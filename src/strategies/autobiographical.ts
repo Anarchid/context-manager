@@ -10890,6 +10890,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
     const stripActive = stripDepth > 0 || maxLive > 0 || maxLiveBytes > 0;
     const placeholderTokens = Math.ceil(AutobiographicalStrategy.IMAGE_PLACEHOLDER.length / 4);
+    // `store.estimateTokens` prices every block at round(raw × calibration);
+    // the stripped image's share must come off at that SAME price. Subtracting
+    // the uncalibrated 1600 drove image-only messages NEGATIVE whenever the
+    // calibration multiplier sat below ~0.995 (0.93 → 1488 − 1591 = −103),
+    // which kv-unified's canonical-forest check then rejects on every compile
+    // ("chunk N has invalid raw cost -111") — a hard-down that cannot heal,
+    // since calibration only moves after a successful call.
+    const calibration = store.getTokenCalibration?.() ?? 1;
+    const calibrated = (tokens: number) => Math.round(tokens * (Number.isFinite(calibration) && calibration > 0 ? calibration : 1));
     let liveImagesSeen = 0;
     let liveImageBytes = 0;
     let rawDepth = 0; // raw-estimate depth from the newest message (mirrors getImageStripStart)
@@ -10905,7 +10914,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const beyondBytes = maxLiveBytes > 0 && liveImageBytes + bytes > maxLiveBytes;
           if (beyondDepth || beyondCount || beyondBytes) {
             const imgEst = (b as { tokenEstimate?: number }).tokenEstimate ?? 1600;
-            est -= Math.max(0, imgEst - placeholderTokens);
+            est -= Math.max(0, calibrated(imgEst) - calibrated(placeholderTokens));
           } else {
             liveImagesSeen++;
             liveImageBytes += bytes;
@@ -10913,7 +10922,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
       rawDepth += raw;
-      out[i] = est;
+      // Belt and braces: a message never costs less than nothing.
+      out[i] = Math.max(0, est);
     }
     return out;
   }
