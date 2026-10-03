@@ -40,8 +40,9 @@ describe('postStripEstimates × calibration', () => {
       ];
       const pse: number[] = (strategy as any).postStripEstimates(storeAt(calibration, messages));
       assert.ok(pse.every((n) => Number.isFinite(n) && n >= 0), `estimates ${JSON.stringify(pse)}`);
-      // The stripped image-only message costs about its placeholder (9 raw tokens), not 1600 or less than 0.
-      assert.ok(pse[0] <= Math.round(9 * calibration) + 1, `stripped estimate ${pse[0]}`);
+      // The stripped image-only message costs exactly its calibrated placeholder (9 raw tokens) —
+      // not 1600, not free, never negative.
+      assert.strictEqual(pse[0], Math.round(9 * calibration), `stripped estimate ${pse[0]}`);
       // The live image is untouched.
       assert.strictEqual(pse[1], Math.round(1600 * calibration) + Math.round(1 * calibration));
     });
