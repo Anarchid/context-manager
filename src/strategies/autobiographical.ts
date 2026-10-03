@@ -4584,6 +4584,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const chunk = this.chunks[chunkIndex];
 
       if (!chunk || chunk.compressed) return;
+      // A chunk that closed before a hold was placed (holdCompression after
+      // the fact) waits; the rebuild after release re-queues it.
+      if (this.chunkHasHeldMessage(chunk, this.holdBlockedIds(ctx.messageStore))) return;
 
       this.pendingCompression = this.compressChunkHierarchical(chunk, ctx);
 
@@ -4606,6 +4609,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // and the next tick() retries it.
     if (this.config.hierarchical && this.mergeQueue.length > 0) {
       const merge = this.mergeQueue[0]!;
+      // A late hold (placed on a message some L1 already covers) pauses
+      // merges reaching it: the merge prompt replays raw sources. No progress
+      // is recorded, so the drain stops; release resumes it.
+      if (this.mergeBlockedByHold(merge.sourceIds, ctx.messageStore)) return;
       this._drainProgress++; // executing a merge is real work, even if a
       // follow-on merge gets enqueued and the queue length nets out unchanged
       this.pendingCompression = this.executeMerge(merge.level, merge.sourceIds, ctx);
@@ -5673,7 +5680,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const allMessages = ctx.messageStore.getAll();
     const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
-    const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
+    // Compression holds: provisional content never enters a prompt, not even
+    // as head context (a reset head can sit past the hold boundary).
+    const headEndIdx = Math.min(this.getHeadWindowEnd(ctx.messageStore), this.holdBoundary(ctx.messageStore));
 
     // ---- Prior recall set (the unmerged frontier) ----
     // Computed BEFORE the head emission because the head loop needs the
@@ -6935,6 +6944,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return;
       }
 
+      // A compression hold placed while the request was in flight: the
+      // summary may be built from provisional content. Discard it; the chunk
+      // stays uncompressed and is re-queued when the hold is released.
+      if (this.chunkHasHeldMessage(chunk, this.holdBlockedIds(ctx.messageStore))) {
+        console.warn('[autobiographical] discarding L1: a compression hold was placed on its span mid-request');
+        return;
+      }
+
       // Re-check the dedup guard AFTER the await: summary state may have
       // changed while the LLM call was in flight (persisted-state reload,
       // or any future concurrent producer). Discarding a paid-for result
@@ -7476,7 +7493,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // covered by a live summary renders via its recall pair; one inside
     // the merge tree renders in the TARGET expansion. Never raw here too.
     const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
-    const headEndIdx = this.getHeadWindowEnd(ctx.messageStore);
+    // Compression holds: provisional content never enters a prompt, not even
+    // as head context (a reset head can sit past the hold boundary).
+    const headEndIdx = Math.min(this.getHeadWindowEnd(ctx.messageStore), this.holdBoundary(ctx.messageStore));
     let headCoveredSkipped = 0;
     for (let i = headStartIdx; !mergeSourceOnly && i < headEndIdx && i < allMessages.length; i++) {
       const m = allMessages[i];
@@ -7971,6 +7990,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         },
       };
       logNewSummaryId = newEntry.id;
+
+      // Hold placed mid-request: throw (not a disposition rejection) so the
+      // merge stays queued and retries after release.
+      if (this.mergeBlockedByHold(sourceIds, ctx.messageStore)) {
+        throw new Error(`merge ${newEntry.id} discarded: a compression hold was placed on its span mid-request`);
+      }
 
       // Provenance the auditor can READ: store the accepted request under the
       // hash the entry carries, before the entry itself lands.
@@ -10395,7 +10420,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     const messages = ctx.messageStore.getAll();
     const headStart = this.getHeadWindowStartIndex(ctx.messageStore);
-    const headEnd = this.getHeadWindowEnd(ctx.messageStore);
+    const headEnd = Math.min(this.getHeadWindowEnd(ctx.messageStore), this.holdBoundary(ctx.messageStore));
     const headMessages = messages.slice(headStart, headEnd);
 
     // Format head content, truncated to ~2000 tokens (~8000 chars)
@@ -10564,8 +10589,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Queue uncompressed record-backed chunks (crash-recovery: record was
     // appended but the process died before its L1 landed).
+    const holdBlocked = this.holdBlockedIds(store);
     for (const chunk of this.chunks) {
-      if (!chunk.compressed && !(chunk.recordId && this._overlapBlocked.has(chunk.recordId))) {
+      if (
+        !chunk.compressed &&
+        !(chunk.recordId && this._overlapBlocked.has(chunk.recordId)) &&
+        !this.chunkHasHeldMessage(chunk, holdBlocked)
+      ) {
         this.compressionQueue.push(chunk.index);
       }
     }
@@ -10994,6 +11024,98 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   protected getRecentWindowStart(store: MessageStoreView): number {
+    return this.clampRecentStartToHolds(store, this.getUnheldRecentWindowStart(store));
+  }
+
+  /**
+   * Compression holds (ContextManager.holdCompression): the earliest held
+   * message starts the protected recent window, so neither it, anything after
+   * it, nor the tool_use it answers can enter a compressible chunk. With no
+   * holds (or a view without the predicate) this returns `start` unchanged.
+   */
+  protected clampRecentStartToHolds(store: MessageStoreView, start: number): number {
+    return Math.min(start, this.holdBoundary(store));
+  }
+
+  /** Timeline scans performed by holdBoundary (test instrumentation). */
+  protected holdBoundaryScans = 0;
+
+  /**
+   * Index where the hold region begins: the earliest held message, stepped
+   * back onto the tool_use a held tool_result answers. `store.length()` when
+   * nothing is held — and then without scanning the timeline.
+   */
+  protected holdBoundary(store: MessageStoreView): number {
+    const isHeld = store.isCompressionHeld;
+    if (!isHeld || (store.hasCompressionHolds && !store.hasCompressionHolds())) {
+      return store.length();
+    }
+    this.holdBoundaryScans++;
+    const messages = store.getAll();
+    for (let i = 0; i < messages.length; i++) {
+      if (isHeld.call(store, messages[i].id)) {
+        let b = i;
+        if (b > 0 && this.hasToolResult(messages[b])) {
+          b--;
+          // Adaptive-resolution ingress puts a sharded message's tool_use on
+          // its FIRST shard: step back over the whole body group.
+          const group = messages[b].bodyGroupId;
+          if (group) while (b > 0 && messages[b - 1].bodyGroupId === group) b--;
+        }
+        return b;
+      }
+    }
+    return messages.length;
+  }
+
+  /**
+   * Ids at or after the hold boundary (null when nothing is held). Compute
+   * once per pass and test chunks against it with chunkHasHeldMessage.
+   */
+  protected holdBlockedIds(store: MessageStoreView): Set<string> | null {
+    const boundary = this.holdBoundary(store);
+    if (boundary >= store.length()) return null;
+    const messages = store.getAll();
+    const blocked = new Set<string>();
+    for (let i = boundary; i < messages.length; i++) blocked.add(messages[i].id);
+    return blocked;
+  }
+
+  /** Whether any merge source's span reaches the hold boundary. */
+  protected mergeBlockedByHold(sourceIds: string[], store: MessageStoreView): boolean {
+    const blocked = this.holdBlockedIds(store);
+    if (!blocked) return false;
+    return sourceIds.some((id) => {
+      const s = this.summaries.find((x) => x.id === id);
+      return s !== undefined && (blocked.has(s.sourceRange.last) || blocked.has(s.sourceRange.first));
+    });
+  }
+
+  /**
+   * Compression holds were released: re-queue the chunks they deferred and,
+   * when auto-tick is on, resume the background drain.
+   */
+  onCompressionHoldsReleased(ctx: StrategyContext): void {
+    this.requireLoadedBranch('onCompressionHoldsReleased');
+    this.rebuildChunks(ctx.messageStore);
+    if (this.config.autoTickOnNewMessage && !this.pendingCompression) {
+      this.driveSpeculativeDrain(ctx);
+    }
+  }
+
+  /**
+   * Whether a chunk reaches the hold boundary: any of its messages is held,
+   * follows a held message, or is the tool_use a held tool_result answers.
+   * Only reachable for chunks that closed before the hold was placed; the
+   * compression request would otherwise carry the provisional content (as
+   * the chunk itself or as its lead-in context).
+   */
+  protected chunkHasHeldMessage(chunk: Chunk, blocked: Set<string> | null): boolean {
+    if (!blocked) return false;
+    return chunk.messages.some((m) => blocked.has(m.id));
+  }
+
+  protected getUnheldRecentWindowStart(store: MessageStoreView): number {
     const messages = store.getAll();
     const pse = this.postStripEstimates(store);
     let tokens = 0;
