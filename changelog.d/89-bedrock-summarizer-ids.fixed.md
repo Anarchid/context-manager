@@ -1,1 +1,0 @@
-- Recognize Bedrock-prefixed Fable/Mythos summarizer model IDs when deferring compression until the host supplies tool definitions.

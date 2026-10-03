@@ -1,1 +1,0 @@
-- Key MessageStore message-ID indexes and materialized caches by native Chronicle branch ID, so deleting and recreating a branch under the same name cannot return stale content or edit/remove the wrong message.

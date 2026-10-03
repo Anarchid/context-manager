@@ -12,6 +12,37 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.13.0 — 2026-10-03
+
+### Added
+
+- Optional compression-hold timeouts: `holdCompression(ids, { timeoutMs })`
+  and `addMessage(..., { holdCompression: { timeoutMs } })`. A timed hold is
+  released automatically once expired — checked lazily on `tick()`,
+  `compile()` and hold queries (no timers) — through the same path as
+  `releaseCompression` (strategy notified), with a warning naming the ids
+  and how long they were held. Re-holding an id replaces its hold (timeout
+  restarts; re-holding without `timeoutMs` makes it indefinite).
+  `getCompressionHoldDetails()` reports `heldAt`/`expiresAt` per hold; the
+  manager clock is injectable via `ContextManager.open({ now })`. Holds
+  without a timeout behave exactly as before.
+  Deadlines are per message id; one call or one sharded `addMessage` reads
+  the clock once, so its ids share a deadline, and expiry releases only the
+  ids past their own deadline (never the rest of a shard group). Expiry is
+  also checked on `addMessage`.
+
+### Fixed
+
+- Key MessageStore message-ID indexes and materialized caches by native Chronicle branch ID, so deleting and recreating a branch under the same name cannot return stale content or edit/remove the wrong message.
+
+- Budget refusals report the configured window, response reserve, and input budget alongside the effective hard limit. Diagnostics label adaptive picker-chunk counts, hierarchical selection-item/raw-message counts, and planned versus attempted depth explicitly; preflight refusals report that no fold plan was computed and count pre-head history after a reset. Available summary inventory remains separate, and KV escalation logs include planned and available depths.
+
+- Recognize Bedrock-prefixed Fable/Mythos summarizer model IDs when deferring compression until the host supplies tool definitions.
+
+- Apply tool pairing repair before result pruning in both adaptive and hierarchical rendering. Generated missing-result placeholders no longer consume last-N retention slots, while genuine output with identical text still counts. Displaced or duplicate results are counted only after repair.
+
+- Coverage-repair warnings report the skipped summary counts and possible budget or interrupted-merge causes without diagnosing healthy stores as corrupt. Empty entries left by tool-result relocation now say the result moved during context repair.
+
 ## 0.12.0 — 2026-10-03
 
 ### Added
