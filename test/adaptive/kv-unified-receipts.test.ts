@@ -199,6 +199,11 @@ test('decoding validates persisted runs before expanding them', () => {
   bad([{ value: null, ids: ['1', -Number.MAX_SAFE_INTEGER] }], /malformed gap-coded/);
   bad([{ value: null, ids: ['1', -(MAX_DECODED_LEAVES + 1)] }], /expand to more than/);
   bad([{ value: null, ids: ['1', -1_000_000] }, { value: null, ids: ['5000000', -1_100_000] }], /expand to more than/);
+  // The bound counts literal ids too, and is checked before anything is expanded.
+  assert.equal(decodeLeafRuns([{ value: null, ids: ['a', 'b', 'c'] }], 3).length, 3);
+  assert.throws(() => decodeLeafRuns([{ value: null, ids: ['a', 'b', 'c', 'd'] }], 3), /expand to more than 3 leaves/);
+  assert.throws(() => decodeLeafRuns([{ value: null, ids: ['1', -2] }, { value: null, ids: ['x'] }], 3), /expand to more than 3 leaves/);
+  assert.throws(() => decodeLeafRuns([{ value: null, ids: ['x'] }, { value: null, ids: ['1', 5, -2] }], 3), /expand to more than 3 leaves/);
   bad([{ value: null, ids: ['1', '1'] }], /duplicate leaf id 1/);
   bad([{ value: null, ids: ['2', -1] }, { value: leaf('x', 1), ids: ['3'] }], /duplicate leaf id 3/);
 });
@@ -315,6 +320,17 @@ test('kv-unified change lists are ordered numerically so a first acceptance stay
   chain.begin({ submissionId: 's1', requestHash: 'r1', layoutHash: 'l1', leaves: table });
   chain.accept('s1', 100, null);
   assert.deepEqual(chain.head?.changes.map((c) => c.leafId), [...table.keys()], '999 sorts before 1000; non-decimal ids after');
+  // The order is total: decimals first, then the rest by code point, whatever the insertion order.
+  const shuffled = new Map([...table.entries()].reverse());
+  const other = new KvUnifiedReceiptChain();
+  other.begin({ submissionId: 's1', requestHash: 'r1', layoutHash: 'l1', leaves: shuffled });
+  other.accept('s1', 100, null);
+  assert.equal(other.head?.receiptHash, chain.head?.receiptHash, 'same leaves in another insertion order: same receipt');
+  const mixed = new Map<string, PresentedLeaf>([['11a', leaf('m', 1)], ['10', leaf('m', 1)], ['2', leaf('m', 1)], ['007', leaf('m', 1)]]);
+  const m = new KvUnifiedReceiptChain();
+  m.begin({ submissionId: 's1', requestHash: 'r1', layoutHash: 'l1', leaves: mixed });
+  m.accept('s1', 100, null);
+  assert.deepEqual(m.head?.changes.map((c) => c.leafId), ['2', '10', '007', '11a']);
   const encoded = chain.serialize();
   assert.deepEqual(encoded.head?.changeRuns, [{ value: { repHash: 'summary:L2-1', level: 2, lastChangedSeq: 1 }, ids: ['990', -19, 'x'] }]);
   // A fresh baseline over a wide id range (ids crossing a digit boundary) is one run, not thousands.

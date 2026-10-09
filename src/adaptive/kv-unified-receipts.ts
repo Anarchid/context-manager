@@ -281,9 +281,11 @@ function diffLeaves(
   return changes;
 }
 
-/** Change lists are ordered by id, numerically where both ids are canonical
- * decimals (`"999"` before `"1000"`), else by code point. Plain string order
- * interleaves ids of different digit counts, which breaks the runs and gap
+/** Change lists are ordered by id: canonical-decimal ids first, numerically
+ * (`"999"` before `"1000"`), then every other id by code point. The two
+ * groups never interleave, so the order is total and a receipt's `changes`
+ * (and hash) do not depend on `Map` insertion order. Plain string order
+ * interleaved ids of different digit counts, which broke the runs and gap
  * codes the persisted form relies on (#148). Only the order of NEW receipts
  * is affected; a persisted receipt keeps the order (and hash) it was
  * written with. */
@@ -291,6 +293,8 @@ function compareLeafIds(a: ChunkId, b: ChunkId): number {
   const na = canonicalDecimal(a);
   const nb = canonicalDecimal(b);
   if (na !== null && nb !== null) return na - nb;
+  if (na !== null) return -1;
+  if (nb !== null) return 1;
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
@@ -396,8 +400,12 @@ export function encodeLeafRuns(
  * literal), the total expanded count (`MAX_DECODED_LEAVES`), and leaf id
  * uniqueness. A malformed stream throws instead of restoring a table that
  * repeats or drops ids. */
-export function decodeLeafRuns(runs: readonly LeafRun[]): Array<[ChunkId, PresentedLeaf | null]> {
+export function decodeLeafRuns(
+  runs: readonly LeafRun[],
+  maxLeaves: number = MAX_DECODED_LEAVES,
+): Array<[ChunkId, PresentedLeaf | null]> {
   if (!Array.isArray(runs)) throw new Error('kv-unified receipt: leaf runs are not an array');
+  const overLimit = () => new Error(`kv-unified receipt: leaf runs expand to more than ${maxLeaves} leaves`);
   // Pass 1: validate every token and count the expansion without performing it.
   let total = 0;
   const values: Array<PresentedLeaf | RawLeafRun | null> = [];
@@ -412,6 +420,7 @@ export function decodeLeafRuns(runs: readonly LeafRun[]): Array<[ChunkId, Presen
         if (entry.length === 0) throw new Error(`kv-unified receipt: empty leaf id in run ${r}`);
         prev = canonicalDecimal(entry);
         total += 1;
+        if (total > maxLeaves) throw overLimit();
         continue;
       }
       if (
@@ -424,9 +433,7 @@ export function decodeLeafRuns(runs: readonly LeafRun[]): Array<[ChunkId, Presen
       }
       prev += Math.abs(entry);
       total += entry > 0 ? 1 : -entry;
-      if (total > MAX_DECODED_LEAVES) {
-        throw new Error(`kv-unified receipt: leaf runs expand to more than ${MAX_DECODED_LEAVES} leaves`);
-      }
+      if (total > maxLeaves) throw overLimit();
     }
   });
   // Pass 2: expand.
