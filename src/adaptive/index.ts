@@ -96,6 +96,8 @@ export {
   type SerializedReceiptChainV2,
   type SerializedReceiptHead,
   type LeafRun,
+  type RawLeafRun,
+  MAX_DECODED_LEAVES,
   encodeLeafRuns,
   decodeLeafRuns,
   type ObservedCacheWireReceipt,

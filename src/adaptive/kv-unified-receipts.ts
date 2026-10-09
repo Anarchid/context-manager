@@ -38,10 +38,21 @@ export interface ObservedCacheWireReceipt {
   markers: Array<{ ordinal: number; prefixHash: string; estimatedOffset: number }>;
 }
 
+/** A run of raw (unfolded) leaves. A raw leaf's `repHash` is exactly
+ * `raw:<its id>`, so it is derived from the id on decode instead of being
+ * stored per leaf; a `repHash` that merely looks like one but does not
+ * match the id stays a literal `PresentedLeaf`. */
+export interface RawLeafRun {
+  raw: true;
+  level: number;
+  lastChangedSeq: number;
+}
+
 /** One run of the run-length encoded leaf table: consecutive leaves (in
- * presentation order) that share the same `PresentedLeaf`. Every chunk folded
- * under one summary shares its representative, so a 23k-leaf table from a
- * six-week session is ~170 runs (#148).
+ * presentation order) that share the same `PresentedLeaf`, or that are all
+ * raw with the same `level` and `lastChangedSeq`. Every chunk folded under
+ * one summary shares its representative, so a 23k-leaf table from a
+ * six-week session is a few dozen runs (#148).
  *
  * `ids` is the run's leaf ids, gap-coded: a string is a literal id; a positive
  * integer `k` is "the previous id plus k"; a negative integer `-n` is "the next
@@ -50,9 +61,15 @@ export interface ObservedCacheWireReceipt {
  * exact id strings and their order survive a round trip; any other id
  * (`"007"`, `"a"`) is kept verbatim and restarts the arithmetic. */
 export interface LeafRun {
-  value: PresentedLeaf | null;
+  value: PresentedLeaf | RawLeafRun | null;
   ids: Array<ChunkId | number>;
 }
+
+/** Upper bound on the leaves one persisted table (or change list) may expand
+ * to, checked from the gap codes BEFORE any expansion so a corrupt `-n`
+ * cannot allocate without limit. Two orders of magnitude above the longest
+ * session seen (23k leaves after six weeks). */
+export const MAX_DECODED_LEAVES = 2_097_152;
 
 export interface SerializedReceiptHead extends Omit<PresentationReceipt, 'changes'> {
   changeRuns: LeafRun[];
@@ -104,22 +121,42 @@ export class KvUnifiedReceiptChain {
     this.wireReceiptValue = snapshot?.wireReceipt ?? null;
   }
 
+  /** Restore a persisted chain. Accepts the current shape (`format: 2`) and
+   * the pre-#148 one (a `leaves` array of pairs). Anything else throws: a
+   * receipt that silently restored as an empty leaf table would make the
+   * next presentation measure continuity against nothing and treat every
+   * leaf as changed (#97), which is worse than a loud failure at load. */
   static deserialize(value: SerializedReceiptChain): KvUnifiedReceiptChain {
-    const chain =
-      isSerializedV2(value)
-        ? new KvUnifiedReceiptChain({
-            head: value.head ? deserializeHead(value.head) : null,
-            leaves: decodeLeafTable(value.leafRuns),
-            cache: value.cache,
-            wireReceipt: value.wireReceipt,
-          })
-        : new KvUnifiedReceiptChain({
-            head: value.head,
-            leaves: new Map(value.leaves),
-            cache: value.cache,
-            wireReceipt: value.wireReceipt,
-          });
-    chain.settled = new Set((value.settledSubmissionIds ?? []).slice(-SETTLED_RETAINED));
+    if (!isRecord(value)) {
+      throw new Error('kv-unified receipt: persisted value is not an object');
+    }
+    let chain: KvUnifiedReceiptChain;
+    if (isSerializedV2(value)) {
+      if (!Array.isArray(value.leafRuns)) {
+        throw new Error('kv-unified receipt: format 2 without a leafRuns array');
+      }
+      chain = new KvUnifiedReceiptChain({
+        head: value.head == null ? null : deserializeHead(value.head),
+        leaves: decodeLeafTable(value.leafRuns),
+        cache: value.cache ?? null,
+        wireReceipt: value.wireReceipt ?? null,
+      });
+    } else if (Array.isArray((value as SerializedReceiptChainV1).leaves)) {
+      const legacy = value as SerializedReceiptChainV1;
+      chain = new KvUnifiedReceiptChain({
+        head: legacy.head ?? null,
+        leaves: new Map(legacy.leaves),
+        cache: legacy.cache ?? null,
+        wireReceipt: legacy.wireReceipt ?? null,
+      });
+    } else {
+      const format = (value as { format?: unknown; v?: unknown }).format ?? (value as { v?: unknown }).v;
+      throw new Error(
+        `kv-unified receipt: unknown persisted shape${format === undefined ? '' : ` (format ${String(format)})`}`,
+      );
+    }
+    const settled = Array.isArray(value.settledSubmissionIds) ? value.settledSubmissionIds : [];
+    chain.settled = new Set(settled.filter((id): id is string => typeof id === 'string').slice(-SETTLED_RETAINED));
     return chain;
   }
 
@@ -235,13 +272,26 @@ function diffLeaves(
 ): PresentationDelta[] {
   const ids = new Set([...previous.keys(), ...next.keys()]);
   const changes: PresentationDelta[] = [];
-  for (const leafId of [...ids].sort()) {
+  for (const leafId of [...ids].sort(compareLeafIds)) {
     const before = previous.get(leafId);
     const after = next.get(leafId);
     if (sameLeaf(before, after)) continue;
     changes.push({ leafId, value: after ?? null });
   }
   return changes;
+}
+
+/** Change lists are ordered by id, numerically where both ids are canonical
+ * decimals (`"999"` before `"1000"`), else by code point. Plain string order
+ * interleaves ids of different digit counts, which breaks the runs and gap
+ * codes the persisted form relies on (#148). Only the order of NEW receipts
+ * is affected; a persisted receipt keeps the order (and hash) it was
+ * written with. */
+function compareLeafIds(a: ChunkId, b: ChunkId): number {
+  const na = canonicalDecimal(a);
+  const nb = canonicalDecimal(b);
+  if (na !== null && nb !== null) return na - nb;
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 function sameLeaf(a: PresentedLeaf | undefined, b: PresentedLeaf | undefined): boolean {
@@ -252,9 +302,46 @@ function isSerializedV2(value: SerializedReceiptChain): value is SerializedRecei
   return 'format' in value && value.format === 2;
 }
 
-function sameRunValue(a: PresentedLeaf | null, b: PresentedLeaf | null): boolean {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isRawRun(value: PresentedLeaf | RawLeafRun): value is RawLeafRun {
+  return (value as RawLeafRun).raw === true;
+}
+
+/** `repHash === \`raw:${id}\`` without building the string per leaf. */
+function isRawHash(repHash: string, id: ChunkId): boolean {
+  return repHash.length === id.length + 4 && repHash.startsWith('raw:') && repHash.endsWith(id);
+}
+
+function sameRunValue(
+  a: PresentedLeaf | RawLeafRun | null,
+  b: PresentedLeaf | RawLeafRun | null,
+): boolean {
   if (a === null || b === null) return a === b;
+  if (isRawRun(a) || isRawRun(b)) {
+    return isRawRun(a) && isRawRun(b) && a.level === b.level && a.lastChangedSeq === b.lastChangedSeq;
+  }
   return sameLeaf(a, b);
+}
+
+function isNonNegativeInt(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function validateRunValue(value: unknown, where: string): PresentedLeaf | RawLeafRun | null {
+  if (value === null) return null;
+  if (!isRecord(value) || !isNonNegativeInt(value.level) || !isNonNegativeInt(value.lastChangedSeq)) {
+    throw new Error(`kv-unified receipt: malformed leaf value in ${where}`);
+  }
+  if (value.raw === true) {
+    return { raw: true, level: value.level, lastChangedSeq: value.lastChangedSeq };
+  }
+  if (typeof value.repHash !== 'string' || value.repHash.length === 0) {
+    throw new Error(`kv-unified receipt: malformed leaf value in ${where}`);
+  }
+  return { repHash: value.repHash, level: value.level, lastChangedSeq: value.lastChangedSeq };
 }
 
 const CANONICAL_DECIMAL = /^(?:0|[1-9][0-9]{0,14})$/;
@@ -274,7 +361,11 @@ export function encodeLeafRuns(
   let run: LeafRun | null = null;
   // The integer the previous id in `run` stands for, when it had one.
   let prev: number | null = null;
-  for (const [id, value] of entries) {
+  for (const [id, leaf] of entries) {
+    const value: PresentedLeaf | RawLeafRun | null =
+      leaf !== null && isRawHash(leaf.repHash, id)
+        ? { raw: true, level: leaf.level, lastChangedSeq: leaf.lastChangedSeq }
+        : leaf;
     if (!run || !sameRunValue(run.value, value)) {
       run = { value, ids: [] };
       runs.push(run);
@@ -297,38 +388,86 @@ export function encodeLeafRuns(
   return runs;
 }
 
-/** Inverse of `encodeLeafRuns`: the entries in their original order. */
+/** Inverse of `encodeLeafRuns`: the entries in their original order.
+ *
+ * The input is persisted state, so it is validated as untrusted before any
+ * expansion: run shapes and leaf values, gap tokens (non-zero safe
+ * integers that keep every reconstructed id a safe integer, never before a
+ * literal), the total expanded count (`MAX_DECODED_LEAVES`), and leaf id
+ * uniqueness. A malformed stream throws instead of restoring a table that
+ * repeats or drops ids. */
 export function decodeLeafRuns(runs: readonly LeafRun[]): Array<[ChunkId, PresentedLeaf | null]> {
-  const out: Array<[ChunkId, PresentedLeaf | null]> = [];
-  for (const run of runs) {
+  if (!Array.isArray(runs)) throw new Error('kv-unified receipt: leaf runs are not an array');
+  // Pass 1: validate every token and count the expansion without performing it.
+  let total = 0;
+  const values: Array<PresentedLeaf | RawLeafRun | null> = [];
+  runs.forEach((run, r) => {
+    if (!isRecord(run) || !Array.isArray(run.ids)) {
+      throw new Error(`kv-unified receipt: malformed leaf run ${r}`);
+    }
+    values.push(validateRunValue(run.value, `run ${r}`));
     let prev: number | null = null;
     for (const entry of run.ids) {
       if (typeof entry === 'string') {
-        out.push([entry, run.value]);
+        if (entry.length === 0) throw new Error(`kv-unified receipt: empty leaf id in run ${r}`);
         prev = canonicalDecimal(entry);
+        total += 1;
         continue;
       }
-      if (prev === null || !Number.isInteger(entry) || entry === 0) {
-        throw new Error(`kv-unified receipt: malformed gap-coded leaf id ${String(entry)}`);
+      if (
+        prev === null ||
+        !Number.isSafeInteger(entry) ||
+        entry === 0 ||
+        !Number.isSafeInteger(prev + Math.abs(entry))
+      ) {
+        throw new Error(`kv-unified receipt: malformed gap-coded leaf id ${String(entry)} in run ${r}`);
       }
-      if (entry > 0) {
+      prev += Math.abs(entry);
+      total += entry > 0 ? 1 : -entry;
+      if (total > MAX_DECODED_LEAVES) {
+        throw new Error(`kv-unified receipt: leaf runs expand to more than ${MAX_DECODED_LEAVES} leaves`);
+      }
+    }
+  });
+  // Pass 2: expand.
+  const out: Array<[ChunkId, PresentedLeaf | null]> = [];
+  const seen = new Set<ChunkId>();
+  const push = (id: ChunkId, value: PresentedLeaf | RawLeafRun | null): void => {
+    if (seen.has(id)) throw new Error(`kv-unified receipt: duplicate leaf id ${id}`);
+    seen.add(id);
+    out.push([
+      id,
+      value !== null && isRawRun(value)
+        ? { repHash: `raw:${id}`, level: value.level, lastChangedSeq: value.lastChangedSeq }
+        : value,
+    ]);
+  };
+  runs.forEach((run, r) => {
+    const value = values[r];
+    let prev = 0;
+    for (const entry of run.ids) {
+      if (typeof entry === 'string') {
+        push(entry, value);
+        prev = canonicalDecimal(entry) ?? 0;
+      } else if (entry > 0) {
         prev += entry;
-        out.push([String(prev), run.value]);
+        push(String(prev), value);
       } else {
         for (let k = 0; k < -entry; k++) {
           prev += 1;
-          out.push([String(prev), run.value]);
+          push(String(prev), value);
         }
       }
     }
-  }
+  });
   return out;
 }
 
 function decodeLeafTable(runs: readonly LeafRun[]): Map<ChunkId, PresentedLeaf> {
   const leaves = new Map<ChunkId, PresentedLeaf>();
   for (const [id, value] of decodeLeafRuns(runs)) {
-    if (value) leaves.set(id, value);
+    if (value === null) throw new Error(`kv-unified receipt: null leaf ${id} in the leaf table`);
+    leaves.set(id, value);
   }
   return leaves;
 }
@@ -339,6 +478,19 @@ function serializeHead(head: PresentationReceipt): SerializedReceiptHead {
 }
 
 function deserializeHead(head: SerializedReceiptHead): PresentationReceipt {
+  if (
+    !isRecord(head) ||
+    !isNonNegativeInt(head.sequence) ||
+    typeof head.receiptHash !== 'string' ||
+    (head.parentReceiptHash !== null && typeof head.parentReceiptHash !== 'string') ||
+    typeof head.submissionId !== 'string' ||
+    typeof head.requestHash !== 'string' ||
+    typeof head.layoutHash !== 'string' ||
+    typeof head.acceptedAt !== 'number' ||
+    !Array.isArray(head.changeRuns)
+  ) {
+    throw new Error('kv-unified receipt: malformed head receipt');
+  }
   const { changeRuns, ...rest } = head;
   return { ...rest, changes: decodeLeafRuns(changeRuns).map(([leafId, value]) => ({ leafId, value })) };
 }

@@ -13,7 +13,8 @@ Record framing (chronicle 0.4.x, `records/log.rs`):
   | type_len(2) | type | enc(1) | payload_len(4) | payload
   | caused_by_count(2) | ids*8 | linked_to_count(2) | ids*8 | crc32(4)
 `state_update` payloads are MessagePack maps; only `state_id` and the
-operation's variant name are read, from the first 400 bytes.
+operation's variant name are read, from the first 400 bytes. A field the
+sample cuts off is reported as `?`, never a crash.
 
 Usage:
     python3 scripts/records-log-bytes-by-state.py <store-dir-or-records.log> [--top N]
@@ -26,18 +27,25 @@ import sys
 
 
 def mp_str(buf, i):
-    """Decode a MessagePack string header at buf[i]; return (text, next_index)."""
+    """Decode a MessagePack string header at buf[i]; return (text, next_index).
+
+    `buf` is a bounded sample of the payload, so a field may start or end past
+    it; then the text is '?' (counted under that label) rather than an error.
+    """
+    if i < 0 or i >= len(buf):
+        return '?', len(buf)
     t = buf[i]
     if 0xA0 <= t <= 0xBF:
-        n = t & 0x1F
-        return buf[i + 1:i + 1 + n].decode('utf-8', 'replace'), i + 1 + n
-    if t == 0xD9:
-        n = buf[i + 1]
-        return buf[i + 2:i + 2 + n].decode('utf-8', 'replace'), i + 2 + n
-    if t == 0xDA:
-        n = int.from_bytes(buf[i + 1:i + 3], 'big')
-        return buf[i + 3:i + 3 + n].decode('utf-8', 'replace'), i + 3 + n
-    return '?', i + 1
+        n, start = t & 0x1F, i + 1
+    elif t == 0xD9 and i + 1 < len(buf):
+        n, start = buf[i + 1], i + 2
+    elif t == 0xDA and i + 2 < len(buf):
+        n, start = int.from_bytes(buf[i + 1:i + 3], 'big'), i + 3
+    else:
+        return '?', i + 1
+    if start + n > len(buf):
+        return '?', len(buf)
+    return buf[start:start + n].decode('utf-8', 'replace'), start + n
 
 
 def state_and_op(head):
@@ -51,7 +59,7 @@ def state_and_op(head):
         j += 10
         if j < len(head) and head[j] == 0x81:  # fixmap(1): { Variant: payload }
             op, _ = mp_str(head, j + 1)
-        elif j < len(head):  # unit variant encoded as a bare string
+        else:  # unit variant encoded as a bare string (or cut off by the sample)
             op, _ = mp_str(head, j)
     return sid, op
 
