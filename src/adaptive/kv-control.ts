@@ -416,10 +416,18 @@ function relevanceCut(
     // boundary cuts through, that is ~1.7k attempts × 2×1.7k ledger moves
     // (try + revert) — the dominant term of the mythos 30s/turn leak.
     // `attempted` short-circuits repeats and is cleared whenever an accept
-    // changes the ledger, so the accept SEQUENCE is exactly the naive one.
+    // changes the ledger.
     const attempted = new Set<string>();
-    // Repeat passes so the youngest group can step down more than one level
-    // (L2→L1→raw) before an older one is touched; a pass with no accept ends it.
+    // After every accepted un-fold the walk RESTARTS from the youngest
+    // position, so the group that just stepped down is the first candidate
+    // for its next step (L2→L1→raw) before any older group is tried. Walking
+    // on from the accepting member instead reached the same group's next
+    // level only through its other members — a group left with one live
+    // member (store surgery) or whose accept came through its oldest member
+    // waited for the next pass, and an older group took the headroom first
+    // (#156 review, Greptile P1). Cost: each node/level is accepted at most
+    // once, so passes are bounded by accepts + 1 and the memo keeps each
+    // rejected group to one attempt per pass.
     let progressed = true;
     while (progressed && ledger.tokens < target) {
       progressed = false;
@@ -484,6 +492,7 @@ function relevanceCut(
           // re-attempted them.
           attempted.clear();
           progressed = true;
+          break; // restart from the youngest position
         }
       }
     }
@@ -753,6 +762,20 @@ export interface ControlPlanParams {
   /** Never override P for quality while preparing a future window. If the
    * smallest realizable change exceeds P, hold and report a pace floor. */
   strictReach?: boolean;
+  /**
+   * Seed the ideal cut from the carried frontier instead of from raw: phases
+   * A/B only deepen what is carried (same salience-then-oldest, level-by-level
+   * order), and only phase C — youngest position first — un-folds. The
+   * from-scratch cut re-decides every band boundary from the current balance
+   * of production and growth, so a deep group near a boundary is raised when
+   * a new mid-level summary lands and re-deepened when growth crosses W —
+   * each direction a front edit (#156 review, Major 2). An inverted carried
+   * profile (a chunk deeper than an older unprotected chunk) is still lowered
+   * to the older level so phase A re-folds it oldest-first — the quality-gap
+   * self-heal keeps working. Bootstrap (nothing carried) is unaffected.
+   * Default true; `false` restores the from-scratch ideal.
+   */
+  seedFromCarried?: boolean;
   /** Quality-gap override threshold (§13.4): a plan within P is rejected — and
    *  the ideal adopted, paying the perturbation — when its relevance loss
    *  exceeds the ideal's by more than this fraction of the ideal's loss.
@@ -893,6 +916,27 @@ export function planControlledFrontier(
   diagHist('carried(projected)', carried, tree);
   const carriedLayout = renderLayout(inputs, tree, carried);
   const carriedTokens = carriedLayout.totalTokens;
+  // Receding-horizon seeding (opt-in): the ideal starts where the carried
+  // frontier is, so A/B never un-fold and the only raises are phase C's
+  // seam-first ones — EXCEPT where the carried profile is inverted (a chunk
+  // carried deeper than some OLDER unprotected chunk): those are lowered to
+  // the older chunk's level so phase A re-folds the region oldest-first and
+  // the inversion heals (the quality-gap self-heal's purpose). Monotone
+  // over-depth — the boundary group a new mid-level summary made
+  // unnecessary — is kept, which is the hysteresis the from-scratch cut
+  // lacks. Protected/base levels are already in `carried`.
+  let idealBase = base;
+  const seeded = (p.seedFromCarried ?? true) && carriedNonEmpty;
+  if (seeded) {
+    idealBase = new Map(carried);
+    let olderMin = Number.POSITIVE_INFINITY;
+    for (const c of ordered) { // oldest first
+      if (p.rawZone.has(c.id) || immovable.has(c.id)) continue;
+      const lvl = carried.get(c.id) ?? 0;
+      if (lvl > olderMin) idealBase.set(c.id, olderMin);
+      if (lvl < olderMin) olderMin = lvl;
+    }
+  }
 
   // Shape prior: soft per-chunk depth caps (log-age band + pin caps), with the
   // −1 sentinel marking the hard-protected set (never folded by anything).
@@ -912,10 +956,8 @@ export function planControlledFrontier(
 
   // 1. The ideal cut — pure relevance, no P anywhere.
   const _t0 = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
-  const ideal = relevanceCut(
-    inputs, tree, ordered, base, caps, pinCaps, p.rawZone, immovable, frozen, fixedLevels,
-    p.targetTokens, p.windowTokens, maxFoldLevel,
-  );
+  const ideal = relevanceCut(inputs, tree, ordered, idealBase, caps, pinCaps, p.rawZone, immovable, frozen, fixedLevels,
+    p.targetTokens, p.windowTokens, maxFoldLevel);
   if (_t0) console.error(`[kv-timing] relevanceCut ${Date.now() - _t0}ms idealTokens=${ideal.tokens}`);
   diagHist('ideal', ideal.F, tree);
   const idealLayout = renderLayout(inputs, tree, ideal.F);
