@@ -1,6 +1,7 @@
 import type { JsStore } from '@animalabs/chronicle';
 import type { Membrane, NormalizedRequest, NormalizedResponse, ContentBlock, CompleteOptions } from '@animalabs/membrane';
 import { NativeFormatter } from '@animalabs/membrane';
+import { registerStateIfAbsent } from '../state-registration.js';
 import { phaseChannel } from '../phase-channel.js';
 import type {
   ContextStrategy,
@@ -23,6 +24,7 @@ import type {
   SearchResult,
   TimeRangeSummaryEntry,
   RenderStats,
+  CalibrationReset,
   HotContextSettingsUpdate,
   HotContextSettingsStatus,
   SelectOptions,
@@ -48,10 +50,10 @@ import { persistMintRequestPreimage } from '../mint-preimage.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
-import { Picker, OverBudgetError, UncoveredDropError, type PickerChunk, type PickerInputs } from '../adaptive/picker.js';
+import { Picker, OverBudgetError, UncoveredDropError, type PickerChunk, type PickerInputs, type PickerResult } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
-import { KvUnifiedStrategy } from '../adaptive/strategies/kv-unified.js';
+import { KvUnifiedStrategy, type KvUnifiedReuse } from '../adaptive/strategies/kv-unified.js';
 import { SummaryTree } from '../adaptive/summary-tree.js';
 import { renderLayout, type RenderLayout } from '../adaptive/render-offsets.js';
 import {
@@ -69,8 +71,17 @@ import type {
 } from '../adaptive/folding-strategy.js';
 import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
+import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
+import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms } from '../raw-forms.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
+
+/** A persisted reset record is trusted only if it has the expected shape. */
+function isCalibrationReset(v: unknown): v is CalibrationReset {
+  const r = v as CalibrationReset | null | undefined;
+  return !!r && Number.isFinite(r.discardedMultiplier) && (r.fromEpoch === null || Number.isFinite(r.fromEpoch)) &&
+    Number.isFinite(r.at);
+}
 
 /**
  * Append a JSONL entry describing one compression LLM call to the path
@@ -806,14 +817,27 @@ function normalizePinLevels(opts?: PinLevelOptions): { level?: number; maxLevel?
  * which — thrown inside the speculative-compression drain — halts ALL
  * compression. Non-text blocks (tool_use/tool_result/image) pass through
  * unchanged, so tool pairing is preserved; callers drop any message left with
- * an empty content array.
+ * an empty content array. membrane's zero-width carriers of opaque Responses
+ * items (a compaction item, a hosted tool's call) are empty text too, so they
+ * are dropped from compression requests as well, as they always were.
+ *
+ * Released narrowly (releaseVanishedRawForms, not releaseEditedRawForms): an
+ * empty part dropped from a Responses message item while a sibling part
+ * survives still rides inside the sibling's raw item, and only whitespace can
+ * ship that way, so releasing would re-render the whole item (and its reasoning
+ * pairing) from fields for no content change. An item none of whose parts
+ * survive is gone from the wire, a dropped carrier's item included, so the
+ * reasoning paired with it gives up its id rather than be replayed without its
+ * follower.
+ *
+ * Exported for its tests; not part of the package's API.
  */
-function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
-  return content.filter((b) => {
+export function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
+  return releaseVanishedRawForms(content, content.filter((b) => {
     if (b.type !== 'text') return true;
     const text = (b as { text?: unknown }).text;
     return typeof text === 'string' && text.trim().length > 0;
-  });
+  }));
 }
 
 /**
@@ -837,9 +861,16 @@ function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
  * ("thinking blocks ... cannot be modified", observed 2026-07-16 on the
  * `full` replay arm). Passing raw thinking through requires keeping those
  * turns byte-identical — a follow-up experiment, not a blanket strip removal.
+ *
+ * A stripped Responses reasoning item releases the raw item it was paired
+ * with, so the follower isn't replayed with an id whose reasoning is gone
+ * (see raw-forms.ts).
  */
 function stripThinkingBlocks(content: ContentBlock[]): ContentBlock[] {
-  return content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking');
+  return releaseEditedRawForms(
+    content,
+    content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking'),
+  );
 }
 
 /**
@@ -1070,6 +1101,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * updated by ID when its L1 lands.
    */
   protected chunkRecords: ChunkRecord[] = [];
+  /** The chunk owning each position of the listing the last rebuild saw. */
+  private _chunkByPosition: { listing: readonly StoredMessage[]; chunks: (Chunk | undefined)[] } | null = null;
+  /** Record-derived chunks of the last rebuild: reused while the listing only
+   *  grew, the record list only grew and the token calibration is unchanged. */
+  private _recordChunks: {
+    listing: readonly StoredMessage[];
+    records: ChunkRecord[];
+    calibration: number;
+    ignoreSize: boolean;
+    entries: Array<{ record: ChunkRecord; messages: StoredMessage[]; tokens: number; positions: number[] }>;
+  } | null = null;
+  /** Static salience per listing position (see selectAdaptive). */
+  private _salience: { listing: readonly StoredMessage[]; values: Float64Array } | null = null;
   protected chunkIdCounter = 0;
   /**
    * Fail-closed latch: set when most persisted records resolve to zero live
@@ -1146,6 +1190,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get resolutionsStateId(): string { return `${this.ns}/autobio:resolutions`; }
   protected get locksStateId(): string { return `${this.ns}/autobio:locks`; }
   protected get calibrationStateId(): string { return `${this.ns}/autobio:calibration`; }
+  protected get imageWatermarkStateId(): string { return `${this.ns}/autobio:imageStripWatermark`; }
   protected get kvUnifiedReceiptStateId(): string { return `${this.ns}/kvunified:presentation-receipt`; }
   private kvUnifiedReceipts = new KvUnifiedReceiptChain();
   /** A persisted kv-unified receipt was found while loading under another
@@ -1218,6 +1263,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private runtimeTransitionPaceTokens: number | undefined;
   /** Diagnostics from the most recent dry-run select. Not persisted. */
   private _lastPreview: PreviewResult | undefined;
+  /** The last dry select's own render stats, which select() keeps apart from
+   *  the live ones for previewContext. */
+  private _lastPreviewStats: RenderStats | undefined;
+  /** Set while a dry select runs: its chunking persists no chunk record. */
+  private _dryRunSelect = false;
   /** Serializes previews against each other (see previewContext). */
   private _previewInFlight = false;
 
@@ -1395,32 +1445,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       throw new Error('previewContext is already running; previews must not overlap');
     }
     this._previewInFlight = true;
+    // The config swap below is this method's own to undo. What the dry select
+    // leaves for observers (transition status, render stats, calibration),
+    // select() puts back for every dry run, whichever of selectAdaptive's
+    // OverBudgetError sites throws; any throw is turned into a report below.
     const savedConfig = this.config;
     const savedPicker = this._adaptivePicker;
     const savedHeadCache = this._cachedHeadStartIndex;
-    // selectAdaptive has FOUR OverBudgetError sites — an early head+tail check
-    // that fires before the picker even runs, the post-pick check, and two
-    // late render-stage checks. Rather than gate each (fragile, and a new site
-    // would silently break previews), restore bookkeeping here in `finally`
-    // and convert any throw into a report below.
-    const savedFrontier = this.lastFrontierTokens;
-    const savedBlocked = this.transitionBlocked;
-    const savedKvStable = this._lastKvStable;
-    // select() calls rsBegin(), which RESETS the render-stats family. Those feed
-    // getRenderStats() -> /debug/context/makeup and the Context panel, so a dry
-    // run would leave the operator's live segment breakdown showing numbers from
-    // a hypothetical compile until the next real one. Save and restore them:
-    // "commits nothing" has to include in-memory observability, not just
-    // Chronicle.
-    // `_lastRenderStats` is the one that matters: select() ends with
-    // `_lastRenderStats = r; _rs = null`, and getRenderStats() reads
-    // _lastRenderStats. Guarding only _rs (null by then) protected nothing.
-    const savedRs = this._rs;
-    const savedLastRs = this._lastRenderStats;
-    const savedDrops = this._uncoveredDrops;
-    const savedEmitted = this._emittedSummaryIds;
-    const savedPlannedTokens = this._plannedTokens;
-    const savedPlannedMeta = this._plannedMeta;
     this._lastPreview = undefined;
     try {
       // Drop explicit undefined/null overrides BEFORE spreading: a spread
@@ -1481,31 +1512,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           'previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview',
         );
       }
-      // Segment breakdown for the hypothetical compile, captured BEFORE the
-      // finally block restores the live one. Lets a caller show the previewed
+      // Segment breakdown for the hypothetical compile, which select() kept
+      // apart from the live one. Lets a caller show the previewed
       // head/middle/tail split without re-deriving it.
       return {
         ...preview,
-        // Read _lastRenderStats, not _rs: select() has already committed and
-        // nulled _rs by this point.
         ...(opts?.render
-          ? { entries: rendered, stats: this._lastRenderStats ?? undefined }
+          ? { entries: rendered, stats: this._lastPreviewStats }
           : {}),
       };
     } finally {
       this.config = savedConfig;
       this._adaptivePicker = savedPicker;
       this._cachedHeadStartIndex = savedHeadCache;
-      this.lastFrontierTokens = savedFrontier;
-      this.transitionBlocked = savedBlocked;
-      this._lastKvStable = savedKvStable;
-      this._rs = savedRs;
-      this._lastRenderStats = savedLastRs;
-      this._uncoveredDrops = savedDrops;
-      this._emittedSummaryIds = savedEmitted;
-      this._plannedTokens = savedPlannedTokens;
-      this._plannedMeta = savedPlannedMeta;
       this._lastPreview = undefined;
+      this._lastPreviewStats = undefined;
       this._previewInFlight = false;
     }
   }
@@ -1664,7 +1685,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Lock a message so the adaptive picker won't change its resolution.
+   * Lock a message so the adaptive picker won't change its stored resolution.
+   * A classic pin (one without a `level` or `maxLevel`) still overrides the
+   * lock while it stands: under the greedy solvers and kv-stable, the pinned
+   * message renders raw, and its locked level stays stored and returns when
+   * the pin is removed. kv-unified treats a pin and a lock as constraints and
+   * reports a conflict when they are incompatible.
    * No-op when adaptiveResolution is false. Set-only programmatic API per
    * the design (no agent-facing tool in V1). Persisted to chronicle.
    */
@@ -1886,8 +1912,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._storeView = null;
     this._calibrationArmed = false;
     this._calibration = 1;
+    this._calibrationEma = null;
     this._calibrationLoaded = false;
+    this._calibrationReset = null;
+    this._calibrationProvisional = null;
+    this._imageWatermark = undefined;
+    this._imageWatermarkLoaded = false;
     this._lastKvStable = null;
+    this._storeOrder = new Map();
+    this._storeOrderSource = [];
+    this._chunkByPosition = null;
+    this._l1ByMessage = null;
+    this._recordChunks = null;
+    this._salience = null;
+    this._exactL1 = null;
+    this._postStripMemo = null;
+    this._coverageMemo = null;
+    delete this.kvUnifiedReuse.forest;
+    delete this.kvUnifiedReuse.tree;
+    delete this.kvUnifiedReuse.certificate;
+    delete this.kvUnifiedReuse.whatIf;
   }
 
   /**
@@ -1978,100 +2022,91 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Register the three Chronicle state slots this strategy uses.
-   * Idempotent — chronicle throws if a state is already registered, which we
-   * swallow (the existing slot is what we want).
+   * Register the Chronicle state slots this strategy uses. A slot that
+   * already exists is kept as it is (see isStateExistsFor). Any other
+   * registration failure propagates and stops initialization. Registrations
+   * are separate and durable, so the slots registered before the failing one
+   * stay registered, and the next start registers the rest.
    */
   protected registerStates(): void {
     if (!this.store) return;
-    try {
-      this.store.registerState({
-        id: this.summariesStateId,
+    const store = this.store;
+    const registerState = (registration: Parameters<JsStore['registerState']>[0]): void => {
+      registerStateIfAbsent(store, registration);
+    };
+    registerState({
+      id: this.summariesStateId,
+      strategy: 'append_log',
+      deltaSnapshotEvery: 50,
+      fullSnapshotEvery: 10,
+    });
+    if (this.chunkPersistenceEnabled) {
+      registerState({
+        id: this.chunksStateId,
         strategy: 'append_log',
         deltaSnapshotEvery: 50,
         fullSnapshotEvery: 10,
       });
-    } catch { /* already registered */ }
-    if (this.chunkPersistenceEnabled) {
-      try {
-        this.store.registerState({
-          id: this.chunksStateId,
-          strategy: 'append_log',
-          deltaSnapshotEvery: 50,
-          fullSnapshotEvery: 10,
-        });
-      } catch { /* already registered */ }
     }
     if (this.config.foldingStrategy === 'kv-unified') {
-      try {
-        this.store.registerState({
-          id: this.kvUnifiedReceiptStateId,
-          strategy: 'snapshot',
-        });
-      } catch { /* already registered */ }
+      registerState({
+        id: this.kvUnifiedReceiptStateId,
+        strategy: 'snapshot',
+      });
     }
-    try {
-      this.store.registerState({
-        id: this.counterStateId,
-        strategy: 'snapshot',
-      });
-    } catch { /* already registered */ }
-    try {
-      this.store.registerState({
-        id: this.mergeQueueStateId,
-        strategy: 'snapshot',
-      });
-    } catch { /* already registered */ }
-    try {
-      this.store.registerState({
-        id: this.mergeQuarantineStateId,
-        strategy: 'snapshot',
-      });
-    } catch { /* already registered */ }
-    try {
-      this.store.registerState({
-        id: this.pinsStateId,
-        strategy: 'snapshot',
-      });
-    } catch { /* already registered */ }
-    try {
-      this.store.registerState({
-        id: this.calibrationStateId,
-        strategy: 'snapshot',
-      });
-    } catch { /* already registered */ }
-    try {
-      this.store.registerState({
-        id: this.compressionRefusalQuarantineLedgerStateId,
-        strategy: 'append_log',
-        deltaSnapshotEvery: 50,
-        fullSnapshotEvery: 10,
-      });
-    } catch { /* already registered */ }
+    registerState({
+      id: this.counterStateId,
+      strategy: 'snapshot',
+    });
+    registerState({
+      id: this.mergeQueueStateId,
+      strategy: 'snapshot',
+    });
+    registerState({
+      id: this.mergeQuarantineStateId,
+      strategy: 'snapshot',
+    });
+    registerState({
+      id: this.pinsStateId,
+      strategy: 'snapshot',
+    });
+    registerState({
+      id: this.calibrationStateId,
+      strategy: 'snapshot',
+    });
+    registerState({
+      id: this.compressionRefusalQuarantineLedgerStateId,
+      strategy: 'append_log',
+      deltaSnapshotEvery: 50,
+      fullSnapshotEvery: 10,
+    });
     // Adaptive-resolution state slots — only registered when the flag is on
     // so chronicles without the flag don't accumulate unused slots.
     if (this.config.adaptiveResolution) {
-      try {
-        this.store.registerState({
-          id: this.resolutionsStateId,
-          strategy: 'snapshot',
-        });
-      } catch { /* already registered */ }
-      try {
-        this.store.registerState({
-          id: this.locksStateId,
-          strategy: 'snapshot',
-        });
-      } catch { /* already registered */ }
+      registerState({
+        id: this.resolutionsStateId,
+        strategy: 'snapshot',
+      });
+      registerState({
+        id: this.locksStateId,
+        strategy: 'snapshot',
+      });
     }
   }
 
   /**
    * Load summaries, counter, and pending merges from chronicle into the
    * in-memory mirrors. Called on every (re)initialize so branch switches
-   * pick up the new branch's state.
+   * pick up the new branch's state, and by a compression that waited on
+   * another instance's in-flight compression of its family, to take up that
+   * result (compressChunkHierarchical). That waiter passes
+   * `keepKvUnifiedPresentation`: a kv-unified strategy then keeps its own
+   * receipt chain, whose pending submission is never persisted, rather than
+   * replacing it from the store, and keeps its draft and pending layout (with
+   * the layout's marker indices and immutable prefix hash), which live only in
+   * memory, rather than clearing them (#166).
    */
-  protected loadPersistedState(): void {
+  protected loadPersistedState(options: { keepKvUnifiedPresentation?: boolean } = {}): void {
     if (!this.store) {
       this.summaries = [];
       this.summaryIdCounter = 0;
@@ -2221,14 +2256,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
     if (this.config.foldingStrategy === 'kv-unified') {
-      const receiptState = this.store.getStateJson(this.kvUnifiedReceiptStateId);
-      this.kvUnifiedReceipts = receiptState && typeof receiptState === 'object'
-        ? KvUnifiedReceiptChain.deserialize(receiptState as unknown as SerializedReceiptChain)
-        : new KvUnifiedReceiptChain();
-      this.kvUnifiedDraft = null;
-      this.kvUnifiedPendingLayout = null;
-      this.kvUnifiedPendingMarkerUnitIndices = [];
-      this.kvUnifiedPendingImmutablePrefixHash = null;
+      if (!options.keepKvUnifiedPresentation) {
+        const receiptState = this.store.getStateJson(this.kvUnifiedReceiptStateId);
+        this.kvUnifiedReceipts = receiptState && typeof receiptState === 'object'
+          ? KvUnifiedReceiptChain.deserialize(receiptState as unknown as SerializedReceiptChain)
+          : new KvUnifiedReceiptChain();
+        this.kvUnifiedDraft = null;
+        this.kvUnifiedPendingLayout = null;
+        this.kvUnifiedPendingMarkerUnitIndices = [];
+        this.kvUnifiedPendingImmutablePrefixHash = null;
+      }
     } else {
       // A presentation receipt is kv-unified's record of the LAST accepted
       // presentation. Once another folding strategy PRESENTS from this store
@@ -2268,7 +2305,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const [id, level] of this.resolutions) {
       if (level > 0) out[id] = level;
     }
-    this.store.setStateJson(this.resolutionsStateId, out);
+    this.writeStateJson(this.resolutionsStateId, out);
   }
 
   /** This strategy has just presented, so the persisted kv-unified receipt no
@@ -2542,10 +2579,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected pinnedPositions(messages: StoredMessage[]): Set<number> {
     if (this.pins.length === 0) return new Set();
-    const positionOf = new Map<string, number>();
-    for (let i = 0; i < messages.length; i++) {
-      positionOf.set(messages[i].id, i);
-    }
+    const positionOf = this.positionIndex(messages);
     const out = new Set<number>();
     for (const pin of this.pins) {
       const first = positionOf.get(pin.firstMessageId);
@@ -2569,8 +2603,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected pinLevelBounds(messages: StoredMessage[]): Map<number, { level?: number; maxLevel?: number }> {
     const out = new Map<number, { level?: number; maxLevel?: number }>();
     if (this.pins.length === 0) return out;
-    const positionOf = new Map<string, number>();
-    for (let i = 0; i < messages.length; i++) positionOf.set(messages[i].id, i);
+    const positionOf = this.positionIndex(messages);
 
     for (const pin of this.pins) {
       if (pin.level === undefined && pin.maxLevel === undefined) continue;
@@ -2617,10 +2650,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /** Read the durable log as well as the local mirror for cross-instance L1 races. */
+  /** First live L1 per joined source-id key, rebuilt only when the summary
+   *  list's entries change (the scan joined every L1's ids on every call). */
+  private _exactL1: { entries: readonly SummaryEntry[]; byKey: Map<string, SummaryEntry> } | null = null;
   private findExactL1(chunkIdKey: string): SummaryEntry | undefined {
-    const local = this.summaries.find(
-      (summary) => summary.level === 1 && summary.sourceIds.join(':') === chunkIdKey,
-    );
+    const memo = this._exactL1;
+    const current = this.summaries;
+    let byKey: Map<string, SummaryEntry>;
+    if (memo && memo.entries.length === current.length && memo.entries.every((s, i) => s === current[i])) {
+      byKey = memo.byKey;
+    } else {
+      byKey = new Map();
+      for (const summary of current) {
+        if (summary.level !== 1) continue;
+        const key = summary.sourceIds.join(':');
+        if (!byKey.has(key)) byKey.set(key, summary);
+      }
+      this._exactL1 = { entries: [...current], byKey };
+    }
+    const local = byKey.get(chunkIdKey);
     if (local) return local;
     const persisted = this.store?.getStateJson(this.summariesStateId);
     if (!Array.isArray(persisted)) return undefined;
@@ -2697,16 +2745,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * count as prefix: a merge's expanded SOURCE pairs are its volatile
    * payload, and marking them would cache-write content that never recurs.
    *
-   * `capped` requests get no markers: recall-budget front-eviction shifts
-   * the prefix on every subsequent mint, and cache writes on a shifting
-   * prefix are pure waste (measured up to +42% total cost at 1h TTL).
+   * `capped` requests get the head marker only: recall-budget front-eviction
+   * shifts the pairs on every subsequent mint, and cache writes on a shifting
+   * prefix are pure waste (measured up to +42% total cost at 1h TTL). The
+   * head boundary sits before the ladder, so eviction cannot move it; with
+   * no head window a capped request carries no marker at all.
    * Effective ladder reuse also requires the append-stable source order
    * fix (2026-08-19); on stores minted under the older lexical order the
    * markers are merely harmless.
    *
    * Returns true iff at least one breakpoint was placed — callers attach
    * `cacheTtl` only then, so every marker-less request (kill switch, capped
-   * ladder, no ladder yet) keeps the exact pre-seam request shape and its
+   * ladder with no head window, no ladder yet) keeps the exact pre-seam request shape and its
    * canonical hash / quarantine identity.
    */
   protected applyMintCacheSeams(
@@ -2734,7 +2784,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
       }
     }
-    if (capped) return false;
     const levelById = new Map(recallLadder.map((s) => [s.id, s.level]));
     let headEnd = -1;
     let deepEnd = -1;
@@ -2753,10 +2802,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (level >= 2) deepEnd = i + 1;
     }
     if (frontierEnd === -1) return false; // no ladder yet — nothing stable to cache
-    for (const idx of new Set([headEnd, deepEnd, frontierEnd])) {
-      if (idx >= 0) messages[idx]!.cacheBreakpoint = true;
+    // A capped ladder front-evicts on every mint, so the pair seams shift and
+    // writing them is waste. The head seam does not: tools, system prompt and
+    // head window precede the ladder and are the same request after request,
+    // unless image shedding (one byte budget, spent newest-first) replaces a
+    // head image for one payload and not for the next.
+    let placed = false;
+    for (const idx of new Set(capped ? [headEnd] : [headEnd, deepEnd, frontierEnd])) {
+      if (idx < 0) continue;
+      messages[idx]!.cacheBreakpoint = true;
+      placed = true;
     }
-    return true;
+    return placed;
   }
 
   private sameAuthoredSummary(a: SummaryEntry, b: SummaryEntry): boolean {
@@ -3910,16 +3967,61 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Store position per message id, refreshed from every listing we see. */
   private _storeOrder = new Map<MessageId, number>();
+  /** The listing `_storeOrder` was built from (append-only refreshes extend it). */
+  private _storeOrderSource: ReadonlyArray<{ id: MessageId }> = [];
   /** Load-time audit result (see assertStoreTopology). */
   private topologyViolations: TopologyViolation[] = [];
   /** Merges refused by executeMerge because they would have minted a crossed node. */
   private topologyRefusals = 0;
 
+  /** `staticSalience` per position of `messages`, kept across appends (the
+   *  earlier positions hold the same message objects, so the same values). */
+  private salienceByPosition(messages: readonly StoredMessage[]): Float64Array {
+    const memo = this._salience;
+    if (memo && memo.listing === messages) return memo.values;
+    const values = new Float64Array(messages.length);
+    let from = 0;
+    if (memo && messages.length >= memo.listing.length) {
+      const prev = memo.listing;
+      let i = 0;
+      while (i < prev.length && messages[i] === prev[i]) i++;
+      if (i === prev.length) { values.set(memo.values); from = prev.length; }
+    }
+    for (let i = from; i < messages.length; i++) values[i] = AutobiographicalStrategy.staticSalience(messages[i]);
+    this._salience = { listing: messages, values };
+    return values;
+  }
+
+  /** id -> index for `messages`: the shared store order when this is the
+   *  listing it was refreshed from, else a map built for this call. */
+  protected positionIndex(messages: ReadonlyArray<{ id: MessageId }>): ReadonlyMap<MessageId, number> {
+    if (messages === this._storeOrderSource) return this._storeOrder;
+    const positionOf = new Map<MessageId, number>();
+    for (let i = 0; i < messages.length; i++) positionOf.set(messages[i].id, i);
+    return positionOf;
+  }
+
   protected refreshStoreOrder(messages: ReadonlyArray<{ id: MessageId }>): void {
     if (messages.length === 0) return;
-    const order = new Map<MessageId, number>();
-    for (let i = 0; i < messages.length; i++) order.set(messages[i].id, i);
+    const prev = this._storeOrderSource;
+    if (messages === prev) return;
+    // A listing that keeps every earlier element (same object, so same id
+    // and position: the store reuses message objects until an edit) only
+    // grew at the end — add the tail instead of rehashing the whole store.
+    let from = 0;
+    if (prev.length > 0 && messages.length >= prev.length) {
+      let i = 0;
+      while (i < prev.length && messages[i] === prev[i]) i++;
+      if (i === prev.length) from = prev.length;
+    }
+    // A dry select puts back the order it found, by reference (select()), so
+    // it extends a copy instead of writing into that one.
+    const order = from === 0
+      ? new Map<MessageId, number>()
+      : this._dryRunSelect ? new Map(this._storeOrder) : this._storeOrder;
+    for (let i = from; i < messages.length; i++) order.set(messages[i].id, i);
     this._storeOrder = order;
+    this._storeOrderSource = messages;
   }
 
   /**
@@ -3952,6 +4054,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // hidden (viewFilter) or pruned: it occupies no position at all.
     for (const id of members) if (!index.has(id) && chunkMember.has(id)) index.set(id, position++);
     return index;
+  }
+
+  /** First live L1 per message id (the fold-path fallback in selectAdaptive),
+   *  rebuilt only when the summary list's entries change. */
+  private _l1ByMessage: { entries: readonly SummaryEntry[]; map: Map<MessageId, SummaryId> } | null = null;
+  private l1ByMessageIndex(): Map<MessageId, SummaryId> {
+    const memo = this._l1ByMessage;
+    const current = this.summaries;
+    if (memo && memo.entries.length === current.length && memo.entries.every((s, i) => s === current[i])) return memo.map;
+    const map = new Map<MessageId, SummaryId>();
+    for (const s of current) {
+      if (s.level !== 1) continue;
+      for (const mid of s.sourceIds) {
+        if (!map.has(mid)) map.set(mid, s.id);
+      }
+    }
+    this._l1ByMessage = { entries: [...current], map };
+    return map;
   }
 
   private _summaryIndex: { source: readonly SummaryEntry[]; length: number; byId: Map<string, SummaryEntry> } | null = null;
@@ -4849,23 +4969,124 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   select(
     store: MessageStoreView,
     log: ContextLogView,
-      budget: TokenBudget,
-      opts?: SelectOptions
-    ): ContextEntry[] {
-      this.requireLoadedBranch('select');
-      const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
-      const _t0 = _diag ? Date.now() : 0;
+    budget: TokenBudget,
+    opts?: SelectOptions
+  ): ContextEntry[] {
+    this.requireLoadedBranch('select');
+    const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
+    const _t0 = _diag ? Date.now() : 0;
+    if (opts?.dryRun !== true) {
       this.rebuildChunks(store);
       if (_diag) console.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
+      return this.selectPath(store, budget, opts);
+    }
+    // A dry run commits nothing, and that includes what a select leaves for
+    // the next one and for observers: the cache-marker baseline the next
+    // compile measures its stable prefix against, the transition status
+    // (getHotContextSettings), the render stats (getRenderStats, with its
+    // plan-vs-actual), calibration's estimate, arming, store view, load and
+    // multiplier, with the multiplier the store prices by (a dry select that
+    // loads the multiplier first leaves it unloaded, so the next committing
+    // select loads it again and persists what the load decides), the store
+    // order with the listing it was built from, and the head-window memo stay
+    // as the last committing select left them. The order and its listing go
+    // back together: an order put back beside the dry run's listing would
+    // read as current for that listing, so after a removal later selects
+    // would position messages as they stood before it until something
+    // rebuilt the order. A dry refresh extends a copy of the order rather
+    // than the one saved here (refreshStoreOrder). They are put back
+    // here, on every path out, throws included; each select path gates its
+    // own persistence and enqueueing. The dry run's own
+    // render stats are its output, as its plan is (_lastPreview), and
+    // previewContext reads them from _lastPreviewStats.
+    // Chunking runs dry too: a chunk the dry run closes gets no record, and
+    // the chunks, the compression queue and whether chunk records are trusted
+    // (a dry rebuild at a preview's chunk size can read them as orphaned) go
+    // back to the last committing rebuild's, so no tick compresses what only
+    // a dry run (or a preview's overridden chunk size) cut.
+    // The image watermark (imageStripHysteresisRatio) goes back too, with the
+    // post-strip estimates priced from it. The dry run advances it for its own
+    // render and writes nothing, so a preview can't strip images from the next
+    // live compile. It's loaded here, before it's saved, so the value put back
+    // is the loaded one.
+    const saved = {
+      imageWatermark: this.imageWatermark(),
+      postStripMemo: this._postStripMemo,
+      chunks: this.chunks,
+      compressionQueue: this.compressionQueue,
+      chunkRecordsOrphaned: this.chunkRecordsOrphaned,
+      orphanWarned: this._orphanWarned,
+      prevCacheKeys: this._prevCacheKeys,
+      lastFrontierTokens: this.lastFrontierTokens,
+      transitionBlocked: this.transitionBlocked,
+      lastRenderStats: this._lastRenderStats,
+      lastCompileEstimate: this._lastCompileEstimate,
+      calibrationArmed: this._calibrationArmed,
+      calibrationLoaded: this._calibrationLoaded,
+      calibration: this._calibration,
+      calibrationReset: this._calibrationReset,
+      calibrationProvisional: this._calibrationProvisional,
+      storeCalibration: store.getTokenCalibration?.(),
+      storeView: this._storeView,
+      storeOrder: this._storeOrder,
+      storeOrderSource: this._storeOrderSource,
+      headStartMemo: this._cachedHeadStartIndex,
+    };
+    this._lastPreviewStats = undefined;
+    this._dryRunSelect = true;
+    try {
+      this.rebuildChunks(store);
+      if (_diag) console.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
+      return this.selectPath(store, budget, opts);
+    } finally {
+      this._dryRunSelect = false;
+      // Only stats this dry run produced are its preview's: on a throw before
+      // they're written, the previous select's must not pose as the preview's.
+      if (this._lastRenderStats !== saved.lastRenderStats) {
+        this._lastPreviewStats = this._lastRenderStats ?? undefined;
+      }
+      this._imageWatermark = saved.imageWatermark;
+      this._postStripMemo = saved.postStripMemo;
+      this.chunks = saved.chunks;
+      this.compressionQueue = saved.compressionQueue;
+      this.chunkRecordsOrphaned = saved.chunkRecordsOrphaned;
+      this._orphanWarned = saved.orphanWarned;
+      this._prevCacheKeys = saved.prevCacheKeys;
+      this.lastFrontierTokens = saved.lastFrontierTokens;
+      this.transitionBlocked = saved.transitionBlocked;
+      this._lastRenderStats = saved.lastRenderStats;
+      this._lastCompileEstimate = saved.lastCompileEstimate;
+      this._calibrationArmed = saved.calibrationArmed;
+      this._calibrationLoaded = saved.calibrationLoaded;
+      this._calibration = saved.calibration;
+      this._calibrationReset = saved.calibrationReset;
+      this._calibrationProvisional = saved.calibrationProvisional;
+      if (saved.storeCalibration !== undefined) store.setTokenCalibration?.(saved.storeCalibration);
+      this._storeView = saved.storeView;
+      this._storeOrder = saved.storeOrder;
+      this._storeOrderSource = saved.storeOrderSource;
+      this._cachedHeadStartIndex = saved.headStartMemo;
+    }
+  }
 
+  private selectPath(store: MessageStoreView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
     // Image stripping runs inside each select path (before stats commit / cache
     // markers), so the returned entries are already bounded — see
     // applyImageStripping.
     if (this.config.adaptiveResolution) {
-      return this.selectAdaptive(store, budget, opts);
+      try {
+        return this.selectAdaptive(store, budget, opts);
+      } catch (err) {
+        // A provisional multiplier above 1 that puts the compile over budget
+        // is dropped to 1 and the select runs again: with the refusal
+        // standing, no inference would run, so no sample could ever correct
+        // it (#179, the startup wedge). Any other refusal stands.
+        if (!(err instanceof OverBudgetError) || !this.dropProvisionalCalibration(err, opts?.dryRun === true)) throw err;
+        return this.selectAdaptive(store, budget, opts);
+      }
     }
-    // selectHierarchical commits nothing (no state-slot writes, no enqueue),
-    // so it is already dry-run-safe and needs no gating.
+    // selectHierarchical persists and enqueues nothing; what it leaves for
+    // observers (render stats) select() restores for a dry run.
     return this.selectHierarchical(store, budget);
   }
 
@@ -5151,35 +5372,80 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * remove content to satisfy API shape rules, which is a structural edit
    * rather than budget-driven loss, and is out of scope for this invariant.
    */
+  /** Store positions of the live messages under each emitted summary, kept
+   *  while the store order and the summaries array are the ones they were
+   *  read from. */
+  private _coverageMemo: {
+    order: ReadonlyMap<MessageId, number>;
+    source: readonly SummaryEntry[];
+    length: number;
+    positions: Map<string, Int32Array>;
+  } | null = null;
+
   protected assertFullCoverage(entries: ContextEntry[], messages: StoredMessage[], regions?: { headStart: number; headEnd: number; recentStart: number }): void {
-    const covered = new Set<string>();
+    // Coverage by store position: marking is a lookup in the shared position
+    // index instead of a set insert per covered id.
+    const positionOf = this.positionIndex(messages);
+    const covered = new Uint8Array(messages.length);
+    const mark = (id: string): void => {
+      const at = positionOf.get(id);
+      if (at !== undefined) covered[at] = 1;
+    };
     for (const e of entries) {
       const one = (e as { sourceMessageId?: string }).sourceMessageId;
-      if (one) covered.add(one);
+      if (one) mark(one);
       // Composites (merged body-group shards) stand for several messages.
       const many = (e as { sourceMessageIds?: string[] }).sourceMessageIds;
-      if (many) for (const id of many) covered.add(id);
+      if (many) for (const id of many) mark(id);
     }
 
-    // Expand emitted summaries down to the message ids they stand for.
-    const byId = new Map(this.summaries.map(x => [x.id, x]));
-    const seen = new Set<string>();
-    const stack: string[] = [...this._emittedSummaryIds];
-    while (stack.length > 0) {
-      const id = stack.pop();
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      const sum = byId.get(id);
-      if (!sum) continue;
-      if (sum.sourceLevel === 0) {
-        for (const mid of sum.sourceIds) covered.add(mid);
-      } else {
-        for (const child of sum.sourceIds) stack.push(child);
+    // Expand emitted summaries down to the message ids they stand for. On the
+    // store listing the positions under a summary are remembered, so a
+    // summary emitted again marks a position list instead of re-walking its
+    // sources through the index.
+    const byStore = positionOf === this._storeOrder;
+    let memo = byStore ? this._coverageMemo : null;
+    if (byStore && (!memo || memo.order !== positionOf || memo.source !== this.summaries || memo.length !== this.summaries.length)) {
+      memo = { order: positionOf, source: this.summaries, length: this.summaries.length, positions: new Map() };
+      this._coverageMemo = memo;
+    }
+    for (const rootId of this._emittedSummaryIds) {
+      const kept = memo?.positions.get(rootId);
+      if (kept) {
+        for (let k = 0; k < kept.length; k++) covered[kept[k]] = 1;
+        continue;
       }
+      const found: number[] = [];
+      const seen = new Set<string>();
+      const stack: string[] = [rootId];
+      while (stack.length > 0) {
+        const id = stack.pop();
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        const sum = this.summaryById(id);
+        if (!sum) continue;
+        if (sum.sourceLevel === 0) {
+          for (const mid of sum.sourceIds) {
+            const at = positionOf.get(mid);
+            if (at !== undefined) { covered[at] = 1; found.push(at); }
+          }
+        } else {
+          for (const child of sum.sourceIds) stack.push(child);
+        }
+      }
+      memo?.positions.set(rootId, Int32Array.from(found));
     }
 
     const missing: string[] = [];
-    for (const m of messages) if (!covered.has(m.id)) missing.push(m.id);
+    if (byStore) {
+      // The store listing sits at its own positions; a position not marked is
+      // re-read through the index so a repeated id resolves as before.
+      for (let i = 0; i < messages.length; i++) {
+        if (covered[i] !== 1 && covered[positionOf.get(messages[i].id)!] !== 1) missing.push(messages[i].id);
+      }
+    } else {
+      for (const m of messages) if (covered[positionOf.get(m.id)!] !== 1) missing.push(m.id);
+    }
     if (missing.length === 0) return;
 
     const site = this._uncoveredSite || 'unknown-site';
@@ -5395,6 +5661,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (loud) console.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
       else console.error(line);
     }
+    r.calibration = {
+      multiplier: this._calibration,
+      pricingEpoch: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH,
+      ...(this._calibrationProvisional ? { provisional: true as const } : {}),
+      ...(this._calibrationReset ? { reset: this._calibrationReset } : {}),
+    };
     this._lastRenderStats = r;
     this._rs = null;
   }
@@ -5407,7 +5679,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   getRenderStats(store: MessageStoreView): RenderStats {
     this.requireLoadedBranch('getRenderStats');
-    return this._lastRenderStats ?? this.reconstructRenderStats(store);
+    if (this._lastRenderStats) return this._lastRenderStats;
+    // Reconstructing the recent window prices images and may advance the
+    // watermark. Like a dry select, this observer uses that advance locally
+    // and restores the watermark together with the estimates priced from it.
+    const savedWatermark = this.imageWatermark();
+    const savedMemo = this._postStripMemo;
+    const savedDryRun = this._dryRunSelect;
+    this._dryRunSelect = true;
+    try {
+      return this.reconstructRenderStats(store);
+    } finally {
+      this._dryRunSelect = savedDryRun;
+      this._imageWatermark = savedWatermark;
+      this._postStripMemo = savedMemo;
+    }
   }
 
   /**
@@ -6275,8 +6561,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The producer may belong to a different strategy instance. Reload the
       // same namespace's durable result so a successful waiter gets its L1 and
       // an exhausted waiter gets the quarantine projection rather than merely
-      // returning after somebody else's work.
-      this.loadPersistedState();
+      // returning after somebody else's work. This instance's kv-unified
+      // presentation in flight stays as it is (#166).
+      this.loadPersistedState({ keepKvUnifiedPresentation: true });
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       const coalescedSummary = this.findExactL1(chunkIdKey);
       if (coalescedSummary) {
@@ -7795,23 +8082,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // content author's voice. Same principle as the L1 case.
     let mergeReadingContext: { totalTokens: number } | null = null;
     if (sourceLeafIds.size > 0) {
-      const leafBodyGroupIds = new Set<string | undefined>();
-      for (const leafId of sourceLeafIds) {
-        const m = messageById.get(leafId);
-        leafBodyGroupIds.add(m?.bodyGroupId);
-      }
-      if (leafBodyGroupIds.size === 1) {
-        const groupId = [...leafBodyGroupIds][0];
-        if (groupId) {
-          let totalTokens = 0;
-          for (const m of allMessages) {
-            if (m.bodyGroupId === groupId) {
-              totalTokens += ctx.messageStore.estimateTokens(m);
-            }
-          }
-          mergeReadingContext = { totalTokens };
-        }
-      }
+      const body = this.shardedBodyOf(sourceLeafIds, allMessages, ctx);
+      if (body) mergeReadingContext = { totalTokens: body.totalTokens };
     }
     let mergeInstructionText = this.applyIdentityReminder(
       refusalFallback
@@ -8227,7 +8499,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // estimate is taken this compile.
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     let _t = _diag ? Date.now() : 0;
-    this.loadCalibration(store);
+    this.loadCalibration(store, { dryRun });
     const messages = store.getAll();
     this.refreshStoreOrder(messages);
     if (_diag) { console.error(`[cm-cache] selectAdaptive: calibration+getAll ${Date.now() - _t}ms`); _t = Date.now(); }
@@ -8308,11 +8580,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // For each compressible (non-head, non-tail) message we create one
     // PickerChunk. Its l1Id is determined by the existing chunks that
     // group messages into L1 summaries.
-    const chunksByMessageId = new Map<MessageId, Chunk>();
-    for (const ch of this.chunks) {
-      for (const m of ch.messages) {
-        chunksByMessageId.set(m.id, ch);
-      }
+    // rebuildChunks ran on this same listing just before (select), so its
+    // per-position owner table answers directly; any other listing gets a map.
+    const chunkAtPosition = this._chunkByPosition?.listing === messages ? this._chunkByPosition.chunks : null;
+    let chunksByMessageId: Pick<ReadonlyMap<MessageId, Chunk>, 'get'>;
+    if (chunkAtPosition) {
+      const order = this._storeOrder;
+      chunksByMessageId = { get: (id) => { const at = order.get(id); return at === undefined ? undefined : chunkAtPosition[at]; } };
+    } else {
+      const byId = new Map<MessageId, Chunk>();
+      for (const ch of this.chunks) for (const m of ch.messages) byId.set(m.id, ch);
+      chunksByMessageId = byId;
     }
 
     // Pinned-position set so the picker doesn't fold messages the user
@@ -8339,13 +8617,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // 233 raw messages pinned under re-merged L4s; the June c-279 chunk had
     // been in this deadlock silently). L1 `sourceIds` IS the coverage
     // authority — fall back to it when the ledger has no pointer.
-    const l1ByMessage = new Map<MessageId, SummaryId>();
-    for (const s of this.summaries) {
-      if (s.level !== 1) continue;
-      for (const mid of s.sourceIds) {
-        if (!l1ByMessage.has(mid)) l1ByMessage.set(mid, s.id);
-      }
-    }
+    const l1ByMessage = this.l1ByMessageIndex();
+    const ancestorMemo = new Map<SummaryId, (SummaryEntry | null | undefined)[]>();
 
     // The foldable middle is everything outside the LIVE head window and the
     // reserved tail — INCLUDING [0, headStart) after a head-window reset.
@@ -8357,14 +8630,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       : [[headEnd, effectiveRecentStart]];
 
     const pickerChunks: PickerChunk[] = [];
+    const salience = this.salienceByPosition(messages);
     for (const [segStart, segEnd] of middleSegments)
     for (let i = segStart; i < segEnd && i < messages.length; i++) {
       const msg = messages[i];
-      const ch = chunksByMessageId.get(msg.id);
+      const ch = chunkAtPosition ? chunkAtPosition[i] : chunksByMessageId.get(msg.id);
       const tokens = msgCap > 0
         ? Math.min(pse[i], msgCap + 50)
         : pse[i];
-      const bound = pinBounds.get(i);
+      const bound = pinBounds.size > 0 ? pinBounds.get(i) : undefined;
       pickerChunks.push({
         id: msg.id,
         sequence: i,
@@ -8373,11 +8647,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         lockedByAgent: this.locked.has(msg.id),
         // A classic pin (in pinnedSet with no level bound) stays force-raw. A
         // leveled pin is not force-raw; it carries its bound instead.
-        pinned: pinnedSet.has(i) && bound === undefined,
+        pinned: pinnedSet.size > 0 && pinnedSet.has(i) && bound === undefined,
         pinLevel: bound?.level,
         pinMaxLevel: bound?.maxLevel,
         l1Id: ch?.summaryId ?? l1ByMessage.get(msg.id),
-        salience: AutobiographicalStrategy.staticSalience(msg),
+        salience: salience[i],
       });
     }
 
@@ -8437,6 +8711,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // which double-counts the head (reserves it twice: once here, once because
     // finalTokens already includes it). The old form threw ~head-tokens early at
     // tight budgets and quietly under-used the budget by ~head everywhere.
+    // Head and tail chunks were appended after the middle ones, so the
+    // middle chunks are the prefix of pickerChunks and this is their count.
+    const middleChunkCount = pickerChunks.length - headMessageIds.size - tailMessageIds.size;
     const totalBudget = maxTokens;
     const slack = this.config.compressionSlackRatio ?? 0.1;
     const foldingBudget: FoldingBudget = {
@@ -8471,41 +8748,81 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       opts?.kvUnifiedImmutablePrefixHash,
       opts?.kvUnifiedContinuityRelaxation,
     );
-    // NOTE: a dry run also disturbs transition bookkeeping below
+    // NOTE: a dry run also writes transition bookkeeping below
     // (`lastFrontierTokens` feeds `prepared` in getHotContextSettings(), so a
-    // low-budget preview could make a converging transition look prepared and
-    // get it settled by the next real compile). That is restored by
-    // previewContext's `finally`, which owns it for ALL throw paths — do not
+    // low-budget dry run could make a converging transition look prepared).
+    // select() puts it back for every dry run, on ALL throw paths — do not
     // also restore it here, or the two owners will disagree.
     if (_diag) { console.error(`[cm-cache] selectAdaptive: inputs-built ${Date.now() - _t}ms`); _t = Date.now(); }
     const result = picker.run(pickerInputs, foldingBudget);
-    if (this.config.foldingStrategy === 'kv-unified' && !dryRun) {
-      const tree = new SummaryTree(pickerInputs);
+    // A picker result answers by position; a stubbed result (tests, hosts
+    // that wrap the picker) may only carry the map.
+    const levelAt: PickerResult['levelAt'] = typeof result.levelAt === 'function'
+      ? result.levelAt
+      : (_sequence, id) => result.finalResolutions.get(id) ?? 0;
+    if (this.config.foldingStrategy === 'kv-unified') {
+      // The plan's check runs dry or not, so a dry select refuses what a real
+      // compile would; only the draft it builds is a real compile's alone.
+      const reuse = this.kvUnifiedReuse;
+      // The tree is only needed for a leaf the forest cannot hash at its
+      // level and for rendering the layout when the solver did not; build
+      // it on first use. Deriving from an older tree still works: derive
+      // only needs the previous leaves intact and new leaves ownerless.
+      let tree: SummaryTree | null = null;
+      const summaryTree = (): SummaryTree => tree ??=
+        (reuse.tree ? SummaryTree.derive(reuse.tree, pickerInputs) : null) ?? new SummaryTree(pickerInputs);
       const nextSequence = (this.kvUnifiedReceipts.head?.sequence ?? 0) + 1;
       const leaves = new Map<ChunkId, PresentedLeaf>();
-      for (const chunk of pickerInputs.chunks) {
-        const level = result.finalResolutions.get(chunk.id) ?? 0;
-        const summaryId = level > 0 ? tree.ancestorAt(chunk.id, level)?.id : undefined;
-        if (level > 0 && !summaryId) {
-          throw new Error(`kv-unified selected unavailable L${level} for ${chunk.id}`);
+      // The forest the picker just solved on carries each leaf's hash per
+      // level; the tree is the fallback for leaves it does not know.
+      const forest = reuse.forest;
+      // A forest built from these inputs lists its leaves in the inputs'
+      // order when the chunks were already sorted, which the strategy's
+      // position-sequenced chunks are; then the leaf is a positional read.
+      const forestCurrent = forest?.builtFrom(pickerInputs) === true;
+      const forestChunks = forestCurrent ? forest!.orderedChunks() : null;
+      let dense = forestChunks !== null && forestChunks.length === pickerInputs.chunks.length;
+      for (let k = 0; dense && k < forestChunks!.length; k++) dense = forestChunks![k].sequence === k;
+      const forestLeaves = dense ? forest!.orderedLeaves() : null;
+      for (let k = 0; k < pickerInputs.chunks.length; k++) {
+        const chunk = pickerInputs.chunks[k];
+        const level = levelAt(chunk.sequence, chunk.id);
+        const leaf = forestLeaves ? forestLeaves[chunk.sequence] : forestCurrent ? forest!.leaf(chunk.id) : undefined;
+        const slot = leaf ? leaf.availableLevels.indexOf(level) : -1;
+        let repHash: string;
+        if (leaf && slot >= 0) {
+          repHash = leaf.repHashes[slot];
+        } else {
+          const summaryId = level > 0 ? summaryTree().ancestorAt(chunk.id, level)?.id : undefined;
+          if (level > 0 && !summaryId) {
+            throw new Error(`kv-unified selected unavailable L${level} for ${chunk.id}`);
+          }
+          repHash = level === 0 ? `raw:${chunk.id}` : `summary:${summaryId}`;
         }
-        const repHash = level === 0 ? `raw:${chunk.id}` : `summary:${summaryId}`;
+        if (dryRun) continue;
         const previous = this.kvUnifiedReceipts.leaves.get(chunk.id);
-        leaves.set(chunk.id, {
-          repHash,
-          level,
-          lastChangedSeq:
-            previous?.repHash === repHash && previous.level === level
-              ? previous.lastChangedSeq
-              : nextSequence,
-        });
+        // An unchanged leaf keeps its receipt object: no allocation, and the
+        // chain's diff sees identity before it compares fields.
+        leaves.set(chunk.id, previous && previous.repHash === repHash && previous.level === level
+          ? previous
+          : { repHash, level, lastChangedSeq: nextSequence });
       }
-      this.kvUnifiedDraft = {
-        leaves,
-        layout: renderLayout(pickerInputs, tree, result.finalResolutions),
-        immutablePrefixHash: opts?.kvUnifiedImmutablePrefixHash,
-        markerUnitIndices: [],
-      };
+      if (!dryRun) {
+        // With a live cache the solver's terminal evaluator already rendered the
+        // selected cut's layout (the same units, tokens and offsets renderLayout
+        // produces; asserted equal in the terminal evaluator tests). The size
+        // check ties it to this compile's applied frontier.
+        const last = this._lastKvUnified?.lastResult;
+        const solvedLayout = last?.feasible && last.cacheRelevant && result.levelsBySequence !== undefined &&
+          last.selected.levels === result.levelsBySequence ? last.selected.layout : null;
+        this.kvUnifiedDraft = {
+          leaves,
+          layout: solvedLayout ?? renderLayout(pickerInputs, summaryTree(), result.finalResolutions),
+          immutablePrefixHash: opts?.kvUnifiedImmutablePrefixHash,
+          markerUnitIndices: [],
+        };
+        if (tree) reuse.tree = tree;
+      }
     }
     if (_diag) { console.error(`[cm-cache] selectAdaptive: picker.run ${Date.now() - _t}ms`); _t = Date.now(); }
     this.lastFrontierTokens = result.finalTokens;
@@ -8543,11 +8860,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // a failed compile: they are recovery work, not presentation state.
     const pendingResolutionChanges: Array<[string, number]> = [];
     let deepestLevel = 0;
-    for (const [id, level] of result.finalResolutions) {
-      if (headMessageIds.has(id) || tailMessageIds.has(id)) continue;
+    // The middle chunks are the prefix of pickerChunks (head and tail were
+    // appended after them); each carries the resolution it was built with.
+    for (let k = 0; k < middleChunkCount; k++) {
+      const chunk = pickerChunks[k];
+      const id = chunk.id;
+      const level = levelAt(chunk.sequence, id);
       if (level > deepestLevel) deepestLevel = level;
       if (this.locked.has(id)) continue;
-      const prev = this.resolutions.get(id) ?? 0;
+      const prev = chunk.currentResolution;
       if (prev !== level && !dryRun) pendingResolutionChanges.push([id, level]);
     }
     if (plan?.override) {
@@ -8613,9 +8934,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    // Record what a dry run needs, then restore the transition bookkeeping the
-    // pick just clobbered. Done before the over-budget check so an infeasible
-    // preview still reports instead of leaving state disturbed.
+    // Record what a dry run needs (select() puts back the transition
+    // bookkeeping the pick just wrote). Done before the over-budget check so
+    // an infeasible preview still reports.
     if (dryRun) {
       this._lastPreview = {
         finalTokens: result.finalTokens,
@@ -8638,8 +8959,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // current raw plan feasible and must never authorize an inference.
     // A dry run reports infeasibility via `_lastPreview.fits` instead: the
     // whole point of previewing an aggressive budget is to learn it won't fit
-    // without taking the outage that learning it live would cause.
-    if (result.finalTokens > rejectionBudget && !dryRun) {
+    // without taking the outage that learning it live would cause. Except
+    // under a provisional multiplier above 1, which a committing select
+    // would drop and retry at (selectPath): the dry run throws the same
+    // refusal so it takes the same fallback, and its preview says what the
+    // real compile will do. If the retry at 1 is still over, it reports.
+    const dryFallback = dryRun && this._calibrationProvisional !== null && this._calibration > 1;
+    if (result.finalTokens > rejectionBudget && (!dryRun || dryFallback)) {
       throw this.overBudgetError(budget, {
         budget: rejectionBudget,
         actual: result.finalTokens,
@@ -8656,9 +8982,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // ----- 5. Emit middle entries in source order -----
+    const positionOf = this.positionIndex(messages);
     // Walk middle messages. Handle two cases:
-    //  - bodyGroupId set: collect all consecutive shards from the same group,
-    //    emit ONE combined entry with concatenated content (raw shards + inline
+    //  - bodyGroupId set: collect the consecutive shards of the same body (one
+    //    ingestion; a later ingestion of the same text is another body, see
+    //    body-runs.ts), emit ONE combined entry with concatenated content (raw shards + inline
     //    summary text for folded shards). This preserves KV — the model sees
     //    one continuous user message instead of N turns.
     //  - bodyGroupId absent: emit normally (raw L0 message, or Q+A summary pair).
@@ -8670,9 +8998,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // overrun here is estimator drift. The grace window (prefixBudget derives
     // from rejectionBudget) absorbs it; beyond that the select refuses the
     // turn rather than silently dropping whatever happened to render last.
-    const middleChunkCountDiag = pickerChunks.filter(
-      c => !headMessageIds.has(c.id) && !tailMessageIds.has(c.id),
-    ).length;
+    const middleChunkCountDiag = middleChunkCount;
     const emissionOverBudget = (attempted: number): OverBudgetError =>
       this.overBudgetError(budget, {
         stage: 'Emission overran the plan (planner/emitter estimator drift)',
@@ -8695,21 +9021,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const msg = messages[i];
 
       if (msg.bodyGroupId) {
-        // Collect the full run of consecutive shards sharing this bodyGroupId.
-        const groupId = msg.bodyGroupId;
+        // Collect this body's consecutive shards. Another ingestion of the
+        // same text right after it shares the group id but is its own body.
         const groupStart = i;
-        while (
-          i < segEnd &&
-          i < messages.length &&
-          messages[i].bodyGroupId === groupId
-        ) {
-          i++;
-        }
-        const groupMessages = messages.slice(groupStart, i);
-        // Sort by shardIndex to ensure byte-faithful ordering.
-        const sortedShards = [...groupMessages].sort(
-          (a, b) => (a.shardIndex ?? 0) - (b.shardIndex ?? 0)
-        );
+        // Read no further than this segment: nothing past it is emitted here.
+        i = bodyEnd(Math.min(segEnd, messages.length), (k) => messages[k], groupStart) + 1;
+        // Store order: a body's shards are already in rising shard order, and
+        // the walk stops where an index doesn't rise, which also keeps a
+        // region that starts mid-body apart from the next copy (body-runs.ts).
+        const shards = messages.slice(groupStart, i);
 
         // Walk shards in order, accumulating "runs":
         //  - a 'raw' run is consecutive shards at L0; flushed as ONE User
@@ -8725,7 +9045,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           | { kind: 'raw'; parts: string[]; ids: string[] }
           | { kind: 'summary'; ancestor: SummaryEntry };
         let currentRun: Run | null = null;
-        const participant = sortedShards[0].participant;
+        const participant = shards[0].participant;
 
         const flushRun = (): void => {
           if (!currentRun) return;
@@ -8792,8 +9112,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           currentRun = null;
         };
 
-        for (const shard of sortedShards) {
-          const resolution = result.finalResolutions.get(shard.id) ?? 0;
+        for (const shard of shards) {
+          const resolution = levelAt(positionOf.get(shard.id) ?? -1, shard.id);
           if (resolution === 0) {
             if (currentRun?.kind !== 'raw') {
               flushRun();
@@ -8805,7 +9125,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               if (block.type === 'text') rawRun.parts.push(block.text);
             }
           } else {
-            const ancestor = this.findAncestorAt(shard.id, resolution, chunksByMessageId, summariesById, l1ByMessage);
+            const ancestor = this.findAncestorAt(shard.id, resolution, chunksByMessageId, summariesById, l1ByMessage, ancestorMemo);
             if (!ancestor) {
               // Fall back to raw
               if (currentRun?.kind !== 'raw') {
@@ -8833,7 +9153,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
 
       // Non-shard path: existing behavior.
-      const resolution = result.finalResolutions.get(msg.id) ?? 0;
+      const resolution = levelAt(i, msg.id);
       if (resolution === 0) {
         const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
         const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
@@ -8851,7 +9171,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.rsRaw('middleRaw', tokens);
         i++;
       } else {
-        const ancestor = this.findAncestorAt(msg.id, resolution, chunksByMessageId, summariesById, l1ByMessage);
+        const ancestor = this.findAncestorAt(msg.id, resolution, chunksByMessageId, summariesById, l1ByMessage, ancestorMemo,
+          chunkAtPosition ? chunkAtPosition[i] ?? null : undefined);
         if (!ancestor) {
           const content = msgCap > 0 ? this.truncateContent(msg.content, msgCap) : msg.content;
           const tokens = msgCap > 0 ? Math.min(pse[i], msgCap + 50) : pse[i];
@@ -8941,15 +9262,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // The newest stored message is the triggering turn for this compile. A
     // structural repair may rewrite tool blocks, but it must never erase that
-    // turn. Body-group shards merge under the first shard's source id, so any
-    // surviving member of the same group proves the newest shard is present.
+    // turn. A body's shards merge into one entry, so any surviving shard of the
+    // newest body proves the newest shard is present: a head or recent-window
+    // merge keeps its first shard's id as sourceMessageId, and a middle-region
+    // composite carries every shard's id in sourceMessageIds (its
+    // sourceMessageId is unset), which is where the newest body lands when its
+    // newest shard alone outgrows the recent window. Only that body's shards
+    // count: an earlier ingestion of the same text shares the group id, and its
+    // survival proves nothing about the newest turn.
     const newest = messages[messages.length - 1];
     if (newest) {
-      const newestGroupIds = newest.bodyGroupId
-        ? new Set(messages.filter(m => m.bodyGroupId === newest.bodyGroupId).map(m => m.id))
-        : new Set([newest.id]);
+      const newestBody = bodyBoundsIn(messages, messages.length - 1);
+      const newestBodyIds = new Set(messages.slice(newestBody.from, newestBody.to + 1).map(m => m.id));
       const newestRetained = merged.some(
-        entry => entry.sourceMessageId && newestGroupIds.has(entry.sourceMessageId),
+        entry => (entry.sourceMessageId !== undefined && newestBodyIds.has(entry.sourceMessageId)) ||
+          (entry.sourceMessageIds ?? []).some(id => newestBodyIds.has(id)),
       );
       if (!newestRetained) {
         throw this.overBudgetError(budget, {
@@ -8974,7 +9301,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // real strategy to ~50% (docs/kv-stable-context-control.md — marker
     // placement is the dominant KV lever).
     this.placeCacheMarkers(merged, headMessageIds, tailMessageIds);
-    if (this.config.foldingStrategy === 'kv-unified' && this.kvUnifiedDraft) {
+    // A dry run made no draft of its own (see the draft's creation), so the
+    // draft here is the last real compile's, which a dry layout must not
+    // re-mark.
+    if (this.config.foldingStrategy === 'kv-unified' && this.kvUnifiedDraft && !dryRun) {
       this.kvUnifiedDraft.markerUnitIndices = this.reconcileKvUnifiedMarkerIndices(
         merged, this.kvUnifiedDraft.layout, headMessageIds, tailMessageIds,
       );
@@ -9064,18 +9394,57 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     const alpha = 0.2; // slow EMA: one wild request shouldn't yank the ruler
-    const next = current + alpha * (observed - current);
+    const ema = this._calibrationEma ?? current;
+    // A provisional multiplier is a guess (see CALIBRATION_PRICING_EPOCH). This
+    // sample is the first evidence under this release's pricing, so it replaces
+    // the guess outright; the EMA steps from here on.
+    const provisional = this._calibrationProvisional;
+    this._calibrationProvisional = null;
+    const next = provisional ? observed : ema + alpha * (observed - ema);
     const clamped = Math.min(1.8, Math.max(0.6, next));
-    if (Math.abs(clamped - current) / current > 0.02) {
-      console.error(
-        `[estimator-calibration] real/est=${ratio.toFixed(2)} ` +
-          `multiplier ${current.toFixed(2)} -> ${clamped.toFixed(2)} (est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k)`,
-      );
+    this._calibrationEma = clamped;
+    // DEAD BAND. The multiplier is applied only once the EMA has moved more
+    // than 2% from the applied value. Every applied change reprices every
+    // message and summary, so each structure kept across compiles (kv-unified
+    // forest, summary tree, certificate graph, token memos) is rebuilt; a
+    // sample per compile moved it by a fraction of a percent every wake and
+    // made every compile a cold one.
+    // ponytail: fixed 2% band, so estimates may lag the EMA by up to 2%;
+    // make it a config value if a host needs a tighter ruler.
+    if (Math.abs(clamped - current) / current <= 0.02) {
+      // A provisional multiplier confirmed within the band gets its stamp
+      // now: the record it came from has none, or is the discard's.
+      if (provisional) {
+        console.error(
+          `[estimator-calibration] real/est=${ratio.toFixed(2)} confirms the provisional multiplier ` +
+            `${current.toFixed(2)} (est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k); stamped`,
+        );
+        this.persistCalibration();
+      }
+      return;
     }
+    console.error(
+      `[estimator-calibration] real/est=${ratio.toFixed(2)} ` +
+        `multiplier ${current.toFixed(2)} -> ${clamped.toFixed(2)}${provisional ? ' (provisional: replaced, not stepped)' : ''} ` +
+        `(est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k)`,
+    );
     this._calibration = clamped;
     this.applyCalibration();
+    this.persistCalibration();
+  }
+
+  /** Write the multiplier in force under the current pricing stamp, with the
+   *  reset it carries and without the provisional flag a discard wrote: this
+   *  is the first sample's write, which is what ends the provisional state.
+   *  Best-effort, as every calibration write is. */
+  private persistCalibration(): void {
     try {
-      this.store?.setStateJson(this.calibrationStateId, { multiplier: this._calibration, at: Date.now() });
+      this.store?.setStateJson(this.calibrationStateId, {
+        multiplier: this._calibration,
+        at: Date.now(),
+        pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH,
+        ...(this._calibrationReset ? { reset: this._calibrationReset } : {}),
+      });
     } catch { /* persistence is best-effort */ }
   }
 
@@ -9143,7 +9512,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.kvUnifiedPendingLayout = null;
     this.kvUnifiedPendingMarkerUnitIndices = [];
     this.kvUnifiedPendingImmutablePrefixHash = null;
-    this.store?.setStateJson(this.kvUnifiedReceiptStateId, this.kvUnifiedReceipts.serialize());
+    this.persistKvUnifiedReceipts();
+  }
+
+  /** Write the receipt chain snapshot (one entry per leaf: 75k entries, ~5 MB
+   *  of JSON on a long history). */
+  private persistKvUnifiedReceipts(): void {
+    this.writeStateJson(this.kvUnifiedReceiptStateId, this.kvUnifiedReceipts.serialize());
+  }
+
+  /** JSON state write through the byte setter. Handing the native store a
+   *  large JS object makes it walk the graph through napi (~100 ms for 75k
+   *  receipt leaves on Bun); JSON.stringify plus the byte setter is ~10 ms
+   *  for the same parsed value. The native JSON setter refuses `undefined`,
+   *  so no value written today depends on its handling. */
+  private writeStateJson(stateId: string, value: unknown): void {
+    const store = this.store;
+    if (!store) return;
+    if (typeof (store as { setState?: unknown }).setState === 'function') {
+      store.setState(stateId, Buffer.from(JSON.stringify(value)));
+    } else {
+      store.setStateJson(stateId, value);
+    }
   }
 
   reportKvUnifiedFailed(submissionId: string): void {
@@ -9157,25 +9547,264 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _calibrationArmed = false;
 
   private _calibration = 1;
+  /** The EMA itself; `_calibration` is its last applied value (see the dead band). */
+  private _calibrationEma: number | null = null;
   private _calibrationLoaded = false;
+  /** Set when an older-epoch multiplier was discarded; persisted with the record. */
+  private _calibrationReset: CalibrationReset | null = null;
+  /** Set while the multiplier is provisional (see CALIBRATION_PRICING_EPOCH):
+   *  the first sample the band accepts replaces it outright, and one above 1
+   *  that puts a compile over budget is dropped to 1. `fromEpoch` is the
+   *  record's it came from, null for one without a stamp. */
+  private _calibrationProvisional: { fromEpoch: number | null } | null = null;
 
   protected applyCalibration(): void {
     this._storeView?.setTokenCalibration?.(this._calibration);
   }
 
-  /** Load the persisted multiplier once and push it into the store view. */
-  protected loadCalibration(store: MessageStoreView): void {
+  /**
+   * Version of the per-class token pricing the persisted calibration
+   * multiplier was learned against. The multiplier is a residual over those
+   * rates, so it means nothing once they change: a store that pinned 1.8
+   * under the flat-600 signed-thinking price (epoch 0) comes back after the
+   * signature-priced fix estimating ~1.8x its real size. If that inflated
+   * plan is over the hard budget, the very first compile throws
+   * OverBudgetError, so no inference runs, no sample is ever reported, and
+   * the band fix in reportRealInputTokens never gets a chance to decay it: a
+   * permanent startup wedge. Bump this whenever MessageStore/ContextLog
+   * pricing changes shape, and give the new epoch an entry in
+   * CALIBRATION_EPOCH_REPRICES.
+   *
+   *   0: signed thinking at a flat HIDDEN_THINKING_TOKENS_DEFAULT (before 0.11.0)
+   *   1: signed thinking priced by signature length (0.11.0 on)
+   *   2: membrane's XML-history carriers (tool_attempt, tool_notice) priced as
+   *      the markup they replay as, where they had estimated as 0
+   *
+   * A record without a stamp was written by 0.13.0 or earlier: by 0.11.0 to
+   * 0.13.0 under epoch 1's pricing, or by a release before 0.11.0, under
+   * epoch 0's pricing or any before it, which CALIBRATION_EPOCH_REPRICES
+   * doesn't model. Nothing in the record tells these apart (#179: five stores
+   * upgraded from pre-0.11 runtimes kept a 1.8 pinned under the flat
+   * signed-thinking price, folded to ~45% of the window or wedged). So such
+   * a multiplier is PROVISIONAL. It is discarded at load if the epochs since
+   * 1 repriced content the store holds, or if it sits at a clamp edge (a
+   * residual pinned at 1.8 or 0.6 corrected rates that were off by more than
+   * the clamp allows, and says nothing about this release's); otherwise it
+   * is kept, but not re-stamped. A provisional multiplier above 1 that puts
+   * the first compile over budget is dropped to 1 and the select runs again
+   * (dropProvisionalCalibration). The first sample the band accepts replaces
+   * a provisional multiplier outright, instead of stepping the EMA toward it,
+   * and writes the stamp (reportRealInputTokens). The 1 a discard restarts
+   * from is provisional too, so one sample sets it rather than about ten; it
+   * is persisted as such (`provisional: true`), so a restart before that
+   * sample doesn't turn the guess into a learned value. A dry run under a
+   * provisional multiplier above 1 takes the same fallback at the picker's
+   * refusal, which it otherwise only reports.
+   *
+   * A binary from before a bump still learns after a rollback, and its first
+   * applied sample overwrites the newer epoch's record with its own stamp
+   * (reportRealInputTokens); rolling forward again treats that as an older
+   * record.
+   */
+  static readonly CALIBRATION_PRICING_EPOCH = 2;
+
+  /**
+   * For each pricing epoch, the content it repriced: a predicate over the
+   * store that is true when the store holds any. A multiplier from an older
+   * epoch is discarded only if some epoch since then repriced content this
+   * store actually holds. Otherwise its residual still means what it meant
+   * (e.g. a store on another provider's tokenizer, which never carries
+   * signed thinking), and it is re-stamped instead. An epoch without an
+   * entry here counts as repricing everything (discard, as before).
+   */
+  static readonly CALIBRATION_EPOCH_REPRICES: Readonly<Record<number, (messages: readonly StoredMessage[]) => boolean>> = {
+    // 1: signed thinking priced by signature length, not a flat 600. A block
+    // with a numeric `tokenEstimate` is priced by that stamp in both epochs
+    // (MessageStore and ContextLog read it first), so it wasn't repriced.
+    1: (messages) => messages.some((m) => m.content.some((b) => {
+      const block = b as { type?: string; signature?: unknown; tokenEstimate?: unknown };
+      return block.type === 'thinking' && typeof block.signature === 'string' && block.signature.length > 0 &&
+        typeof block.tokenEstimate !== 'number';
+    })),
+    // 2: XML-history carriers, which estimated as 0 before (an unknown block)
+    // and are now priced by MessageStore.xmlHistoryCarrierTokens.
+    2: (messages) => messages.some((m) => m.content.some((b) => MessageStore.xmlHistoryCarrierTokens(b) > 0)),
+  };
+
+  /** Whether any epoch in (fromEpoch, CALIBRATION_PRICING_EPOCH] repriced content in this store. */
+  protected calibrationRepricedSince(fromEpoch: number, messages: readonly StoredMessage[]): boolean {
+    for (let e = fromEpoch + 1; e <= AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH; e++) {
+      const reprices = AutobiographicalStrategy.CALIBRATION_EPOCH_REPRICES[e];
+      if (!reprices || reprices(messages)) return true;
+    }
+    return false;
+  }
+
+  /** Load the persisted multiplier once and push it into the store view.
+   *  A multiplier from an older epoch is re-stamped if no content this store
+   *  holds was repriced since, and otherwise discarded (start at 1). One from
+   *  a record without a stamp is kept as provisional, or discarded when it
+   *  sits at a clamp edge (see CALIBRATION_PRICING_EPOCH). One from a newer
+   *  epoch is not used.
+   *  A dry select's load decides the same way from the record and the store
+   *  as they are, and the rest of its select prices by that decision (its
+   *  chunking ran before the load, at the store's factor then, as a
+   *  committing select's does), but it writes and logs nothing. select()
+   *  then puts back everything the load changed, the multiplier the store
+   *  prices by included, so the first committing select loads again, from
+   *  the record and the store as they are by then, and logs and persists
+   *  what it decides. */
+  protected loadCalibration(store: MessageStoreView, opts: { dryRun: boolean }): void {
     this._storeView = store;
     if (!this._calibrationLoaded) {
       this._calibrationLoaded = true;
+      const commit = !opts.dryRun;
+      // A load decides from the record and the store alone: an earlier dry
+      // load of this branch may have left its own decision in these.
+      this._calibration = 1;
+      this._calibrationReset = null;
+      this._calibrationProvisional = null;
       try {
-        const saved = this.store?.getStateJson(this.calibrationStateId) as { multiplier?: number } | null;
+        const saved = this.store?.getStateJson(this.calibrationStateId) as
+          { multiplier?: number; pricing?: number; reset?: CalibrationReset; provisional?: boolean } | null;
         if (saved && Number.isFinite(saved.multiplier)) {
-          this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+          const current = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+          const stamped = typeof saved.pricing === 'number' && Number.isFinite(saved.pricing);
+          // No stamp: written by 0.13.0 or earlier, under epoch 1's pricing or
+          // any before it (see CALIBRATION_PRICING_EPOCH). The reprice check
+          // can only be asked about the epochs since 1; the rest is what makes
+          // such a multiplier provisional.
+          const epoch = stamped ? saved.pricing! : 1;
+          const fromEpoch = stamped ? epoch : null;
+          const pinned = saved.multiplier! >= 1.8 || saved.multiplier! <= 0.6;
+          const repriced = epoch < current && this.calibrationRepricedSince(epoch, store.getAll());
+          if (epoch === current) {
+            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
+            // A discard's 1 that no sample has confirmed yet was persisted as
+            // provisional, and stays a guess across the restart: the first
+            // sample still sets it, instead of stepping toward it.
+            if (saved.provisional === true) {
+              this._calibrationProvisional = { fromEpoch: this._calibrationReset?.fromEpoch ?? null };
+            }
+          } else if (repriced || (epoch < current && !stamped && pinned)) {
+            const reset: CalibrationReset = { discardedMultiplier: saved.multiplier!, fromEpoch, at: Date.now() };
+            this._calibrationReset = reset;
+            // The 1 this restarts from is a guess too: the first sample sets it.
+            this._calibrationProvisional = { fromEpoch };
+            if (commit) {
+              const why = stamped
+                ? `learned under pricing epoch ${epoch} (current ${current})`
+                : !repriced
+                  ? `from a record with no pricing stamp (0.13.0 or earlier), pinned at the ` +
+                    `${saved.multiplier! >= 1.8 ? 'ceiling' : 'floor'} of its clamp: it corrected per-class rates ` +
+                    `that were off by more than the clamp allows, and says nothing about this release's`
+                  : `from a record with no pricing stamp (0.13.0 or earlier), in a store holding content ` +
+                    `repriced since (current epoch ${current})`;
+              console.warn(
+                `[estimator-calibration] DISCARDED multiplier ${saved.multiplier!.toFixed(2)} ${why}; ` +
+                  `restarting from 1.00. Every token estimate changes by ${(1 / saved.multiplier!).toFixed(2)}x, ` +
+                  `and the window refolds to match; the first provider sample sets the multiplier outright. ` +
+                  `If the old value is still accurate for this store (e.g. it mostly corrects for a ` +
+                  `non-Anthropic tokenizer), check it against provider-billed input tokens and re-stamp it: ` +
+                  `setStateJson('${this.calibrationStateId}', { multiplier, at, pricing: ${current} }). ` +
+                  `Shown as calibration.reset in render stats until then.`,
+              );
+              // Persist the reset, so a rollback to a binary that ignores the
+              // stamp can't reload the stale multiplier and re-arm the wedge,
+              // and the discard isn't re-logged on every restart. The 1 is
+              // persisted as provisional until the first sample's write.
+              try {
+                this.store?.setStateJson(this.calibrationStateId,
+                  { multiplier: 1, at: Date.now(), pricing: current, reset, provisional: true });
+              } catch { /* persistence is best-effort */ }
+            }
+          } else if (epoch < current && stamped) {
+            // Nothing this store holds was repriced since that epoch, so the
+            // residual is still valid: keep it and re-stamp it. A reset it
+            // carries is this store's history and stays with it, as it does
+            // through the learner's writes.
+            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
+            if (commit) {
+              console.warn(
+                `[estimator-calibration] kept multiplier ${this._calibration.toFixed(2)} from pricing epoch ${epoch} ` +
+                  `(current ${current}): this store holds no content repriced since then; re-stamped`,
+              );
+              try {
+                this.store?.setStateJson(this.calibrationStateId, {
+                  multiplier: this._calibration,
+                  at: Date.now(),
+                  pricing: current,
+                  ...(this._calibrationReset ? { reset: this._calibrationReset } : {}),
+                });
+              } catch { /* persistence is best-effort */ }
+            }
+          } else if (epoch < current) {
+            // No stamp, not pinned, and nothing the epochs since 1 repriced:
+            // the multiplier may be epoch 1's and still right, or older and
+            // stale, and the record can't say. Keep it as provisional, and
+            // write nothing: the stamp is the first sample's to give.
+            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
+            this._calibrationProvisional = { fromEpoch: null };
+            if (commit) {
+              console.warn(
+                `[estimator-calibration] kept multiplier ${this._calibration.toFixed(2)} from a record with no ` +
+                  `pricing stamp (0.13.0 or earlier) as provisional: the first provider sample replaces it ` +
+                  `outright, and a compile it puts over budget drops it to 1.00 first. Stamped (epoch ` +
+                  `${current}) once a sample confirms it.`,
+              );
+            }
+          }
+          // A record from a NEWER epoch belongs to a later binary. The load
+          // leaves it on disk and doesn't use it, and logs nothing, since
+          // re-stamping it as the discard warning advises would destroy it.
+          // This binary's learner still writes its own record over it on its
+          // first applied sample (see CALIBRATION_PRICING_EPOCH).
         }
       } catch { /* absent slot is fine */ }
     }
+    // A dry select changes the store's multiplier only where select() read it
+    // first and can put it back (see MessageStoreView).
+    if (opts.dryRun && store.setTokenCalibration && !store.getTokenCalibration) {
+      throw new Error(
+        'A dry select needs a store view that reads its token calibration (getTokenCalibration) ' +
+          'as well as setting it, so the multiplier it applies can be put back afterwards.',
+      );
+    }
     this.applyCalibration();
+  }
+
+  /** The fallback for a provisional multiplier above 1 whose compile was
+   *  refused (see CALIBRATION_PRICING_EPOCH): discard it to 1, so the select
+   *  can run again, and record the reset; a committing select logs and
+   *  persists it, a dry one keeps it to itself (select() puts it back).
+   *  Returns false when there is nothing to drop: no provisional multiplier,
+   *  or one at or below 1, where raising estimates can't help, so the refusal
+   *  stands. The 1 stays provisional: the first sample sets it. */
+  protected dropProvisionalCalibration(err: OverBudgetError, dryRun: boolean): boolean {
+    const provisional = this._calibrationProvisional;
+    if (!provisional || this._calibration <= 1) return false;
+    const current = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const discarded = this._calibration;
+    const reset: CalibrationReset = { discardedMultiplier: discarded, fromEpoch: provisional.fromEpoch, at: Date.now() };
+    this._calibration = 1;
+    this._calibrationReset = reset;
+    this.applyCalibration();
+    if (dryRun) return true;
+    console.warn(
+      `[estimator-calibration] DISCARDED provisional multiplier ${discarded.toFixed(2)} ` +
+        `(${provisional.fromEpoch === null ? 'from a record with no pricing stamp' : `from pricing epoch ${provisional.fromEpoch}`}): ` +
+        `the compile priced by it was refused (${err.actual} tokens against a hard budget of ${err.budget}); ` +
+        `restarting from 1.00 and compiling again. The first provider sample sets the multiplier outright. ` +
+        `Shown as calibration.reset in render stats.`,
+    );
+    try {
+      this.store?.setStateJson(this.calibrationStateId,
+        { multiplier: 1, at: Date.now(), pricing: current, reset, provisional: true });
+    } catch { /* persistence is best-effort */ }
+    return true;
   }
 
   /**
@@ -9408,8 +10037,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Look up bodyGroup metadata by sourceMessageId, memoized for the
     // duration of this pass. Entries reference the same messages repeatedly
-    // (run-extension checks + the shardIndex sort comparator below), and
-    // store.get() also resolves blobs — fetch each message at most once.
+    // (the run-extension checks below), and store.get() also resolves
+    // blobs — fetch each message at most once.
     // Read the metadata off the full listing (the caller's, so a filtered
     // view is not listed twice) instead of one `store.get()` per raw entry:
     // each get re-fetched the record from chronicle and resolved its blobs — ~0.7 s per compile on a 75k-message
@@ -9423,6 +10052,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       sourceMessageId ? shardMeta.get(sourceMessageId) : undefined;
     const groupOf = (sourceMessageId?: string): string | undefined =>
       metaOf(sourceMessageId)?.groupId;
+    const shardOf = (entry: ContextEntry) => {
+      const meta = metaOf(entry.sourceMessageId);
+      return meta ? { bodyGroupId: meta.groupId, shardIndex: meta.shardIndex } : undefined;
+    };
 
     const out: ContextEntry[] = [];
     let i = 0;
@@ -9434,35 +10067,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         i++;
         continue;
       }
-      // Collect run of consecutive raw entries with same bodyGroupId.
-      const run: ContextEntry[] = [entry];
-      let j = i + 1;
-      while (
-        j < entries.length &&
-        entries[j].sourceRelation === 'copy' &&
-        groupOf(entries[j].sourceMessageId) === groupId
-      ) {
-        run.push(entries[j]);
-        j++;
-      }
+      // Collect the run of consecutive raw entries of the same body. Another
+      // ingestion of the same text shares the group id but restarts its
+      // shard indices, and a window can start mid-body: the run ends where an
+      // index doesn't rise (see body-runs.ts).
+      const end = bodyEnd(entries.length, (k) => (entries[k]!.sourceRelation === 'copy' ? shardOf(entries[k]!) : undefined), i);
+      const run: ContextEntry[] = entries.slice(i, end + 1);
+      const j = end + 1;
       if (run.length === 1) {
         out.push({ ...entry, index: out.length });
         i++;
         continue;
       }
-      // Sort the run by the underlying shardIndex to ensure byte-faithful
-      // ordering. (Head/tail emission keeps chronological order, but defending
-      // against reorderings is cheap.)
-      const sortedRun = [...run].sort((a, b) => {
-        const sa = metaOf(a.sourceMessageId)?.shardIndex ?? 0;
-        const sb = metaOf(b.sourceMessageId)?.shardIndex ?? 0;
-        return sa - sb;
-      });
+      // Head and tail emission keep store order, so the run's shards are
+      // already in rising shard order (body-runs.ts).
       // Build merged text content. Non-text blocks (rare in shards) are
       // preserved on the first shard's entry only.
       const mergedTextParts: string[] = [];
       const nonTextBlocks: ContentBlock[] = [];
-      for (const r of sortedRun) {
+      for (const r of run) {
         for (const block of r.content) {
           if (block.type === 'text') mergedTextParts.push(block.text);
           else nonTextBlocks.push(block);
@@ -9474,14 +10097,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ];
       out.push({
         index: out.length,
-        sourceMessageId: sortedRun[0].sourceMessageId,
+        sourceMessageId: run[0].sourceMessageId,
         // Keep every shard's id: this composite represents all of them, and
         // the coverage invariant reads provenance, not just the first source.
-        sourceMessageIds: sortedRun
+        sourceMessageIds: run
           .map(e => e.sourceMessageId)
           .filter((id): id is string => !!id),
         sourceRelation: 'copy',
-        participant: sortedRun[0].participant,
+        participant: run[0].participant,
         content: mergedContent,
       });
       i = j;
@@ -9549,6 +10172,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       const strategy = new KvUnifiedStrategy({
         ...configured,
+        reuse: this.kvUnifiedReuse,
         continuityMultiplier: this.kvUnifiedContinuityMultiplier(continuityRelaxation),
         latentDemand: {
           mergeThreshold: this.config.mergeThreshold ?? 6,
@@ -9608,6 +10232,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  `[kv-escalation]` observability (design §13.4: every override is loud). */
   private _lastKvStable: KvStableStrategy | null = null;
   private _lastKvUnified: KvUnifiedStrategy | null = null;
+  /** Structures kv-unified may derive from across compiles (validated on use). */
+  private readonly kvUnifiedReuse: KvUnifiedReuse = {};
 
   /**
    * Static salience prior (design §13.3) — "is the window the only copy?".
@@ -9744,28 +10370,42 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected findAncestorAt(
     messageId: MessageId,
     level: number,
-    chunksByMessageId: ReadonlyMap<MessageId, Chunk>,
+    chunksByMessageId: Pick<ReadonlyMap<MessageId, Chunk>, 'get'>,
     summariesById?: ReadonlyMap<string, SummaryEntry>,
     /** Fold-path fallback (see selectAdaptive): message → covering L1 id
      *  from L1 sourceIds, for released/boundary-drifted chunk records.
      *  MUST be passed wherever the planner used the same fallback, or the
      *  emitter renders raw what the plan priced folded (emission refusal). */
     l1Fallback?: ReadonlyMap<MessageId, SummaryId>,
+    /** Per-compile memo of the walk from a start summary to its ancestor at
+     *  a level; every message under the same L1 shares it. */
+    memo?: Map<SummaryId, (SummaryEntry | null | undefined)[]>,
+    /** The message's chunk record when the caller already holds it (null
+     *  for none); undefined looks it up. */
+    knownChunk?: Chunk | null,
   ): SummaryEntry | null {
     if (level <= 0) return null;
-    const chunk = chunksByMessageId.get(messageId);
+    const chunk = knownChunk === undefined ? chunksByMessageId.get(messageId) : knownChunk ?? undefined;
     const startId = chunk?.summaryId ?? l1Fallback?.get(messageId);
     if (!startId) return null;
+    let known = memo?.get(startId);
+    if (known) {
+      const cached = known[level];
+      if (cached !== undefined) return cached;
+    } else if (memo) {
+      memo.set(startId, known = []);
+    }
     const lookup = (id: string): SummaryEntry | undefined =>
       summariesById ? summariesById.get(id) : this.summaries.find((s) => s.id === id);
     let current: SummaryEntry | undefined = lookup(startId);
     while (current && current.level < level) {
       const parentId = getSummaryParentId(current);
-      if (!parentId) return null;
+      if (!parentId) { current = undefined; break; }
       current = lookup(parentId);
     }
-    if (!current || current.level !== level) return null;
-    return current;
+    const found = current && current.level === level ? current : null;
+    if (known) known[level] = found;
+    return found;
   }
 
   /**
@@ -10010,10 +10650,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Legacy (positionedRecallPairs=false): summaries concatenated into one
     // Q/A pair between head and tail; pinned messages still emit raw, in
     // their chronological positions, after the combined recall pair.
-    const positionOf = new Map<string, number>();
-    for (let i = 0; i < messages.length; i++) {
-      positionOf.set(messages[i].id, i);
-    }
+    const positionOf = this.positionIndex(messages);
     const pinnedPositionsSet = this.pinnedPositions(messages);
     // Pinned messages between head and recent (head/recent pinned ones
     // already emit raw via Phase 0 / Phase 4).
@@ -10405,6 +11042,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * The one sharded body every given message belongs to, with its total
+   * tokens, or null when they don't all belong to one. A body is one
+   * ingestion: another ingestion of the same text shares the group id, and
+   * counting it too doubled the document (see body-runs.ts).
+   */
+  protected shardedBodyOf(
+    ids: Iterable<string>,
+    allMessages: readonly StoredMessage[],
+    ctx: StrategyContext,
+  ): { totalTokens: number } | null {
+    const wanted = [...ids];
+    const at = allMessages.findIndex((m) => m.id === wanted[0]);
+    if (at < 0 || !allMessages[at]!.bodyGroupId) return null;
+    const { from, to } = bodyBoundsIn(allMessages, at);
+    const messages = allMessages.slice(from, to + 1);
+    const inBody = new Set(messages.map((m) => m.id));
+    if (!wanted.every((id) => inBody.has(id))) return null;
+    let totalTokens = 0;
+    for (const m of messages) totalTokens += ctx.messageStore.estimateTokens(m);
+    return { totalTokens };
+  }
+
+  /**
    * If the chunk is part of a substantially larger sharded message (total
    * bodyGroup tokens ≥ 2× the chunk's own tokens), return reading-context
    * metadata for the reading instruction. The 2× threshold means the
@@ -10420,21 +11080,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     chunk: Chunk,
     ctx: StrategyContext,
   ): { totalTokens: number; chunkTokens: number } | null {
-    if (chunk.messages.length === 0) return null;
-    const firstGroupId = chunk.messages[0].bodyGroupId;
-    if (!firstGroupId) return null;
-    // All messages in the chunk must share the same bodyGroupId
-    for (const m of chunk.messages) {
-      if (m.bodyGroupId !== firstGroupId) return null;
-    }
-    // Total tokens of the original message (sum of all shards in the bodyGroup).
-    const allMessages = ctx.messageStore.getAll();
-    let totalTokens = 0;
-    for (const m of allMessages) {
-      if (m.bodyGroupId === firstGroupId) {
-        totalTokens += ctx.messageStore.estimateTokens(m);
-      }
-    }
+    // A chunk of whole messages is no part of a sharded body: answer before
+    // listing the store, as every chunk asks.
+    if (chunk.messages.length === 0 || !chunk.messages[0]!.bodyGroupId) return null;
+    const body = this.shardedBodyOf(chunk.messages.map((m) => m.id), ctx.messageStore.getAll(), ctx);
+    if (!body) return null;
+    const totalTokens = body.totalTokens;
     // Tokens in this chunk specifically.
     let chunkTokens = 0;
     for (const m of chunk.messages) {
@@ -10530,10 +11181,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     summaries: SummaryEntry[],
     messages: StoredMessage[],
   ): SummaryEntry[] {
-    const positionOf = new Map<string, number>();
-    for (let i = 0; i < messages.length; i++) {
-      positionOf.set(messages[i].id, i);
-    }
+    const positionOf = this.positionIndex(messages);
     return [...summaries].sort((a, b) => {
       const posA = positionOf.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
       const posB = positionOf.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
@@ -10667,7 +11315,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * [0, headStart) ∪ [headEnd, recentStart) minus any positions covered
    * by a pin or document mark.
    */
-  protected getCompressibleMessages(store: MessageStoreView): StoredMessage[] {
+  protected getCompressibleMessages(store: MessageStoreView, exclude?: Uint8Array): StoredMessage[] {
     const messages = store.getAll();
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
@@ -10677,6 +11325,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (let i = 0; i < recentStart; i++) {
       if (i >= headStart && i < headEnd) continue;
       if (pinned.has(i)) continue;
+      if (exclude && exclude[i]) continue;
       out.push(messages[i]);
     }
     return out;
@@ -10695,36 +11344,67 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.compressionQueue = [];
 
     // ---- 1. Materialize persisted records (they OWN their messages). ----
-    const byId = new Map<string, StoredMessage>();
     const listing = store.getAll();
     this.refreshStoreOrder(listing);
-    for (const m of listing) byId.set(m.id, m);
+    // id -> listing index; the same map positions the frontier below.
+    const position = listing.length === 0 ? new Map<MessageId, number>() : this._storeOrder;
 
-    const consumed = new Set<string>();
+    const consumed = new Uint8Array(listing.length);
+    const byPosition: (Chunk | undefined)[] = new Array(listing.length);
+    this._chunkByPosition = { listing, chunks: byPosition };
+    // A record resolves to the same message objects at the same positions as
+    // last time when the listing only grew (the store keeps message objects
+    // until an edit, which replaces them all), so its messages and token sum
+    // carry over; only the record's own fields are re-read.
+    const calibration = store.getTokenCalibration?.() ?? 1;
+    const ignoreSize = !!this.config.attachmentsIgnoreSize;
+    const memo = this._recordChunks;
+    let reusable = memo !== null && memo.records === this.chunkRecords && memo.calibration === calibration &&
+      memo.ignoreSize === ignoreSize && listing.length >= memo.listing.length;
+    if (reusable) {
+      const prev = memo!.listing;
+      for (let i = 0; i < prev.length; i++) if (listing[i] !== prev[i]) { reusable = false; break; }
+    }
+    const entries: NonNullable<typeof memo>['entries'] = [];
     let orphaned = 0;
-    for (const rec of this.chunkRecords) {
-      const msgs: StoredMessage[] = [];
-      for (const id of rec.sourceIds) {
-        const m = byId.get(id);
-        if (m) msgs.push(m);
+    for (let r = 0; r < this.chunkRecords.length; r++) {
+      const rec = this.chunkRecords[r];
+      const kept = reusable && r < memo!.entries.length ? memo!.entries[r] : null;
+      let msgs: StoredMessage[], tokens: number, positions: number[];
+      if (kept && kept.record === rec && kept.messages.length === rec.sourceIds.length) {
+        ({ messages: msgs, tokens, positions } = kept);
+        for (const at of positions) consumed[at] = 1;
+        entries.push(kept);
+      } else {
+        msgs = []; positions = [];
+        for (const id of rec.sourceIds) {
+          const at = position.get(id);
+          if (at === undefined) continue;
+          msgs.push(listing[at]);
+          consumed[at] = 1;
+          positions.push(at);
+        }
+        tokens = msgs.reduce((sum, m) => sum + (ignoreSize
+          ? this.estimateTextOnlyTokens(m)
+          : store.estimateTokens(m)), 0);
+        entries.push({ record: rec, messages: msgs, tokens, positions });
       }
       if (msgs.length === 0) { orphaned++; continue; }
-      for (const m of msgs) consumed.add(m.id);
       const chunk: Chunk = {
         index: this.chunks.length,
         startIndex: -1, // record-derived; filtered-array indices are not meaningful
         endIndex: -1,
         messages: msgs,
-        tokens: msgs.reduce((sum, m) => sum + (this.config.attachmentsIgnoreSize
-          ? this.estimateTextOnlyTokens(m)
-          : store.estimateTokens(m)), 0),
+        tokens,
         compressed: rec.compressed,
         summaryId: rec.summaryId,
         phaseType: rec.phaseType,
         recordId: rec.id,
       };
+      for (const at of positions) byPosition[at] = chunk;
       this.chunks.push(chunk);
     }
+    this._recordChunks = { listing, records: this.chunkRecords, calibration, ignoreSize, entries };
 
     // ---- 2. Fail closed on the chain-break signature. ----
     // Most records resolving to zero live messages means message identity
@@ -10766,10 +11446,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // are not the resident's, and a record written here would be compressed
     // by the resident at its next boot.
     if (this.config.auditOnly) return;
-    const messagesToChunk = this.getCompressibleMessages(store)
-      .filter(m => !consumed.has(m.id));
-    const livePosition = new Map<string, number>();
-    store.getAll().forEach((message, index) => livePosition.set(message.id, index));
+    const messagesToChunk = this.getCompressibleMessages(store, consumed);
+    const livePosition = position;
 
     let currentChunk: StoredMessage[] = [];
     let currentTokens = 0;
@@ -10788,8 +11466,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         compressed: false,
       };
       // Persist the boundary the moment it closes — from here on this
-      // span is owned and never re-keyed by config drift or restarts.
-      if (this.chunkPersistenceEnabled) {
+      // span is owned and never re-keyed by config drift or restarts. A dry
+      // select's chunks stay unrecorded: select() puts the last committing
+      // rebuild's chunks back after it.
+      if (this.chunkPersistenceEnabled && !this._dryRunSelect) {
         const record: ChunkRecord = {
           id: `c-${this.chunkIdCounter++}`,
           sourceIds: chunk.messages.map(m => m.id),
@@ -10797,6 +11477,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         };
         this.appendChunkRecord(record);
         chunk.recordId = record.id;
+      }
+      for (const m of chunk.messages) {
+        const at = position.get(m.id);
+        if (at !== undefined) byPosition[at] = chunk;
       }
       this.chunks.push(chunk);
       this.compressionQueue.push(chunk.index);
@@ -11007,8 +11691,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return; // policy disabled
 
     const messages = store.getAll();
-    const posById = new Map<string, number>();
-    for (let i = 0; i < messages.length; i++) posById.set(messages[i].id, i);
+    const posById = this.positionIndex(messages);
     const stripStart = depthTokens > 0 ? this.getImageStripStart(store, depthTokens) : 0;
 
     // Same region windows select() bucketed by, so a stripped image's reclaimed
@@ -11039,13 +11722,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const { idx, pos } of ordered) {
       const entry = entries[idx];
       const tooDeep = depthTokens > 0 && (pos < 0 || pos < stripStart);
+      const belowMark = pos >= 0 && this.belowImageWatermark(messages[pos]!.sequence);
       const bucket = bucketAt(pos);
       entry.content = entry.content.map((block) => {
         if (block.type !== 'image') return block;
         const blockBytes = AutobiographicalStrategy.imageBlockBytes(block);
         const overCount = maxLive > 0 && keptImages >= maxLive;
         const overBytes = maxLiveBytes > 0 && keptImageBytes + blockBytes > maxLiveBytes;
-        if (tooDeep || overCount || overBytes) {
+        if (belowMark || tooDeep || overCount || overBytes) {
           // Stats-neutral (2026-07-12): every budgeting site now tallies at
           // POST-STRIP prices (see postStripEstimates), so the bucket never
           // charged this image at full weight — reclaiming here would
@@ -11059,6 +11743,86 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return block;
       });
     }
+  }
+
+  /** imageStripHysteresisRatio: images in messages at or before this
+   *  sequence stay stripped (undefined = none). Loaded lazily, persisted. */
+  private _imageWatermark: number | undefined;
+  private _imageWatermarkLoaded = false;
+
+  protected imageWatermark(): number | undefined {
+    if (!this._imageWatermarkLoaded) {
+      this._imageWatermarkLoaded = true;
+      try {
+        const saved = this.store?.getStateJson(this.imageWatermarkStateId) as { sequence?: number } | null;
+        if (saved && Number.isFinite(saved.sequence)) this._imageWatermark = saved.sequence;
+      } catch { /* absent slot is fine */ }
+    }
+    return this._imageWatermark;
+  }
+
+  /** Hysteresis ratio in (0, 1), or undefined when the option is off. */
+  private imageHysteresisRatio(): number | undefined {
+    const r = this.config.imageStripHysteresisRatio;
+    return typeof r === 'number' && r > 0 && r < 1 ? r : undefined;
+  }
+
+  /**
+   * imageStripHysteresisRatio: if any image newer than the watermark would be
+   * stripped by the live-image limits, advance the watermark so that what
+   * remains fits within ratio × each limit. Deterministic in the store's
+   * content, and persisted, so a restart renders the same stripped set.
+   */
+  protected maybeAdvanceImageWatermark(store: MessageStoreView): void {
+    const ratio = this.imageHysteresisRatio();
+    if (ratio === undefined) return;
+    const stripDepth = this.config.imageStripDepthTokens ?? 0;
+    const maxLive = this.config.maxLiveImages ?? 0;
+    const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
+    if (stripDepth === 0 && maxLive === 0 && maxLiveBytes === 0) return;
+    const messages = store.getAll();
+    const w = this.imageWatermark();
+    // Walk newest-first with the given limits; return the sequence of the
+    // first message holding an image that does not fit (or undefined).
+    const firstMisfit = (depthCap: number, countCap: number, bytesCap: number): number | undefined => {
+      let depth = 0, count = 0, bytes = 0;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i]!;
+        if (w !== undefined && m.sequence <= w) break;
+        for (const b of m.content) {
+          if (b.type !== 'image') continue;
+          const size = AutobiographicalStrategy.imageBlockBytes(b);
+          const misfit = (depthCap > 0 && depth > depthCap) || (countCap > 0 && count >= countCap) ||
+            (bytesCap > 0 && bytes + size > bytesCap);
+          if (misfit) return m.sequence;
+          count++;
+          bytes += size;
+        }
+        depth += store.estimateTokens(m);
+      }
+      return undefined;
+    };
+    if (firstMisfit(stripDepth, maxLive, maxLiveBytes) === undefined) return; // no limit binds
+    const next = firstMisfit(
+      stripDepth > 0 ? Math.floor(stripDepth * ratio) : 0,
+      maxLive > 0 ? Math.max(0, Math.floor(maxLive * ratio)) || 1 : 0,
+      maxLiveBytes > 0 ? Math.floor(maxLiveBytes * ratio) : 0,
+    );
+    if (next === undefined || (w !== undefined && next <= w)) return;
+    this._imageWatermark = next;
+    // Dry selections and observer reconstructions advance it locally only;
+    // their finally blocks restore it together with the post-strip memo.
+    if (this._dryRunSelect) return;
+    try {
+      this.store?.setStateJson(this.imageWatermarkStateId, { sequence: next, at: Date.now() });
+    } catch { /* persistence is best-effort */ }
+  }
+
+  /** True when an image in the message with this sequence is below the watermark. */
+  protected belowImageWatermark(sequence: number | undefined): boolean {
+    if (this.imageHysteresisRatio() === undefined) return false;
+    const w = this.imageWatermark();
+    return w !== undefined && sequence !== undefined && sequence <= w;
   }
 
   /**
@@ -11075,11 +11839,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected postStripEstimates(store: MessageStoreView): number[] {
     const messages = store.getAll();
-    const out = new Array<number>(messages.length);
     const stripDepth = this.config.imageStripDepthTokens ?? 0;
     const maxLive = this.config.maxLiveImages ?? 0;
     const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
+    // A compile asks for this pass more than once (recent-window scan, then
+    // the picker inputs). The listing array is the store's own cached view,
+    // so its identity, calibration and the knobs key the memo, the
+    // hysteresis ratio among them: it decides whether and how the watermark
+    // strips. The watermark is not in the key: it advances only on a memo
+    // miss, and dry selections and observer reconstructions restore it with
+    // the memo. A branch reload clears both. Callers treat the array as read-only.
+    const memoCalibration = store.getTokenCalibration?.() ?? 1;
+    const ratio = this.imageHysteresisRatio();
+    const memo = this._postStripMemo;
+    if (
+      memo && memo.messages === messages && memo.calibration === memoCalibration &&
+      memo.stripDepth === stripDepth && memo.maxLive === maxLive && memo.maxLiveBytes === maxLiveBytes &&
+      memo.ratio === ratio
+    ) return memo.out;
+    const out = new Array<number>(messages.length);
     const stripActive = stripDepth > 0 || maxLive > 0 || maxLiveBytes > 0;
+    if (stripActive) this.maybeAdvanceImageWatermark(store);
     const placeholderTokens = Math.ceil(AutobiographicalStrategy.IMAGE_PLACEHOLDER.length / 4);
     // `store.estimateTokens` prices every block at round(raw × calibration);
     // the stripped image's share must come off at that SAME price. Subtracting
@@ -11103,7 +11883,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const beyondDepth = stripDepth > 0 && rawDepth > stripDepth;
           const beyondCount = maxLive > 0 && liveImagesSeen >= maxLive;
           const beyondBytes = maxLiveBytes > 0 && liveImageBytes + bytes > maxLiveBytes;
-          if (beyondDepth || beyondCount || beyondBytes) {
+          const belowMark = this.belowImageWatermark(messages[i].sequence);
+          if (belowMark || beyondDepth || beyondCount || beyondBytes) {
             const imgEst = (b as { tokenEstimate?: number }).tokenEstimate ?? 1600;
             est -= Math.max(0, calibrated(imgEst) - calibrated(placeholderTokens));
           } else {
@@ -11116,8 +11897,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Belt and braces: a message never costs less than nothing.
       out[i] = Math.max(0, est);
     }
+    this._postStripMemo = { messages, calibration: memoCalibration, stripDepth, maxLive, maxLiveBytes, ratio, out };
     return out;
   }
+
+  private _postStripMemo: {
+    messages: readonly StoredMessage[]; calibration: number; stripDepth: number; maxLive: number; maxLiveBytes: number; ratio: number | undefined; out: number[];
+  } | null = null;
 
   /** Byte wall default: 20MB of base64 (API total-request cap is 32MB). */
   protected static readonly DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
@@ -11153,8 +11939,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // browser carries most of its image bytes NESTED in tool results, not as
     // top-level blocks. Capping only the top level left those untouched and
     // membrane's transport shed kept firing at 27MB (2026-07-12).
-    const capBlocks = (blocks: ContentBlock[]): ContentBlock[] =>
-      blocks.map((b) => {
+    // A block is copied only when an image in it is replaced, so an untouched
+    // block keeps its identity and its raw replay form (see raw-forms.ts).
+    const capBlocks = (blocks: ContentBlock[]): ContentBlock[] => {
+      let changed = false;
+      const capped = blocks.map((b) => {
         if (b.type === 'image') {
           const bytes = AutobiographicalStrategy.imageBlockBytes(b);
           if (kept + bytes <= capBytes) {
@@ -11162,14 +11951,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             return b;
           }
           dropped++;
+          changed = true;
           return { type: 'text', text: AutobiographicalStrategy.IMAGE_PLACEHOLDER } as ContentBlock;
         }
         const nested = (b as { type: string; content?: unknown }).content;
         if (b.type === 'tool_result' && Array.isArray(nested)) {
-          return { ...b, content: capBlocks(nested as ContentBlock[]) } as ContentBlock;
+          const inner = capBlocks(nested as ContentBlock[]);
+          if (inner === nested) return b;
+          changed = true;
+          return { ...b, content: inner } as ContentBlock;
         }
         return b;
       });
+      return changed ? releaseEditedRawForms(blocks, capped) : blocks;
+    };
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
       if (!Array.isArray(m.content)) continue;
@@ -11219,9 +12014,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (b > 0 && this.hasToolResult(messages[b])) {
           b--;
           // Adaptive-resolution ingress puts a sharded message's tool_use on
-          // its FIRST shard: step back over the whole body group.
-          const group = messages[b].bodyGroupId;
-          if (group) while (b > 0 && messages[b - 1].bodyGroupId === group) b--;
+          // its FIRST shard: step back to the start of that body (not over an
+          // earlier ingestion of the same text, which shares the group id).
+          b = bodyStart((k) => messages[k], b);
         }
         return b;
       }
@@ -11512,7 +12307,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         });
         if (filtered.length !== entry.content.length) {
           entry.content = filtered.length > 0
-            ? filtered
+            ? releaseEditedRawForms(entry.content, filtered)
             : [{ type: 'text', text: '[tool call omitted]' }];
         }
       }
@@ -11610,19 +12405,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           b => b.type === 'tool_result' && b.toolUseId === id,
         );
         if (bi === -1) continue;
-        const real = src.content[bi];
-        const rest = src.content.filter((_, k) => k !== bi);
+        const source = src.content;
+        const real = source[bi];
+        const rest = source.filter((_, k) => k !== bi);
+        // A raw replay form shared with the results left behind (one
+        // <function_results> holding several) is true of neither side once
+        // they're apart; each gives it up (see raw-forms.ts).
         src.content = rest.length > 0
-          ? rest
+          ? releaseEditedRawForms(source, rest)
           : [{ type: 'text', text: '[tool result moved during context repair]' }];
-        return real;
+        return releaseSharedRawFormsOnMove(real, source);
       }
       return this.createToolResultStub(id);
     });
   }
 
   /**
-   * Prune tool_use / tool_result blocks in-place:
+   * Prune tool_use / tool_result blocks in place on the entries (an edited
+   * entry gets its own copy of its content array, never the store's):
    *  1. Truncate `tool_use.input` blocks whose serialized JSON exceeds
    *     `toolUseInputMaxTokens`.
    *  2. For each tool name, keep only the last N `tool_result` blocks
@@ -11635,6 +12435,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * affect chunk formation or the recall/pin layout.
    */
   protected pruneToolEntries(entries: ContextEntry[]): void {
+    // Each edited entry's content as it was, so the edit's raw replay forms can
+    // be released once both passes are done (see raw-forms.ts).
+    //
+    // An entry's content array can be its message's own, from the store's
+    // cached getAll() view (immutable to callers), whenever no message cap cut
+    // it. So the first edit gives the entry a copy and leaves that array as it
+    // was. An edit written into it would reach every getAll() caller until the
+    // next store write, and the next compile would start from the marker
+    // instead of the original (the compile-twice test in raw-forms.test.ts).
+    const originals = new Map<ContextEntry, ContentBlock[]>();
+    const replaceBlock = (entry: ContextEntry, index: number, block: ContentBlock): void => {
+      if (!originals.has(entry)) {
+        originals.set(entry, entry.content);
+        entry.content = entry.content.slice();
+      }
+      entry.content[index] = block;
+    };
+
     // Pass 1: build toolUseId → toolName map and apply input truncation
     const toolUseInputCap = this.config.toolUseInputMaxTokens ?? 0;
     const toolUseIdToName = new Map<string, string>();
@@ -11650,14 +12468,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const inputTokens = Math.ceil(inputJson.length / 4);
           if (inputTokens > toolUseInputCap) {
             const keys = Object.keys(block.input).slice(0, 5);
-            entry.content[i] = {
+            replaceBlock(entry, i, {
               ...block,
               input: {
                 _truncated: true,
                 _originalTokens: inputTokens,
                 _keys: keys,
               },
-            };
+            });
           }
         }
       }
@@ -11685,27 +12503,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Pass 3: apply per-tool max-last-N
     const cfg = this.config.toolResultMaxLastN;
-    if (cfg === undefined) return;
+    if (cfg !== undefined) {
+      for (const [toolName, occs] of occurrencesByTool) {
+        let limit: number | undefined;
+        if (typeof cfg === 'number') limit = cfg;
+        else if (typeof cfg === 'object') limit = cfg[toolName];
+        if (limit === undefined || limit < 0) continue;
 
-    for (const [toolName, occs] of occurrencesByTool) {
-      let limit: number | undefined;
-      if (typeof cfg === 'number') limit = cfg;
-      else if (typeof cfg === 'object') limit = cfg[toolName];
-      if (limit === undefined || limit < 0) continue;
+        const excessCount = occs.length - limit;
+        if (excessCount <= 0) continue;
 
-      const excessCount = occs.length - limit;
-      if (excessCount <= 0) continue;
-
-      for (let i = 0; i < excessCount; i++) {
-        const { entry, blockIndex } = occs[i];
-        const orig = entry.content[blockIndex];
-        if (orig.type !== 'tool_result') continue;
-        const fresherCount = occs.length - i - 1;
-        entry.content[blockIndex] = {
-          ...orig,
-          content: `[Result truncated — tool '${toolName}' has ${fresherCount} more recent result${fresherCount === 1 ? '' : 's'} below]`,
-        };
+        for (let i = 0; i < excessCount; i++) {
+          const { entry, blockIndex } = occs[i];
+          const orig = entry.content[blockIndex];
+          if (orig.type !== 'tool_result') continue;
+          const fresherCount = occs.length - i - 1;
+          replaceBlock(entry, blockIndex, {
+            ...orig,
+            content: `[Result truncated — tool '${toolName}' has ${fresherCount} more recent result${fresherCount === 1 ? '' : 's'} below]`,
+          });
+        }
       }
+    }
+
+    for (const [entry, before] of originals) {
+      entry.content = releaseEditedRawForms(before, entry.content);
     }
   }
 
@@ -11764,6 +12586,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   protected estimateTextOnlyTokens(msg: StoredMessage): number {
+    const cached = AutobiographicalStrategy._textOnlyTokens.get(msg);
+    if (cached !== undefined) return cached;
+    const tokens = AutobiographicalStrategy.computeTextOnlyTokens(msg);
+    AutobiographicalStrategy._textOnlyTokens.set(msg, tokens);
+    return tokens;
+  }
+
+  /** Pure per-message text-only estimate, cached on the message object like
+   *  staticSalience (immutable content; the store keeps the object across
+   *  appends). */
+  private static _textOnlyTokens = new WeakMap<StoredMessage, number>();
+
+  private static computeTextOnlyTokens(msg: StoredMessage): number {
     let tokens = 0;
     for (const block of msg.content) {
       if (block.type === 'text') {
@@ -11884,11 +12719,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * Under `'full'` (default) this IS `summaryAnswerProse`, block for block.
    * Under `'live-strip'` the captured reasoning carriers are omitted from the
-   * live render alone: whole blocks dropped, every surviving block passed
-   * through untouched, so the same entry's mint-side recall still replays its
-   * signed blocks byte-verbatim. Mutating a carrier here would break the
-   * signature that the mint surface depends on — hence omission, never
-   * rewriting.
+   * live render alone: whole blocks dropped, so the same entry's mint-side
+   * recall still replays its signed blocks byte-verbatim. Mutating a carrier
+   * here would break the signature that the mint surface depends on — hence
+   * omission, never rewriting. Every surviving block is passed through by
+   * reference, except a Responses item a stripped reasoning item led to: every
+   * block that shares it is copied without its raw item, and so without its id
+   * (see raw-forms.ts).
    *
    * A carrier-only entry (reasoning captured, no prose block — degenerate, and
    * guarded against at mint time) would strip to an empty assistant turn,
@@ -11973,16 +12810,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     summaries: SummaryEntry[],
     maxTokens: number,
   ): ContentBlock[] {
+    // A separator follows the answer before it on the wire, so the reasoning at
+    // that answer's end gives up its id first (see raw-forms.ts).
+    const separated = (content: ContentBlock[]): ContentBlock[] => [
+      ...releaseTrailingReasoning(content),
+      { type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT },
+    ];
     if (this.config.recallEnvelope !== 'xml') {
-      const content: ContentBlock[] = [];
+      let content: ContentBlock[] = [];
       summaries.forEach((s, idx) => {
-        if (idx > 0) content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
+        if (idx > 0) content = separated(content);
         content.push(...this.liveWindowAnswerContent(s));
       });
       return maxTokens > 0 ? this.truncateContent(content, maxTokens) : content;
     }
 
-    const content: ContentBlock[] = [];
+    let content: ContentBlock[] = [];
     const separatorCost = this.estimateTextOnlyTokens(
       { content: [{ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT }] } as StoredMessage,
     );
@@ -11993,7 +12836,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (maxTokens > 0 && proseBudget <= 0) break;
       const prose = this.liveWindowAnswerProse(s);
       const capped = maxTokens > 0 ? this.truncateContent(prose, proseBudget) : prose;
-      if (idx > 0) content.push({ type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT });
+      if (idx > 0) content = separated(content);
       content.push(...wrapRecallAnswerContent(capped, s, this.config.recallEnvelope));
       if (maxTokens > 0) {
         remainingTokens -=
@@ -12003,6 +12846,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return content;
   }
 
+  /**
+   * Cut a message's text and string tool-result content to `maxTokens`. A cut
+   * or dropped block gives up its raw replay form, along with every block
+   * sharing it, so the cut reaches the wire (see raw-forms.ts).
+   */
   protected truncateContent(content: ContentBlock[], maxTokens: number): ContentBlock[] {
     if (maxTokens <= 0) return content;
     const est = this.estimateTextOnlyTokens({ content } as StoredMessage);
@@ -12056,6 +12904,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    return result;
+    return releaseEditedRawForms(content, result);
   }
 }

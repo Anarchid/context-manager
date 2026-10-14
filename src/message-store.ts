@@ -18,6 +18,7 @@ import type {
   ChannelTokenStatsOptions,
 } from './types/index.js';
 import { BlobManager } from './blob-manager.js';
+import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody } from './body-runs.js';
 
 const DEFAULT_MESSAGE_STATE_ID = 'messages';
 
@@ -756,9 +757,10 @@ export class MessageStore {
   }
 
   /**
-   * Remove every shard of the bodyGroup containing `messageId`. If the
-   * message is not part of a bodyGroup, falls back to single-message
-   * remove. Atomic from the caller's perspective.
+   * Remove every shard of the body containing `messageId`: one ingestion,
+   * so another copy of the same text, under the same group id, stays (see
+   * body-runs.ts). If the message is not part of a body, falls back to
+   * single-message remove. Atomic from the caller's perspective.
    */
   removeBodyGroup(messageId: MessageId): void {
     const index = this.lookupIndex(messageId);
@@ -776,15 +778,11 @@ export class MessageStore {
       this.emit({ type: 'remove', messageId });
       return;
     }
-    // Find the contiguous run of shards with this bodyGroupId. Shards are
-    // stored consecutively (they're appended one after the other at
-    // ingestion), so we can scan outward from `index`.
-    const groupId = target.bodyGroupId;
+    // Find this body's shards: stored consecutively, one ingestion at a
+    // time. Another ingestion of the same text carries the same group id
+    // and is another body (see body-runs.ts), so the run stops there.
     const all = this.getAllInternal();
-    let from = index;
-    while (from > 0 && all[from - 1].bodyGroupId === groupId) from--;
-    let to = index;
-    while (to + 1 < all.length && all[to + 1].bodyGroupId === groupId) to++;
+    const { from, to } = bodyBoundsIn(all, index);
     const firstId = all[from].id;
     const lastId = all[to].id;
     bumpWriteVersion(this.store, this.stateId);
@@ -797,9 +795,11 @@ export class MessageStore {
   /**
    * Remove a range of messages from the store.
    *
-   * If the range starts or ends in the middle of a bodyGroup, throws —
-   * removeRange must align to bodyGroup boundaries. (Use `removeBodyGroup`
-   * to remove an entire group, then call `removeRange` over plain messages.)
+   * If the range starts or ends in the middle of a body, throws: removeRange
+   * must align to body boundaries. A boundary between two bodies of one
+   * group id (two copies of one text) is a body boundary. (Use
+   * `removeBodyGroup` to remove one whole body, then call `removeRange` over
+   * plain messages.)
    */
   removeRange(fromId: MessageId, toId: MessageId): void {
     const fromIndex = this.lookupIndex(fromId);
@@ -812,18 +812,18 @@ export class MessageStore {
       throw new Error(`Message not found: ${toId}`);
     }
 
-    // Verify the range doesn't bisect a bodyGroup.
+    // Verify the range doesn't bisect a body: neither edge may sit between
+    // two shards of one body. The boundary between two ingestions of the
+    // same text (one group id) is not a bisection.
     const all = this.getAllInternal();
-    const startGroup = all[fromIndex].bodyGroupId;
-    const endGroup = all[toIndex].bodyGroupId;
-    if (startGroup && fromIndex > 0 && all[fromIndex - 1].bodyGroupId === startGroup) {
+    if (fromIndex > 0 && continuesBody(all[fromIndex - 1], all[fromIndex])) {
       throw new Error(
-        `removeRange would bisect bodyGroup ${startGroup} at start. Use removeBodyGroup(${fromId}) first.`,
+        `removeRange would bisect bodyGroup ${all[fromIndex].bodyGroupId} at start. Use removeBodyGroup(${fromId}) first.`,
       );
     }
-    if (endGroup && toIndex + 1 < all.length && all[toIndex + 1].bodyGroupId === endGroup) {
+    if (toIndex + 1 < all.length && continuesBody(all[toIndex], all[toIndex + 1])) {
       throw new Error(
-        `removeRange would bisect bodyGroup ${endGroup} at end. Use removeBodyGroup(${toId}) first.`,
+        `removeRange would bisect bodyGroup ${all[toIndex].bodyGroupId} at end. Use removeBodyGroup(${toId}) first.`,
       );
     }
 
@@ -887,13 +887,17 @@ export class MessageStore {
     // misses and rebuilds. The mapped array is immutable to callers, same as
     // getAllInternal's contract.
     const branchId = this.store.currentBranch().id;
-    const sequence = this.store.currentSequence();
     const writeVersion = slotRevision(this.store, this.stateId);
     const c = this.allStoredCache;
+    // getAllInternal already revalidates across foreign state writes (the
+    // store-global sequence moves on every receipt or resolution write) and
+    // hands back the same array; keying on that array, not the sequence,
+    // keeps this view alive across them too. Same-instance mutators bump
+    // writeVersion (edits in place, appends by push), so both still miss.
     if (
       c &&
       c.branchId === branchId &&
-      c.sequence === sequence &&
+      c.internals === internals &&
       c.writeVersion === writeVersion &&
       c.stored.length === internals.length
     ) {
@@ -909,7 +913,7 @@ export class MessageStore {
       }
       return view;
     });
-    this.allStoredCache = { branchId, sequence, writeVersion, stored };
+    this.allStoredCache = { branchId, internals, writeVersion, stored };
     return stored;
   }
 
@@ -917,7 +921,7 @@ export class MessageStore {
    *  as allCache (see getAll). */
   private allStoredCache: {
     branchId: string;
-    sequence: number;
+    internals: StoredMessageInternal[];
     writeVersion: number;
     stored: StoredMessage[];
   } | null = null;
@@ -939,25 +943,13 @@ export class MessageStore {
     }
 
     if (opts.alignToBodyGroups) {
-      // Shards of a bodyGroup are contiguous by construction (removeRange
-      // refuses to bisect a group). Walk edges outward with O(item) point
-      // lookups until the group boundary.
-      const first = this.getInternal(start);
-      if (first?.bodyGroupId !== undefined) {
-        while (start > 0) {
-          const prev = this.getInternal(start - 1);
-          if (prev?.bodyGroupId !== first.bodyGroupId) break;
-          start--;
-        }
-      }
-      const last = this.getInternal(end - 1);
-      if (last?.bodyGroupId !== undefined) {
-        while (end < totalCount) {
-          const next = this.getInternal(end);
-          if (next?.bodyGroupId !== last.bodyGroupId) break;
-          end++;
-        }
-      }
+      // A body's shards are contiguous by construction (removeRange refuses
+      // to bisect one). Walk the edges outward with O(item) point lookups to
+      // the body boundary, which falls between two ingestions of the same
+      // text too (see body-runs.ts).
+      const at = (i: number) => this.getInternal(i);
+      start = bodyStart(at, start);
+      end = bodyEnd(totalCount, at, end - 1) + 1;
     }
 
     const internals = this.getSliceInternal(start, end - start);
@@ -1001,12 +993,29 @@ export class MessageStore {
    * Estimate tokens for a message.
    */
   estimateTokens(message: StoredMessage): number {
+    const content = message.content;
+    const hit = this._messageTokens.get(message);
+    if (hit && hit.calibration === this.tokenCalibration && hit.blocks.length === content.length) {
+      let same = true;
+      for (let i = 0; same && i < content.length; i++) same = hit.blocks[i] === content[i];
+      if (same) return hit.tokens;
+    }
     let tokens = 0;
-    for (const block of message.content) {
+    for (const block of content) {
       tokens += this.estimateBlockTokens(block);
     }
+    this._messageTokens.set(message, { blocks: content.slice(), calibration: this.tokenCalibration, tokens });
     return tokens;
   }
+
+  /** Whole-message estimate per mapped message object. Guarded by the
+   *  identity of every block (a caller may replace one inside the same
+   *  content array) and by the calibration factor, so a changed block or a
+   *  recalibration never serves a stale sum. Entries die with the message
+   *  objects. */
+  private _messageTokens = new WeakMap<StoredMessage, {
+    blocks: readonly ContentBlock[]; calibration: number; tokens: number;
+  }>();
 
   /**
    * Closed-loop calibration multiplier applied to every estimate (default 1).
@@ -1096,6 +1105,40 @@ export class MessageStore {
     return raw;
   }
 
+  /**
+   * Membrane's XML-history carriers (membrane#101): a `tool_attempt` is the
+   * model's own tool-call block that dispatched nothing, replayed verbatim; a
+   * `tool_notice` is the harness's notice about refused or warned invokes,
+   * replayed as one `<tool_call_notice>` element each, escaped as membrane's
+   * formatToolCallNotice escapes it. Both reach the provider
+   * as text, so both are priced as the markup they replay as — never 0. Read
+   * structurally, so this holds whatever membrane version typed the block.
+   * Any other unknown block stays at 0. Shared with ContextLog's estimator,
+   * which applies the same uncalibrated rule; the store's calibration still
+   * applies on top of its own estimate, as for every block.
+   */
+  static xmlHistoryCarrierTokens(block: unknown): number {
+    const carrier = block as { type?: unknown; rawXml?: unknown; notices?: unknown };
+    if (carrier.type === 'tool_attempt' && typeof carrier.rawXml === 'string') {
+      return jsonTokenEstimator(carrier.rawXml);
+    }
+    if (carrier.type === 'tool_notice' && Array.isArray(carrier.notices)) {
+      // As membrane's formatToolCallNotice writes it: `&`, `<` and `>` escaped
+      // in the message and the tool name, and `"` too in the tool attribute.
+      const escapeText = (text: string): string =>
+        text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const rendered = carrier.notices
+        .map((notice) => {
+          const { invoke, toolName, kind, message } = (notice ?? {}) as Record<string, unknown>;
+          const tool = escapeText(String(toolName)).replace(/"/g, '&quot;');
+          return `<tool_call_notice invoke="${String(invoke)}" tool="${tool}" kind="${String(kind)}">${escapeText(String(message))}</tool_call_notice>`;
+        })
+        .join('\n');
+      return jsonTokenEstimator(rendered);
+    }
+    return 0;
+  }
+
   private computeBlockTokensRaw(block: ContentBlock): number {
     switch (block.type) {
       case 'text':
@@ -1147,7 +1190,7 @@ export class MessageStore {
       case 'video':
         return 1000; // Default estimate for media
       default:
-        return 0;
+        return MessageStore.xmlHistoryCarrierTokens(block);
     }
   }
 

@@ -33,9 +33,7 @@ export class ContextLog {
       namespace?: string;
     } = {}
   ) {
-    this.stateId = options.namespace
-      ? `${options.namespace}/context`
-      : DEFAULT_CONTEXT_STATE_ID;
+    this.stateId = ContextLog.stateIdFor(options.namespace);
     this.blobManager = new BlobManager(store);
     this.tokenEstimator = options.estimator ?? defaultTokenEstimator;
     this.rebuildSourceIndex();
@@ -48,11 +46,6 @@ export class ContextLog {
    * @param store The Chronicle store
    * @param namespace Optional namespace for multi-agent support
    */
-  /** The Chronicle state id of the context log for `namespace`. */
-  static stateIdFor(namespace?: string): string {
-    return namespace ? `${namespace}/context` : DEFAULT_CONTEXT_STATE_ID;
-  }
-
   static register(store: JsStore, namespace?: string): void {
     const stateId = ContextLog.stateIdFor(namespace);
     store.registerState({
@@ -61,6 +54,11 @@ export class ContextLog {
       deltaSnapshotEvery: 50,
       fullSnapshotEvery: 10,
     });
+  }
+
+  /** The context log's slot id for a namespace. */
+  static stateIdFor(namespace?: string): string {
+    return namespace ? `${namespace}/context` : DEFAULT_CONTEXT_STATE_ID;
   }
 
   private rebuildSourceIndex(): void {
@@ -319,7 +317,10 @@ export class ContextLog {
       case 'video':
         return 1000;
       default:
-        return 0;
+        // Mirrors MessageStore.computeBlockTokensRaw: membrane's XML-history
+        // carriers (tool_attempt, tool_notice) are priced as the markup they
+        // replay as; any other unknown block stays at 0.
+        return MessageStore.xmlHistoryCarrierTokens(block);
     }
   }
 
