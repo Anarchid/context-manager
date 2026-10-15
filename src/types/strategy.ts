@@ -1347,7 +1347,8 @@ export interface AutobiographicalConfig {
    * out of headroom, rather than raised now and re-deepened when growth
    * crosses W (each direction a front edit; measured 7 round trips in 3 days
    * on one resident). An inverted carried profile is still lowered to the
-   * older level so the quality-gap self-heal keeps working. Default true;
+   * older level so phase A re-folds it in its own order (ascending salience,
+   * then oldest) and the quality-gap self-heal keeps working. Default true;
    * `false` restores the from-scratch relevance ideal of design §13.4.
    */
   kvStableSeedFromCarried?: boolean;

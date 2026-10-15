@@ -68,9 +68,14 @@ test('phase C spends headroom at the seam: deep groups intact, youngest foldable
 
 test('phase C takes the seam quantum that fits and leaves the deep group alone', () => {
   const s = setup();
-  // Same fold state (3300); headroom 250 fits exactly one seam un-fold
-  // (3500, 50 short) — a second (3700) or the deep one (3800) would overshoot.
-  const p = plan(s, 3550, 4200);
+  // Same fold state (3300), target 3600. The old walk tried the deep L2
+  // un-fold first: 3300 → 3800 is 200 from target, closer than 300, so it was
+  // accepted and the band moved. By position the seam quantum lands at 3500
+  // (100 from target); a second seam un-fold would reach 3700 — not closer —
+  // and is reverted, and the deep one (3800) likewise. (At 3550 both walks
+  // happened to agree: 3800 and 3300 are equally far, so the old walk also
+  // fell through to the seam — #156 review.)
+  const p = plan(s, 3600, 4200);
   const h = histogram(p.resolutions, s.ids(0, 210));
   assert.equal(h[2], 36, `the deep L2 group is intact: ${JSON.stringify(h)}`);
   assert.ok(s.ids(204, 210).every((id) => (p.resolutions.get(id) ?? 0) === 0), 'youngest foldable group raw');
@@ -135,7 +140,7 @@ test('phase C: a singleton group after excision steps all the way down before an
  * With the carried-seeded ideal no deep (L3) group is ever raised and the
  * total re-read is well below the from-scratch cut's.
  */
-function growthReplay(opts: { seedFromCarried: boolean; turns: number }) {
+function growthReplay(opts: { seedFromCarried?: boolean; turns: number }) {
   const ch = new MockChronicle({ mergeThreshold: 6, recallPairTokens: 100 });
   let n = 0;
   const add = () => { ch.addChunk({ id: `c-${String(n).padStart(5, '0')}`, rawTokens: 50 }); n++; };
@@ -163,22 +168,24 @@ function growthReplay(opts: { seedFromCarried: boolean; turns: number }) {
     let now = 0; for (const c of inputs.chunks) if (c.sequence > now) now = c.sequence;
     const plan = planControlledFrontier(inputs, tree, {
       previous, foldAtTokens: W, expandAtTokens: TARGET, targetTokens: TARGET, windowTokens: W,
-      rawZone: tail, now, mergeThreshold: 6, seedFromCarried: opts.seedFromCarried,
+      rawZone: tail, now, mergeThreshold: 6,
+      ...(opts.seedFromCarried === undefined ? {} : { seedFromCarried: opts.seedFromCarried }),
     });
     const layout = renderLayout(inputs, tree, plan.resolutions);
     if (prevLayout) totalPert += kvCost(prevLayout, layout);
     for (const c of inputs.chunks) {
       const before = previous.get(c.id) ?? 0, after = plan.resolutions.get(c.id) ?? 0;
-      if (before === 3 && after < 3) deepRaises++;
+      if (before >= 3 && after < before) deepRaises++; // any raise from L3 or deeper (plans reach L4)
     }
-    if (plan.folded) folds++;
+    if (t > 0 && plan.folded) folds++; // the bootstrap compile reports `folded` too; count real crossings only
     previous = plan.resolutions; prevLayout = layout;
   }
   return { totalPert, deepRaises, folds };
 }
 
 test('carried growth: the seeded ideal never raises a deep group across repeated W crossings', () => {
-  const seeded = growthReplay({ seedFromCarried: true, turns: 120 });
+  // The option is NOT passed: this pins the default (`seedFromCarried ?? true`).
+  const seeded = growthReplay({ turns: 120 });
   assert.ok(seeded.folds >= 2, `crossed W at least twice (folds=${seeded.folds})`);
   assert.equal(seeded.deepRaises, 0, 'no L3 leaf was ever raised');
   const scratch = growthReplay({ seedFromCarried: false, turns: 120 });
@@ -190,4 +197,47 @@ test('carried growth: the seeded ideal never raises a deep group across repeated
   // raises above are the load-bearing assertion.
   assert.ok(seeded.totalPert < scratch.totalPert * 0.9,
     `re-read: seeded ${seeded.totalPert} vs from-scratch ${scratch.totalPert}`);
+});
+
+/**
+ * R2-3: the hysteresis is released when it buys nothing. A chain carried at a
+ * tight budget and then given a much larger one: the seeded plan would keep
+ * the deep allocation while paying ~95% of the from-scratch rewrite anyway,
+ * so the from-scratch cut is taken (`seedingReleased`). A modest raise keeps
+ * the seeded allocation (deep groups stay; headroom spent at the seam).
+ */
+test('seeded ideal: a large budget raise takes the from-scratch allocation; a modest one keeps the seeded one', () => {
+  const ch = buildChronicleWithChain({ chunkCount: 1296, tokensPerChunk: 50, mergeThreshold: 6, recallPairTokens: 100 });
+  const tail = new Set(ch.chunks.slice(-6).map((c) => c.id));
+  const inputs: PickerInputs = {
+    chunks: ch.chunks, summaries: ch.summaries, recallPairTokens: ch.recallPairTokens,
+    headTokens: 0, tailTokens: 300, headChunkIds: new Set(), tailChunkIds: tail,
+  };
+  const tree = new SummaryTree(inputs);
+  let now = 0; for (const c of inputs.chunks) if (c.sequence > now) now = c.sequence;
+  const solve = (previous: ReadonlyMap<ChunkId, number>, target: number, W: number, seedFromCarried?: boolean) =>
+    planControlledFrontier(inputs, tree, {
+      previous, foldAtTokens: W, expandAtTokens: target, targetTokens: target, windowTokens: W,
+      rawZone: tail, now, mergeThreshold: 6, ...(seedFromCarried === undefined ? {} : { seedFromCarried }),
+    });
+  const hist = (F: ReadonlyMap<ChunkId, number>) => {
+    const h: Record<number, number> = {};
+    for (const c of ch.chunks) { const l = F.get(c.id) ?? 0; h[l] = (h[l] ?? 0) + 1; }
+    return h;
+  };
+  // Tight: 1,290 foldable leaves must fit in ~1,600 → deep L3s.
+  const tight = solve(new Map(), 1600, 2150);
+  assert.ok((hist(tight.resolutions)[3] ?? 0) > 0, 'tight budget folds to L3');
+
+  // Large raise (×8): the from-scratch cut opens the deep groups; the seeded
+  // plan would have paid nearly the same re-read for a worse allocation.
+  const big = solve(tight.resolutions, 12_800, 17_200);
+  const bigScratch = solve(tight.resolutions, 12_800, 17_200, false);
+  assert.equal(big.seedingReleased, true, 'hysteresis released on a large raise');
+  assert.deepEqual(hist(big.resolutions), hist(bigScratch.resolutions), 'same allocation as from scratch');
+
+  // Modest raise (×1.1): headroom goes to the seam; the deep groups stay.
+  const small = solve(tight.resolutions, 1760, 2365);
+  assert.notEqual(small.seedingReleased, true, 'hysteresis kept on a modest raise');
+  assert.equal(hist(small.resolutions)[3], hist(tight.resolutions)[3], 'L3 leaves unchanged');
 });

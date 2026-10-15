@@ -4,8 +4,9 @@
   in three days, each direction re-reading ~300k tokens; a fold confined to
   the seam cost ~97k) and on a carried-growth replay (1,296 base-6 leaves at
   50 raw / 100 recall, one appended leaf per turn, a summary every six, every
-  frontier carried; 120 turns: no deep group is ever raised, total re-read
-  20,000 vs 25,900 before; 400 turns: 13 turns change a band vs 40 before):
+  frontier carried; 120 turns at target 1600 / W 2150: no deep group is ever
+  raised, total re-read 20,000 against 22,500 on the previous release and
+  25,900 with the new walk but seeding off):
   - **Phase C** (spend headroom by un-folding toward the target) walks chunks
     youngest-first by **position**, whatever their level, and restarts from
     the youngest after every accepted un-fold, so the youngest group steps
@@ -23,7 +24,22 @@
     relevance-gap check compared against that moving ideal. An inverted
     carried profile (a chunk deeper than an older unprotected chunk) is still
     lowered to the older level so the quality-gap self-heal keeps working;
-    bootstrap is unchanged. `kvStableSeedFromCarried: false` restores the
-    from-scratch ideal of design §13.4.
+    an older chunk already at the deepest level its group can render at
+    (lineage top, or a pin-max-level on a group-mate) is no evidence of
+    inversion, and a fold the seeded base already holds gets the same
+    overlap exemptions a fold made in the compile gets — without either, a
+    seeded plan could alternate between two frontiers on an imperfect tree.
+    Bootstrap is unchanged. `kvStableSeedFromCarried: false` restores the
+    from-scratch ideal of design §13.4 while keeping the new phase-C walk; it
+    is not a rollback to the previous release's planner.
+  - **Cost, stated:** keeping monotone over-depth IS the hysteresis, and the
+    quality-gap check cannot see it (relevance loss only scores depth past
+    the age cap, and the seeded ideal keeps the carried depth). Depth the
+    budget once forced persists until the seam runs out of headroom; on the
+    replay the seeded plan's loss exceeded the from-scratch ceiling on 217 of
+    400 turns. When the budget is raised enough that the seeded plan would
+    pay at least 90% of a from-scratch re-cut's re-read anyway, the
+    from-scratch cut is taken instead, so a large raise is not spent keeping
+    a tight-budget allocation.
   Accept rule, group consistency, protections and the phase A/B fold order
   are unchanged. `kv-unified` is untouched.

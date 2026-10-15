@@ -10,11 +10,16 @@
  *   subject to  render(F) ≤ W            — the only physics
  *               perturbation(F, F_prev) ≤ P   — trust region; overridable
  *
- * - The IDEAL CUT is built from scratch each turn by pure relevance: fold in
- *   salience-then-age priority order, level by level, under the soft shape
- *   prior (`foldDepthCap`), past it if W demands, never past the hard
- *   protections (flat zone / pins / locked); then pack youngest-first back
- *   toward the target. Age/salience-monotone by construction.
+ * - The IDEAL CUT is built each turn by relevance, SEEDED from the carried
+ *   frontier (`seedFromCarried`, default; `false` builds it from raw): fold
+ *   in salience-then-age priority order, level by level, under the soft
+ *   shape prior (`foldDepthCap`), past it if W demands, never past the hard
+ *   protections (flat zone / pins / locked); then pack youngest-position-
+ *   first back toward the target. Phases A/B only deepen what is carried;
+ *   only phase C un-folds. An inverted carried profile is lowered before the
+ *   phases run so it heals oldest-first; monotone over-depth is kept (the
+ *   hysteresis that stops a band boundary from flapping with the balance of
+ *   production and growth). Bootstrap (nothing carried) is from scratch.
  * - PERTURBATION is exact, not modeled: `kvCost` — the tokens the provider
  *   will re-read from the earliest layout divergence to the end.
  * - P (`reachTokens`, re-priced) is a TRUST REGION on per-turn divergence,
@@ -74,6 +79,11 @@ export interface ControlOptions {
   targetSteps?: number;
   /** Cache TTL in steps. Default Infinity. */
   cacheTtlSteps?: number;
+  /** Seed each turn's ideal cut from the carried frontier (the production
+   *  default, see `ControlPlanParams.seedFromCarried`). Forwarded to every
+   *  `planControlledFrontier` call of the replay; `false` measures the
+   *  from-scratch ideal. Default true. */
+  seedFromCarried?: boolean;
 }
 
 export interface ControlStep {
@@ -252,7 +262,9 @@ class TokenLedger {
 }
 
 /**
- * Build the IDEAL CUT from scratch — pure relevance, no P anywhere (§13.4).
+ * Build the IDEAL CUT from `base` — pure relevance, no P anywhere (§13.4).
+ * `base` is the carried frontier when seeded (the default), raw on bootstrap
+ * or with `seedFromCarried: false`.
  *
  * Fold order is (salience ascending, then oldest-first), level by level, so the
  * profile is salience/age-monotone by construction: with uniform salience it
@@ -294,6 +306,26 @@ function relevanceCut(
   // raw beside the recall — exactly the renderer's existing ownership-wins
   // semantics for boundary-cut members.
   const overlapExempt = new Set<ChunkId>();
+  // A fold the base already holds (a seeded ideal starts from the carried
+  // frontier) gets the exemptions foldPass gives a fold it makes: a leaf the
+  // folded node lists, whose own lineage at that level is another node, keeps
+  // its level and is exempt. Without this, phase C un-folds a carried
+  // double-represented group that a fold made in the same compile would have
+  // left alone, and the next compile folds it back (#156 R2-2). The
+  // from-scratch path holds no movable folds in its base, so this is a no-op
+  // there.
+  for (const c of ordered) {
+    if (rawZone.has(c.id) || immovable.has(c.id)) continue;
+    const level = F.get(c.id) ?? 0;
+    if (level < 1) continue;
+    const node = tree.ancestorAt(c.id, level);
+    if (!node) continue;
+    for (const leafId of node.leafChunkIds) {
+      if ((caps.get(leafId) ?? 0) < 0) continue; // protected: foldPass never exempts these
+      const own = tree.ancestorAt(leafId, level);
+      if (!own || own.id !== node.id) overlapExempt.add(leafId);
+    }
+  }
   // Fold priority: cheapest information first — ascending salience, then oldest.
   const priority = [...ordered].sort((a, b) => {
     const sa = salienceOf(a);
@@ -771,8 +803,9 @@ export interface ControlPlanParams {
    * a new mid-level summary lands and re-deepened when growth crosses W —
    * each direction a front edit (#156 review, Major 2). An inverted carried
    * profile (a chunk deeper than an older unprotected chunk) is still lowered
-   * to the older level so phase A re-folds it oldest-first — the quality-gap
-   * self-heal keeps working. Bootstrap (nothing carried) is unaffected.
+   * to the older level so phase A re-folds it in its own order (ascending
+   * salience, then oldest) — the quality-gap self-heal keeps working.
+   * Bootstrap (nothing carried) is unaffected.
    * Default true; `false` restores the from-scratch ideal.
    */
   seedFromCarried?: boolean;
@@ -824,6 +857,11 @@ export interface ControlPlan {
    *  - 'infeasible': nothing within P fits under W — feasibility beats P;
    *  - 'quality-gap': the best plan within P was certifiably bad vs the ideal. */
   override?: 'bootstrap' | 'infeasible' | 'quality-gap';
+  /** Seeded solve only: the from-scratch cut was taken instead of the
+   *  carried-seeded one because the seeded plan would already pay ≥ 90% of
+   *  the from-scratch re-read (a budget raise large enough that keeping the
+   *  tight-budget allocation buys nothing — #156 R2-3). */
+  seedingReleased?: boolean;
   /** No realizable progress fits inside a strict trust region. */
   blocked?: 'reach-floor' | 'target-floor';
 }
@@ -832,7 +870,9 @@ export interface ControlPlan {
  * Plan one turn's frontier — the rev 5.0 single-path solve (§13.4), shared by
  * the replay harness (`replayControlled`) and `KvStableStrategy`.
  *
- *   1. Build the IDEAL CUT from scratch (pure relevance; W the only wall).
+ *   1. Build the IDEAL CUT by pure relevance (W the only wall), seeded from
+ *      the carried frontier by default (`seedFromCarried`; from raw on
+ *      bootstrap or when `false`).
  *   2. No carried frontier → adopt it (bootstrap; P not applicable).
  *   3. Carried frontier in the [expandAt, foldAt] dead band with a small
  *      quality gap → hold it (zero perturbation). A LARGE gap falls through:
@@ -916,12 +956,13 @@ export function planControlledFrontier(
   diagHist('carried(projected)', carried, tree);
   const carriedLayout = renderLayout(inputs, tree, carried);
   const carriedTokens = carriedLayout.totalTokens;
-  // Receding-horizon seeding (opt-in): the ideal starts where the carried
-  // frontier is, so A/B never un-fold and the only raises are phase C's
-  // seam-first ones — EXCEPT where the carried profile is inverted (a chunk
-  // carried deeper than some OLDER unprotected chunk): those are lowered to
-  // the older chunk's level so phase A re-folds the region oldest-first and
-  // the inversion heals (the quality-gap self-heal's purpose). Monotone
+  // Receding-horizon seeding (the default): the ideal starts where the
+  // carried frontier is, so A/B never un-fold and the only raises are phase
+  // C's seam-first ones — EXCEPT where the carried profile is inverted (a
+  // chunk carried deeper than some OLDER unprotected chunk): those are
+  // lowered to the older chunk's level so phase A re-folds the region in its
+  // own order (ascending salience, then oldest) and the inversion heals (the
+  // quality-gap self-heal's purpose). Monotone
   // over-depth — the boundary group a new mid-level summary made
   // unnecessary — is kept, which is the hysteresis the from-scratch cut
   // lacks. Protected/base levels are already in `carried`.
@@ -930,11 +971,40 @@ export function planControlledFrontier(
   if (seeded) {
     idealBase = new Map(carried);
     let olderMin = Number.POSITIVE_INFINITY;
+    // Per-node memo for the pin-cap scan below: the verdict depends only on
+    // the node, and every member chunk would otherwise rescan the node's
+    // leaves (O(N·groupSize) per compile on a 36k-message store).
+    const nodeFoldable = new Map<SummaryId, boolean>();
+    const canRenderAt = (node: { id: SummaryId; leafChunkIds: readonly ChunkId[] }, k: number): boolean => {
+      const hit = nodeFoldable.get(node.id);
+      if (hit !== undefined) return hit;
+      let ok = true;
+      for (const leafId of node.leafChunkIds) {
+        if (p.rawZone.has(leafId) || immovable.has(leafId)) continue;
+        const cap = pinCaps.get(leafId);
+        if (cap !== undefined && cap < k) { ok = false; break; }
+      }
+      nodeFoldable.set(node.id, ok);
+      return ok;
+    };
     for (const c of ordered) { // oldest first
       if (p.rawZone.has(c.id) || immovable.has(c.id)) continue;
       const lvl = carried.get(c.id) ?? 0;
       if (lvl > olderMin) idealBase.set(c.id, olderMin);
-      if (lvl < olderMin) olderMin = lvl;
+      // An older chunk already at the deepest level its GROUP can render at
+      // cannot be folded deeper, so it is no evidence that a younger, deeper
+      // chunk is inverted (#156 R2-1: a parentless L1 beside an L3, or a
+      // pin-max-level on a group-mate, otherwise re-lowered the band on every
+      // compile — a two-cycle re-reading the whole layout, and the deep-band
+      // flap back under a pin). "Deepest" is measured over the group the way
+      // `groupEligible` measures it with shape caps ignored: the lineage's
+      // top, capped by any pin-max-level among the group's foldable leaves.
+      let deepest = 0;
+      for (let k = tree.maxLevel(c.id); k >= 1 && deepest === 0; k--) {
+        const node = tree.ancestorAt(c.id, k);
+        if (node && canRenderAt(node, k)) deepest = k;
+      }
+      if (lvl < olderMin && lvl < deepest) olderMin = lvl;
     }
   }
 
@@ -956,8 +1026,28 @@ export function planControlledFrontier(
 
   // 1. The ideal cut — pure relevance, no P anywhere.
   const _t0 = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
-  const ideal = relevanceCut(inputs, tree, ordered, idealBase, caps, pinCaps, p.rawZone, immovable, frozen, fixedLevels,
+  let ideal = relevanceCut(inputs, tree, ordered, idealBase, caps, pinCaps, p.rawZone, immovable, frozen, fixedLevels,
     p.targetTokens, p.windowTokens, maxFoldLevel);
+  // The hysteresis has a cost the quality-gap check cannot see: relevance
+  // loss scores only depth past the age cap, and the seeded ideal keeps the
+  // carried depth, so a budget raise can leave L4s in place that a
+  // from-scratch cut would open — while the seeded plan still pays most of
+  // the rewrite (the seam below the band churns either way). When the seeded
+  // plan would already pay ≥ 90% of the from-scratch re-read, take the
+  // from-scratch cut: the hysteresis is buying nothing but a worse
+  // allocation. On ordinary turns (a shed, a hold, a seam fold) the seeded
+  // plan is far cheaper and is kept. (#156 R2-3)
+  let seedingReleased = false;
+  if (seeded) {
+    const scratch = relevanceCut(inputs, tree, ordered, base, caps, pinCaps, p.rawZone, immovable, frozen, fixedLevels,
+      p.targetTokens, p.windowTokens, maxFoldLevel);
+    const seededPert = kvCost(carriedLayout, renderLayout(inputs, tree, ideal.F));
+    const scratchPert = kvCost(carriedLayout, renderLayout(inputs, tree, scratch.F));
+    if (scratchPert > 0 && seededPert >= 0.9 * scratchPert) {
+      ideal = scratch;
+      seedingReleased = true;
+    }
+  }
   if (_t0) console.error(`[kv-timing] relevanceCut ${Date.now() - _t0}ms idealTokens=${ideal.tokens}`);
   diagHist('ideal', ideal.F, tree);
   const idealLayout = renderLayout(inputs, tree, ideal.F);
@@ -984,6 +1074,7 @@ export function planControlledFrontier(
     escalated: ideal.tokens > p.windowTokens,
     perturbation: kvCost(carriedLayout, idealLayout),
     ...(override ? { override } : {}),
+    ...(seedingReleased ? { seedingReleased: true } : {}),
     ...(strictReach && ideal.tokens > p.foldAtTokens
       ? { blocked: 'target-floor' as const }
       : {}),
@@ -1114,6 +1205,7 @@ export function replayControlled(fullInputs: PickerInputs, opts: ControlOptions)
     const plan = planControlledFrontier(inputs, tree, {
       previous: fprev, foldAtTokens: HW, expandAtTokens: LW, targetTokens: LW,
       windowTokens: opts.windowTokens, reachTokens, rawZone: flatZone, now, mergeThreshold,
+      seedFromCarried: opts.seedFromCarried,
     });
     const F = plan.resolutions;
     const folded = plan.folded || plan.expanded; // any active prefix change this turn
