@@ -33,6 +33,13 @@ export type {
   BranchInfo,
   ContextInjection,
   CompileResult,
+  BranchRef,
+  RawBodySource,
+  CompiledMessageSources,
+  CompileProvenance,
+  JournalMark,
+  RenderedLayout,
+  LayoutUnit,
 } from './context.js';
 
 // Strategy types
@@ -74,6 +81,7 @@ export type {
   RenderStats,
   CalibrationReset,
   RenderStatsCapableStrategy,
+  RenderedSummaryInfo,
 } from './strategy.js';
 
 export {
