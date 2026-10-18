@@ -1217,10 +1217,13 @@ function planUnreported(
       // flap back under a pin). "Deepest" is measured over the group the way
       // `groupEligible` measures it with shape caps ignored: the lineage's
       // top, capped by any pin-max-level among the group's foldable leaves.
+      // A level counts only where its summary lists the chunk: `ancestorAt`
+      // follows parent links, and a stale one reaches a summary that doesn't,
+      // where the chunk can't render (R3-2).
       let deepest = 0;
       for (let k = tree.maxLevel(c.id); k >= 1 && deepest === 0; k--) {
         const node = tree.ancestorAt(c.id, k);
-        if (node && canRenderAt(node, k)) deepest = k;
+        if (node && lists(listedBy, node, c.id) && canRenderAt(node, k)) deepest = k;
       }
       if (lvl < olderMin && lvl < deepest) olderMin = lvl;
     }

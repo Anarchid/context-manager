@@ -11,6 +11,10 @@
  * 2. A store with a second L1 over the same leaves. R-2 lists m0 and m1, as
  *    L1-0 does, and m0's lineage is R-2. The plan alternates between
  *    rendering both L1s (173 tokens) and rendering m0 and m1 raw (348).
+ * 3. The first store with L1-6 and L1-7 re-pointed at L3-0, which still
+ *    doesn't list m14 to m17 (R3-2). Their parent links reach L3-0, where
+ *    they can't render, so they are no evidence that m18 and m19 are
+ *    inverted.
  */
 
 import { test } from 'node:test';
@@ -117,4 +121,28 @@ test('replanned on unchanged inputs, seeded plans settle (a second L1 over the s
     ['R-2', 1, ['m0', 'm1'], 45, null],
   ], { targetTokens: 271, foldAtTokens: 284, windowTokens: 1476, now: 12, mergeThreshold: 3 }, 6);
   assert.equal(plans[5], plans[4], `still moving at plan 6: ${plans.join(' → ')}`);
+});
+
+test('replanned on unchanged inputs, a seeded plan keeps its frontier (L1s re-pointed at an L3 that doesn\'t list them)', () => {
+  const raw = [109, 66, 121, 187, 122, 127, 132, 143, 173, 56, 50, 115, 57, 153, 137, 120, 127, 193, 81, 103, 169];
+  const l1 = ['L1-0', 'L1-0', 'L1-0', 'L1-1', 'L1-1', 'L1-1', 'L1-2', 'L1-3', 'L1-3', 'L1-3', 'L1-4',
+    'L1-4', 'L1-5', 'L1-5', 'L1-6', 'L1-6', 'L1-7', 'L1-7', 'L1-8', 'L1-9', 'L1-10'];
+  const plans = replan(raw.map((r, i): Leaf => [r, l1[i]!]), [
+    ['L1-0', 1, ['m0', 'm1', 'm2'], 12, 'L2-0'],
+    ['L1-1', 1, ['m3', 'm4', 'm5'], 13, 'L2-0'],
+    ['L1-2', 1, ['m6'], 29, 'L2-0'],
+    ['L1-3', 1, ['m7', 'm8', 'm9'], 32, 'L2-1'],
+    ['L1-4', 1, ['m10', 'm11'], 13, 'L2-1'],
+    ['L1-5', 1, ['m12', 'm13'], 14, 'L2-1'],
+    ['L1-6', 1, ['m14', 'm15'], 13, 'L3-0'],
+    ['L1-7', 1, ['m16', 'm17'], 30, 'L3-0'],
+    ['L1-8', 1, ['m18'], 40, 'L2-2'],
+    ['L1-9', 1, ['m19'], 31, 'L2-2'],
+    ['L1-10', 1, ['m20'], 36, null],
+    ['L2-0', 2, ['L1-0', 'L1-1', 'L1-2'], 44, 'L3-0'],
+    ['L2-1', 2, ['L1-3', 'L1-4', 'L1-5'], 43, 'L3-0'],
+    ['L2-2', 2, ['L1-8', 'L1-9'], 44, 'L3-0'],
+    ['L3-0', 3, ['L2-0', 'L2-1', 'L2-2'], 36, null],
+  ], { targetTokens: 206, foldAtTokens: 216, windowTokens: 5082, now: 72, mergeThreshold: 6 }, 4);
+  for (let k = 1; k < plans.length; k++) assert.equal(plans[k], plans[0], `plan ${k + 1} moved: ${plans.join(' → ')}`);
 });
