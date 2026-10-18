@@ -883,12 +883,20 @@ solve(tree, F_prev, W, P):
       --   under the shape prior, toward the target;
       -- phase B: if still over W, keep folding past the prior (never past
       --   hard protections);
-      -- phase C: pack — un-fold youngest-first back toward the target,
-      --   accepting an un-fold that overshoots the target when it lands
-      --   CLOSER to it and stays under W (§13.6);
+      -- phase C: pack — un-fold back toward the target, the youngest
+      --   position first whatever its level, restarting from the youngest
+      --   after each accepted un-fold; each leaf is priced where the
+      --   projection will put it, and an un-fold that overshoots the target
+      --   is accepted when it lands CLOSER to it and stays under W (§13.6);
       -- project to a valid group-consistent cut and iterate fold→project
       --   to a fixpoint (§13.6). BEST-EFFORT: on a damaged tree this can
       --   return over-W with `escalated` set — it does not throw.
+
+  seeded, carried < expandAt, Δ(ideal) > 0,
+    Δ(ideal) ≥ 0.9 · Δ(from-scratch cut) → ideal = from-scratch cut
+      -- seedingReleased: the hysteresis buys nothing on such a raise. Δ is
+      --   the perturbation against F_prev, and the from-scratch cut is
+      --   built only once the first three hold
 
   gapCeiling = qualityGapRatio · max(1, loss(ideal))      -- ∞ under strictReach
 
@@ -933,14 +941,18 @@ Properties: on a quiet turn `ideal ≈ F_prev` + a tail fold, Δ is naturally
 small, and the solve is indistinguishable from the old polite pass — nothing
 is legislated. The old behaviors (dead band, reach, emergency) are all regions
 of one parameter space instead of three code paths. A from-scratch solve is
-age/salience-monotone **by construction** (fold order = priority order), so
-the inversion class of bug cannot be produced by it. A carried-seeded solve
-(the default since `kvStableSeedFromCarried`) inherits the carried profile,
-so an inverted carried profile is lowered to the older level before the
-phases run and re-folds in fold order; monotone over-depth is kept — that
-retained depth is the hysteresis, and when a budget raise would make the
-seeded plan pay ≥ 90% of a from-scratch re-read anyway, the from-scratch cut
-is taken (`seedingReleased`).
+age/salience-monotone **by construction** (fold order = priority order),
+except at a boundary-cut fold: a group that straddles the raw tail, a pin or
+a lock folds its other members while older chunks beside it stay raw. Apart from
+that, the inversion class of bug cannot be produced by it. A carried-seeded
+solve (the default since `kvStableSeedFromCarried`) inherits the carried
+profile, so an inverted carried profile is lowered to the older level before
+the phases run and re-folds in fold order, a boundary-cut fold excepted;
+monotone over-depth is kept — that retained depth is the hysteresis. Where
+the carried frontier is under expandAt, as after a budget raise, and the
+seeded plan would pay ≥ 90% of a from-scratch re-read anyway, or a re-read
+where the from-scratch cut pays none, the from-scratch cut is taken
+(`seedingReleased`).
 
 **Cheap-moment scheduling (v2).** The quality-gap threshold makes "repair now
 vs amortize" explicit; a future refinement schedules big adoptions onto turns
