@@ -26,9 +26,8 @@
     lowered to the older level so the quality-gap self-heal keeps working;
     an older chunk already at the deepest level its group can render at
     (lineage top, or a pin-max-level on a group-mate) is no evidence of
-    inversion, and a fold the seeded base already holds gets the same
-    overlap exemptions a fold made in the compile gets — without either, a
-    seeded plan could alternate between two frontiers on an imperfect tree.
+    inversion — without that, a seeded plan could alternate between two
+    frontiers on an imperfect tree.
     Bootstrap is unchanged. `kvStableSeedFromCarried: false` restores the
     from-scratch ideal of design §13.4 while keeping the new phase-C walk; it
     is not a rollback to the previous release's planner.
