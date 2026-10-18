@@ -141,7 +141,7 @@ test('phase C: a singleton group after excision steps all the way down before an
  * total re-read is well below the from-scratch cut's.
  */
 function growthReplay(opts: {
-  seedFromCarried?: boolean; turns: number;
+  seedFromCarried?: boolean; turns: number; pinCaps?: ReadonlyMap<ChunkId, number>;
   target?: number; window?: number;
   /** A turn to re-plan on unchanged inputs, after its own plan. */
   replanAt?: number;
@@ -176,6 +176,7 @@ function growthReplay(opts: {
       previous: prev, foldAtTokens: W, expandAtTokens: TARGET, targetTokens: TARGET, windowTokens: W,
       rawZone: tail, now, mergeThreshold: 6,
       ...(opts.seedFromCarried === undefined ? {} : { seedFromCarried: opts.seedFromCarried }),
+      ...(opts.pinCaps ? { pinCaps: opts.pinCaps } : {}),
     });
     const plan = planControlledFrontier(inputs, tree, params(previous));
     if (t === opts.replanAt) {
@@ -213,6 +214,18 @@ test('carried growth: the seeded ideal never raises a deep group across repeated
   // raises above are the load-bearing assertion.
   assert.ok(seeded.totalPert < scratch.totalPert * 0.9,
     `re-read: seeded ${seeded.totalPert} vs from-scratch ${scratch.totalPert}`);
+});
+
+/**
+ * R3-5: the same replay over 400 turns with chunk 40 pinned at a max level
+ * of 2. Its group can fold no deeper than L2, so an older chunk at L2 there
+ * is at the deepest level its group can render at, and no evidence that a
+ * younger, deeper chunk is inverted (R2-1). Read as evidence, it lowered the
+ * deep band again on the turns that followed.
+ */
+test('carried growth with a pin-max-level: the seeded ideal never raises a deep group', () => {
+  const pinned = growthReplay({ turns: 400, pinCaps: new Map([['c-00040', 2]]) });
+  assert.equal(pinned.deepRaises, 0, `${pinned.deepRaises} leaves were raised from L3 or deeper`);
 });
 
 /**
