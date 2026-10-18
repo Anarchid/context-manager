@@ -1205,10 +1205,30 @@ function planUnreported(
       nodeFoldable.set(node.id, ok);
       return ok;
     };
+    // A chunk whose group at its carried level holds a hard-protected member
+    // is part of a boundary-cut fold: the group straddles the raw tail, a
+    // pin or a lock, and its other members fold with the protected ones held,
+    // so a younger one can sit folded beside older raw chunks without being
+    // an inversion. So it isn't lowered as inverted, which moved the plan once
+    // on unchanged inputs after such a fold (R3-4). The group is the chunk's
+    // lineage at its carried level, which lists it, since the carried
+    // frontier was projected to a valid cut above. Each node's members are
+    // read once.
+    const boundaryCutMemo = new Map<SummaryId, boolean>();
+    const boundaryCut = (chunkId: ChunkId, lvl: number): boolean => {
+      const node = tree.ancestorAt(chunkId, lvl);
+      if (!node) return false;
+      let cut = boundaryCutMemo.get(node.id);
+      if (cut === undefined) {
+        cut = node.leafChunkIds.some((leafId) => p.rawZone.has(leafId) || immovable.has(leafId));
+        boundaryCutMemo.set(node.id, cut);
+      }
+      return cut;
+    };
     for (const c of ordered) { // oldest first
       if (p.rawZone.has(c.id) || immovable.has(c.id)) continue;
       const lvl = carried.get(c.id) ?? 0;
-      if (lvl > olderMin) idealBase.set(c.id, olderMin);
+      if (lvl > olderMin && !boundaryCut(c.id, lvl)) idealBase.set(c.id, olderMin);
       // An older chunk already at the deepest level its GROUP can render at
       // cannot be folded deeper, so it is no evidence that a younger, deeper
       // chunk is inverted (#156 R2-1: a parentless L1 beside an L3, or a

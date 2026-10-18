@@ -140,7 +140,12 @@ test('phase C: a singleton group after excision steps all the way down before an
  * With the carried-seeded ideal no deep (L3) group is ever raised and the
  * total re-read is well below the from-scratch cut's.
  */
-function growthReplay(opts: { seedFromCarried?: boolean; turns: number }) {
+function growthReplay(opts: {
+  seedFromCarried?: boolean; turns: number;
+  target?: number; window?: number;
+  /** A turn to re-plan on unchanged inputs, after its own plan. */
+  replanAt?: number;
+}) {
   const ch = new MockChronicle({ mergeThreshold: 6, recallPairTokens: 100 });
   let n = 0;
   const add = () => { ch.addChunk({ id: `c-${String(n).padStart(5, '0')}`, rawTokens: 50 }); n++; };
@@ -152,10 +157,11 @@ function growthReplay(opts: { seedFromCarried?: boolean; turns: number }) {
   };
   for (let i = 0; i < 1296; i++) add();
   produce();
-  const TARGET = 1600, W = 2150;
+  const TARGET = opts.target ?? 1600, W = opts.window ?? 2150;
   let previous = new Map<ChunkId, number>();
   let prevLayout: ReturnType<typeof renderLayout> | null = null;
   let totalPert = 0, deepRaises = 0, folds = 0, releases = 0;
+  let replan: { moved: boolean; levels: string } | undefined;
   for (let t = 0; t < opts.turns; t++) {
     add(); produce();
     const tail = new Set(ch.chunks.slice(-6).map((c) => c.id));
@@ -166,11 +172,17 @@ function growthReplay(opts: { seedFromCarried?: boolean; turns: number }) {
     };
     const tree = new SummaryTree(inputs);
     let now = 0; for (const c of inputs.chunks) if (c.sequence > now) now = c.sequence;
-    const plan = planControlledFrontier(inputs, tree, {
-      previous, foldAtTokens: W, expandAtTokens: TARGET, targetTokens: TARGET, windowTokens: W,
+    const params = (prev: ReadonlyMap<ChunkId, number>) => ({
+      previous: prev, foldAtTokens: W, expandAtTokens: TARGET, targetTokens: TARGET, windowTokens: W,
       rawZone: tail, now, mergeThreshold: 6,
       ...(opts.seedFromCarried === undefined ? {} : { seedFromCarried: opts.seedFromCarried }),
     });
+    const plan = planControlledFrontier(inputs, tree, params(previous));
+    if (t === opts.replanAt) {
+      const again = planControlledFrontier(inputs, tree, params(plan.resolutions));
+      const levels = (F: ReadonlyMap<ChunkId, number>) => ch.chunks.map((c) => F.get(c.id) ?? 0).join('');
+      replan = { moved: levels(again.resolutions) !== levels(plan.resolutions), levels: levels(plan.resolutions) };
+    }
     const layout = renderLayout(inputs, tree, plan.resolutions);
     if (prevLayout) totalPert += kvCost(prevLayout, layout);
     for (const c of inputs.chunks) {
@@ -181,7 +193,7 @@ function growthReplay(opts: { seedFromCarried?: boolean; turns: number }) {
     if (plan.seedingReleased) releases++;
     previous = plan.resolutions; prevLayout = layout;
   }
-  return { totalPert, deepRaises, folds, releases };
+  return { totalPert, deepRaises, folds, releases, replan };
 }
 
 test('carried growth: the seeded ideal never raises a deep group across repeated W crossings', () => {
@@ -201,6 +213,23 @@ test('carried growth: the seeded ideal never raises a deep group across repeated
   // raises above are the load-bearing assertion.
   assert.ok(seeded.totalPert < scratch.totalPert * 0.9,
     `re-read: seeded ${seeded.totalPert} vs from-scratch ${scratch.totalPert}`);
+});
+
+/**
+ * R3-4: a boundary-cut fold settles. On the replay at target 3650 / W 4200,
+ * turn 180 leaves the L1 group of chunks 1470 to 1475 straddling the raw
+ * tail, and the plan folds its one non-tail member, chunk 1470, with older
+ * chunks beside it raw. Re-planned on unchanged inputs, the seeded plan keeps
+ * that fold: the member's group holds tail chunks, so it isn't read as an
+ * inversion to lower.
+ */
+test('carried growth: a boundary-cut fold at the raw tail settles on unchanged inputs', () => {
+  const { replan } = growthReplay({ turns: 181, target: 3650, window: 4200, replanAt: 180 });
+  assert.ok(replan, 'turn 180 was re-planned');
+  // The premise: the straddling group's non-tail member is folded, and a chunk of the group before it is raw.
+  assert.ok(Number(replan.levels[1470]) > 0, `chunk 1470 is folded: ${replan.levels.slice(1458)}`);
+  assert.ok(replan.levels.slice(1464, 1470).includes('0'), `a chunk before it is raw: ${replan.levels.slice(1458)}`);
+  assert.equal(replan.moved, false, 'the plan re-planned on unchanged inputs moved');
 });
 
 /**
