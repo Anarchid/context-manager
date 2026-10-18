@@ -155,7 +155,7 @@ function growthReplay(opts: { seedFromCarried?: boolean; turns: number }) {
   const TARGET = 1600, W = 2150;
   let previous = new Map<ChunkId, number>();
   let prevLayout: ReturnType<typeof renderLayout> | null = null;
-  let totalPert = 0, deepRaises = 0, folds = 0;
+  let totalPert = 0, deepRaises = 0, folds = 0, releases = 0;
   for (let t = 0; t < opts.turns; t++) {
     add(); produce();
     const tail = new Set(ch.chunks.slice(-6).map((c) => c.id));
@@ -178,9 +178,10 @@ function growthReplay(opts: { seedFromCarried?: boolean; turns: number }) {
       if (before >= 3 && after < before) deepRaises++; // any raise from L3 or deeper (plans reach L4)
     }
     if (t > 0 && plan.folded) folds++; // the bootstrap compile reports `folded` too; count real crossings only
+    if (plan.seedingReleased) releases++;
     previous = plan.resolutions; prevLayout = layout;
   }
-  return { totalPert, deepRaises, folds };
+  return { totalPert, deepRaises, folds, releases };
 }
 
 test('carried growth: the seeded ideal never raises a deep group across repeated W crossings', () => {
@@ -188,6 +189,9 @@ test('carried growth: the seeded ideal never raises a deep group across repeated
   const seeded = growthReplay({ turns: 120 });
   assert.ok(seeded.folds >= 2, `crossed W at least twice (folds=${seeded.folds})`);
   assert.equal(seeded.deepRaises, 0, 'no L3 leaf was ever raised');
+  // The budgets never change here, so the hysteresis is never released: a
+  // shed past the fold threshold doesn't weigh the from-scratch cut (R3-3).
+  assert.equal(seeded.releases, 0, `the from-scratch cut was taken on ${seeded.releases} turns`);
   const scratch = growthReplay({ seedFromCarried: false, turns: 120 });
   assert.ok(scratch.deepRaises > 0, `the from-scratch ideal does raise deep groups here (${scratch.deepRaises} leaves)`);
   // Both totals include the same pure-append baseline (one 50-token leaf per

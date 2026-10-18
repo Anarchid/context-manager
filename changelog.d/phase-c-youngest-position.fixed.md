@@ -36,9 +36,12 @@
     the age cap, and the seeded ideal keeps the carried depth). Depth the
     budget once forced persists until the seam runs out of headroom; on the
     replay the seeded plan's loss exceeded the from-scratch ceiling on 217 of
-    400 turns. When the budget is raised enough that the seeded plan would
-    pay at least 90% of a from-scratch re-cut's re-read anyway, the
-    from-scratch cut is taken instead, so a large raise is not spent keeping
-    a tight-budget allocation.
+    400 turns. Where the carried frontier is under the expand threshold, as
+    after a budget raise, and the seeded plan would pay at least 90% of a
+    from-scratch re-cut's re-read anyway, or a re-read where the re-cut pays
+    none, the from-scratch cut is taken instead, so a large raise is not
+    spent keeping a tight-budget allocation. A shed, a hold in the dead band
+    and a fold at the seam keep the seeded plan, and a seeded plan that
+    re-reads nothing is kept without building the re-cut.
   Accept rule, group consistency, protections and the phase A/B fold order
   are unchanged. `kv-unified` is untouched.

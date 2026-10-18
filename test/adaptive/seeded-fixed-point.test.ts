@@ -52,6 +52,39 @@ function replan(leaves: Leaf[], nodes: Node[], budget: Budget, count: number): s
   return plans;
 }
 
+/**
+ * Under the expand threshold, a seeded plan that re-reads nothing is kept, not
+ * released, even where the from-scratch cut renders the same. That cut folds
+ * L1-0, since un-folding it would pass W, and renders 30 tokens. Replanned on
+ * unchanged inputs, the seeded ideal is the carried frontier, which re-reads
+ * nothing, so the release isn't weighed (R3-3; #186 R3-2; Greptile's P2).
+ */
+test('replanned on unchanged inputs under the expand threshold, a seeded plan that re-reads nothing isn\'t released', () => {
+  const summaries = new Map<string, SummaryEntry>([['L1-0', {
+    id: 'L1-0', level: 1, content: 'L1-0', tokens: 30, sourceLevel: 0, sourceIds: ['m0', 'm1', 'm2'], created: 0,
+    sourceRange: { first: 'm0', last: 'm2' },
+  }]]);
+  const inputs: PickerInputs = {
+    chunks: [0, 1, 2].map((i) => ({
+      id: `m${i}`, sequence: i, rawTokens: 50, currentResolution: 0, lockedByAgent: false, pinned: false, l1Id: 'L1-0',
+    })),
+    summaries, headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const tree = new SummaryTree(inputs);
+  const params = {
+    targetTokens: 100, foldAtTokens: 120, expandAtTokens: 100, windowTokens: 120, now: 12, mergeThreshold: 3,
+    rawZone: new Set<string>(),
+  };
+  const levels = (F: ReadonlyMap<string, number>) => inputs.chunks.map((c) => F.get(c.id) ?? 0).join('');
+  const first = planControlledFrontier(inputs, tree, { ...params, previous: new Map() });
+  assert.equal(levels(first.resolutions), '111', 'premise: the from-scratch cut folds L1-0');
+  assert.ok(first.tokens < params.expandAtTokens, `premise: the plan is under the expand threshold: ${first.tokens}`);
+  const second = planControlledFrontier(inputs, tree, { ...params, previous: first.resolutions });
+  assert.equal(levels(second.resolutions), '111');
+  assert.equal(second.perturbation, 0);
+  assert.notEqual(second.seedingReleased, true, 'a seeded plan that re-reads nothing is kept');
+});
+
 test('replanned on unchanged inputs, a seeded plan keeps its frontier (an L3 over parentless L1s)', () => {
   const raw = [109, 66, 121, 187, 122, 127, 132, 143, 173, 56, 50, 115, 57, 153, 137, 120, 127, 193, 81, 103, 169];
   const l1 = ['L1-0', 'L1-0', 'L1-0', 'L1-1', 'L1-1', 'L1-1', 'L1-2', 'L1-3', 'L1-3', 'L1-3', 'L1-4',

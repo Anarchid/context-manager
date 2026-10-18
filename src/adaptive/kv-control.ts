@@ -980,9 +980,11 @@ export interface ControlPlan {
    *  - 'quality-gap': the best plan within P was certifiably bad vs the ideal. */
   override?: 'bootstrap' | 'infeasible' | 'quality-gap';
   /** Seeded solve only: the from-scratch cut was taken instead of the
-   *  carried-seeded one because the seeded plan would already pay ≥ 90% of
-   *  the from-scratch re-read (a budget raise large enough that keeping the
-   *  tight-budget allocation buys nothing — #156 R2-3). */
+   *  carried-seeded one. That's weighed only while the carried frontier is
+   *  under expandAt, as after a budget raise, and taken when the seeded plan
+   *  pays a re-read and would already pay ≥ 90% of the from-scratch one,
+   *  which may be none: keeping the tight-budget allocation buys nothing then
+   *  (#156 R2-3, R3-3; #186 R3-2). */
   seedingReleased?: boolean;
   /** No realizable progress fits inside a strict trust region. */
   blocked?: 'reach-floor' | 'target-floor';
@@ -1248,20 +1250,27 @@ function planUnreported(
   // loss scores only depth past the age cap, and the seeded ideal keeps the
   // carried depth, so a budget raise can leave L4s in place that a
   // from-scratch cut would open — while the seeded plan still pays most of
-  // the rewrite (the seam below the band churns either way). When the seeded
-  // plan would already pay ≥ 90% of the from-scratch re-read, take the
-  // from-scratch cut: the hysteresis is buying nothing but a worse
-  // allocation. On ordinary turns (a shed, a hold, a seam fold) the seeded
-  // plan is far cheaper and is kept. (#156 R2-3)
+  // the rewrite (the seam below the band churns either way). So where the
+  // carried frontier has headroom, under expandAt as after a raise, a seeded
+  // ideal that pays a re-read is set beside the from-scratch cut, and when it
+  // would already pay ≥ 90% of the from-scratch re-read, the from-scratch cut
+  // is taken: the hysteresis is buying nothing but a worse allocation. That
+  // includes a from-scratch cut that re-reads nothing, where the seeded ideal
+  // would re-lay a plan on unchanged inputs. A seeded ideal that re-reads
+  // nothing is kept without building the other cut. Above expandAt (a shed,
+  // a hold, a fold at the seam) the seeded plan is kept. (#156 R2-3, R3-3;
+  // #186 R3-2)
   let seedingReleased = false;
-  if (seeded) {
-    const scratch = relevanceCut(inputs, tree, ordered, base, caps, pinCaps, p.rawZone, immovable, frozen, fixedLevels,
-      p.targetTokens, p.windowTokens, maxFoldLevel, listedBy);
+  if (seeded && carriedTokens < expandAt) {
     const seededPert = kvCost(carriedLayout, renderLayout(inputs, tree, ideal.F));
-    const scratchPert = kvCost(carriedLayout, renderLayout(inputs, tree, scratch.F));
-    if (scratchPert > 0 && seededPert >= 0.9 * scratchPert) {
-      ideal = scratch;
-      seedingReleased = true;
+    if (seededPert > 0) {
+      const scratch = relevanceCut(inputs, tree, ordered, base, caps, pinCaps, p.rawZone, immovable, frozen, fixedLevels,
+        p.targetTokens, p.windowTokens, maxFoldLevel, listedBy);
+      const scratchPert = kvCost(carriedLayout, renderLayout(inputs, tree, scratch.F));
+      if (seededPert >= 0.9 * scratchPert) {
+        ideal = scratch;
+        seedingReleased = true;
+      }
     }
   }
   if (_t0) console.error(`[kv-timing] relevanceCut ${Date.now() - _t0}ms idealTokens=${ideal.tokens}`);
