@@ -985,7 +985,9 @@ export interface ControlPlan {
    *  under expandAt, as after a budget raise, and taken when the seeded plan
    *  pays a re-read and would already pay ≥ 90% of the from-scratch one,
    *  which may be none: keeping the tight-budget allocation buys nothing then
-   *  (#156 R2-3, R3-3; #186 R3-2). */
+   *  (#156 R2-3, R3-3; #186 R3-2). Past the trust region, a plan that adopts
+   *  the from-scratch cut's newest part (step 5) reports it too, and one that
+   *  adopts none of it, where no part fits, doesn't. */
   seedingReleased?: boolean;
   /** No realizable progress fits inside a strict trust region. */
   blocked?: 'reach-floor' | 'target-floor';
@@ -1288,9 +1290,11 @@ function planUnreported(
   // is taken: the hysteresis is buying nothing but a worse allocation. That
   // includes a from-scratch cut that re-reads nothing, where the seeded ideal
   // would re-lay a plan on unchanged inputs. A seeded ideal that re-reads
-  // nothing is kept without building the other cut. Above expandAt (a shed,
-  // a hold, a fold at the seam) the seeded plan is kept. (#156 R2-3, R3-3;
-  // #186 R3-2)
+  // nothing is kept without building the other cut. Past the trust region P,
+  // the from-scratch cut is adopted as any ideal past P is, its newest part
+  // that fits within P (step 5), and that plan reports the release if it takes
+  // any of it. Above expandAt (a shed, a hold, a fold at the seam) the seeded
+  // plan is kept. (#156 R2-3, R3-3; #186 R3-2)
   let seedingReleased = false;
   if (seeded && carriedTokens < expandAt) {
     const seededPert = kvCost(carriedLayout, renderLayout(inputs, tree, ideal.F));
@@ -1374,12 +1378,14 @@ function planUnreported(
   if (partial.tokens <= p.windowTokens && partialLoss - idealLoss <= gapCeiling && madeProgress) {
     diagBranch(`suffix-adopt (pert=${partial.perturbation} tokens=${partial.tokens})`);
     diagHist('partial', partial.F, tree);
+    const moved = flags(partial.F);
     return {
       resolutions: partial.F,
       tokens: partial.tokens,
-      ...flags(partial.F),
+      ...moved,
       escalated: false,
       perturbation: partial.perturbation,
+      ...(seedingReleased && (moved.folded || moved.expanded) ? { seedingReleased: true } : {}),
     };
   }
 

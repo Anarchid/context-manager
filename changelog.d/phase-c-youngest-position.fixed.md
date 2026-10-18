@@ -43,7 +43,9 @@
     after a budget raise, and the seeded plan would pay at least 90% of a
     from-scratch re-cut's re-read anyway, or a re-read where the re-cut pays
     none, the from-scratch cut is taken instead, so a large raise is not
-    spent keeping a tight-budget allocation. A shed, a hold in the dead band
+    spent keeping a tight-budget allocation. Past the trust region, a release
+    adopts only the newest part of the from-scratch cut that fits within it,
+    and the plan keeps the depth further back. A shed, a hold in the dead band
     and a fold at the seam keep the seeded plan, and a seeded plan that
     re-reads nothing is kept without building the re-cut.
   Accept rule, group consistency, protections and the phase A/B fold order

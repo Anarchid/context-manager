@@ -261,10 +261,11 @@ test('seeded ideal: a large budget raise takes the from-scratch allocation; a mo
   };
   const tree = new SummaryTree(inputs);
   let now = 0; for (const c of inputs.chunks) if (c.sequence > now) now = c.sequence;
-  const solve = (previous: ReadonlyMap<ChunkId, number>, target: number, W: number, seedFromCarried?: boolean) =>
+  const solve = (previous: ReadonlyMap<ChunkId, number>, target: number, W: number, seedFromCarried?: boolean, reachTokens?: number) =>
     planControlledFrontier(inputs, tree, {
       previous, foldAtTokens: W, expandAtTokens: target, targetTokens: target, windowTokens: W,
       rawZone: tail, now, mergeThreshold: 6, ...(seedFromCarried === undefined ? {} : { seedFromCarried }),
+      ...(reachTokens === undefined ? {} : { reachTokens }),
     });
   const hist = (F: ReadonlyMap<ChunkId, number>) => {
     const h: Record<number, number> = {};
@@ -284,6 +285,21 @@ test('seeded ideal: a large budget raise takes the from-scratch allocation; a mo
   const bigScratch = solve(tight.resolutions, 12_800, 17_200, false);
   assert.equal(big.seedingReleased, true, 'hysteresis released on a large raise');
   assert.equal(levels(big.resolutions), levels(bigScratch.resolutions), 'the same levels as from scratch, chunk by chunk');
+
+  // The same raise with a trust region between the seeded ideal's re-read
+  // (12,300) and the from-scratch cut's (12,800): the release still takes the
+  // from-scratch cut, step 5 adopts a suffix of it within the trust region,
+  // and the plan reports the release.
+  const capped = solve(tight.resolutions, 12_800, 17_200, undefined, 12_500);
+  assert.equal(capped.seedingReleased, true, 'the release past the trust region is reported');
+  assert.equal(capped.perturbation, 12_200, 'a suffix of the from-scratch cut, within the trust region');
+  assert.equal(capped.tokens, 12_300);
+
+  // With a trust region of 1,000, no part of the from-scratch cut fits, so
+  // step 5 adopts none of it, and the plan reports no release.
+  const none = solve(tight.resolutions, 12_800, 17_200, undefined, 1_000);
+  assert.equal(none.perturbation, 0, 'premise: no part of the from-scratch cut fits within 1,000');
+  assert.notEqual(none.seedingReleased, true, 'a plan that takes none of the from-scratch cut reports no release');
 
   // Modest raise (×1.1): headroom goes to the seam; the deep groups stay.
   const small = solve(tight.resolutions, 1760, 2365);

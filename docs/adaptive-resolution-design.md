@@ -953,7 +953,8 @@ monotone over-depth is kept — that retained depth is the hysteresis. Where
 the carried frontier is under expandAt, as after a budget raise, and the
 seeded plan would pay ≥ 90% of a from-scratch re-read anyway, or a re-read
 where the from-scratch cut pays none, the from-scratch cut is taken
-(`seedingReleased`).
+(`seedingReleased`); past P, as for any ideal, its newest part that fits
+within P is adopted.
 
 **Cheap-moment scheduling (v2).** The quality-gap threshold makes "repair now
 vs amortize" explicit; a future refinement schedules big adoptions onto turns
