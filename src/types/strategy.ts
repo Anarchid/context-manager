@@ -1438,10 +1438,16 @@ export interface AutobiographicalConfig {
    * produced mid-level summary made unnecessary is kept until the seam runs
    * out of headroom, rather than raised now and re-deepened when growth
    * crosses W (each direction a front edit; measured 7 round trips in 3 days
-   * on one resident). An inverted carried profile is still lowered to the
-   * older level so phase A re-folds it in its own order (ascending salience,
-   * then oldest) and the quality-gap self-heal keeps working. Default true;
-   * `false` restores the from-scratch relevance ideal of design §13.4.
+   * on one resident). After a budget raise that leaves the seeded cut paying
+   * nearly the whole from-scratch re-read anyway, the from-scratch cut is
+   * taken instead, as much of it as the trust region allows. An inverted
+   * carried profile is still lowered to the older level so phase A re-folds
+   * it in its own order (ascending salience, then oldest) and the quality-gap
+   * self-heal keeps working, except where the older chunk can't fold any
+   * deeper or the inverted chunk's group has a raw-zone, pinned or locked
+   * member. Default true; `false` restores the from-scratch relevance ideal
+   * of design §13.4 but keeps phase C's walk by youngest position, so it
+   * isn't the previous release's planner.
    */
   kvStableSeedFromCarried?: boolean;
 

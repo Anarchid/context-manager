@@ -15,12 +15,15 @@
  *   in salience-then-age priority order, level by level, under the soft
  *   shape prior (`foldDepthCap`), past it if W demands, never past the hard
  *   protections (flat zone / pins / locked); then pack youngest-position-
- *   first back toward the target. Phases A/B only deepen what is carried;
- *   only phase C un-folds. An inverted carried profile is lowered before the
- *   phases run so it heals in fold order (ascending salience, then oldest);
- *   monotone over-depth is kept (the
- *   hysteresis that stops a band boundary from flapping with the balance of
- *   production and growth). Bootstrap (nothing carried) is from scratch.
+ *   first back toward the target. Of a seeded cut's phases, A and B only
+ *   deepen what is carried and only C un-folds. An inverted carried profile
+ *   is lowered before the phases run so it heals in fold order (ascending
+ *   salience, then oldest), a boundary-cut fold excepted; monotone
+ *   over-depth is kept (the hysteresis that stops a band boundary from
+ *   flapping with the balance of production and growth). Where a budget
+ *   raise leaves the seeded cut paying nearly the whole from-scratch re-read
+ *   anyway, the from-scratch cut is taken instead (`seedingReleased`).
+ *   Bootstrap (nothing carried) is from scratch.
  * - PERTURBATION is exact, not modeled: `kvCost` — the tokens the provider
  *   will re-read from the earliest layout divergence to the end.
  * - P (`reachTokens`, re-priced) is a TRUST REGION on per-turn divergence,
@@ -80,8 +83,9 @@ export interface ControlOptions {
   targetSteps?: number;
   /** Cache TTL in steps. Default Infinity. */
   cacheTtlSteps?: number;
-  /** Seed each turn's ideal cut from the carried frontier (the production
-   *  default, see `ControlPlanParams.seedFromCarried`). Forwarded to every
+  /** Seed each turn's ideal cut from the carried frontier, the production
+   *  default (`ControlPlanParams.seedFromCarried` says when a budget raise
+   *  takes the from-scratch cut instead). Forwarded to every
    *  `planControlledFrontier` call of the replay; `false` measures the
    *  from-scratch ideal. Default true. */
   seedFromCarried?: boolean;
@@ -264,8 +268,9 @@ class TokenLedger {
 
 /**
  * Build the IDEAL CUT from `base` — pure relevance, no P anywhere (§13.4).
- * `base` is the carried frontier when seeded (the default), raw on bootstrap
- * or with `seedFromCarried: false`.
+ * `base` is the carried frontier when seeded (the default), and raw on
+ * bootstrap, with `seedFromCarried: false` and for the release's from-scratch
+ * cut.
  *
  * Fold order is (salience ascending, then oldest-first), level by level, so the
  * profile is salience/age-monotone by construction: with uniform salience it
@@ -914,9 +919,14 @@ export interface ControlPlanParams {
    * each direction a front edit (#156 review, Major 2). An inverted carried
    * profile (a chunk deeper than an older unprotected chunk) is still lowered
    * to the older level so phase A re-folds it in its own order (ascending
-   * salience, then oldest) — the quality-gap self-heal keeps working.
-   * Bootstrap (nothing carried) is unaffected.
-   * Default true; `false` restores the from-scratch ideal.
+   * salience, then oldest) — the quality-gap self-heal keeps working. An
+   * older chunk already at the deepest level its group can render at is no
+   * evidence of inversion, and a boundary-cut fold isn't lowered. Where the
+   * carried frontier is under expandAt and the seeded cut would pay nearly
+   * the whole from-scratch re-read anyway, the from-scratch cut is taken
+   * instead (`ControlPlan.seedingReleased`). Bootstrap (nothing carried) is
+   * unaffected. Default true; `false` builds the ideal from raw every turn,
+   * keeping phase C's walk by youngest position.
    */
   seedFromCarried?: boolean;
   /** Quality-gap override threshold (§13.4): a plan within P is rejected — and

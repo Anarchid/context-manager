@@ -943,18 +943,18 @@ is legislated. The old behaviors (dead band, reach, emergency) are all regions
 of one parameter space instead of three code paths. A from-scratch solve is
 age/salience-monotone **by construction** (fold order = priority order),
 except at a boundary-cut fold: a group with a raw-zone, pinned or locked
-member of its own lineage folds its other members while older chunks beside
-it stay raw. Apart from that, the inversion class of bug cannot be produced
-by it. A carried-seeded
-solve (the default since `kvStableSeedFromCarried`) inherits the carried
-profile, so an inverted carried profile is lowered to the older level before
-the phases run and re-folds in fold order, a boundary-cut fold excepted;
-monotone over-depth is kept — that retained depth is the hysteresis. Where
-the carried frontier is under expandAt, as after a budget raise, and the
-seeded plan would pay ≥ 90% of a from-scratch re-read anyway, or a re-read
-where the from-scratch cut pays none, the from-scratch cut is taken
-(`seedingReleased`); past P, as for any ideal, its newest part that fits
-within P is adopted.
+member of its own lineage folds its other members while older chunks beside it
+stay raw. Apart from that, the inversion class of bug cannot be produced by
+it. A carried-seeded solve (the default since `kvStableSeedFromCarried`)
+inherits the carried profile, so an inverted carried profile is lowered to the
+older level before the phases run and re-folds in fold order. A boundary-cut
+fold isn't lowered, and an older chunk already at the deepest level its group
+can render at is no evidence of inversion. Monotone over-depth is kept — that
+retained depth is the hysteresis. Where the carried frontier is under
+expandAt, as after a budget raise, and the seeded plan would pay ≥ 90% of a
+from-scratch re-read anyway, or a re-read where the from-scratch cut pays
+none, the from-scratch cut is taken (`seedingReleased`); past P, as for any
+ideal, its newest part that fits within P is adopted.
 
 **Cheap-moment scheduling (v2).** The quality-gap threshold makes "repair now
 vs amortize" explicit; a future refinement schedules big adoptions onto turns
