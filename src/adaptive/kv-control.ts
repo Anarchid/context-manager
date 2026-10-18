@@ -1199,6 +1199,10 @@ function planUnreported(
       let ok = true;
       for (const leafId of node.leafChunkIds) {
         if (p.rawZone.has(leafId) || immovable.has(leafId)) continue;
+        // A listed leaf whose own lineage at this level is another node, or
+        // none, takes no part in the group's fold (groupEligible skips it),
+        // so its pin-max-level doesn't cap the group (#186 R3-3).
+        if (tree.ancestorAt(leafId, k)?.id !== node.id) continue;
         const cap = pinCaps.get(leafId);
         if (cap !== undefined && cap < k) { ok = false; break; }
       }

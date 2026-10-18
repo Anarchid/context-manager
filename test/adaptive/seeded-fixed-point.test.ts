@@ -15,6 +15,9 @@
  *    doesn't list m14 to m17 (R3-2). Their parent links reach L3-0, where
  *    they can't render, so they are no evidence that m18 and m19 are
  *    inverted.
+ *
+ * And the inversion pass reads a group as its fold does: a pin-max-level on
+ * a leaf the group lists but doesn't render takes no part (#186 R3-3).
  */
 
 import { test } from 'node:test';
@@ -145,4 +148,46 @@ test('replanned on unchanged inputs, a seeded plan keeps its frontier (L1s re-po
     ['L3-0', 3, ['L2-0', 'L2-1', 'L2-2'], 36, null],
   ], { targetTokens: 206, foldAtTokens: 216, windowTokens: 5082, now: 72, mergeThreshold: 6 }, 4);
   for (let k = 1; k < plans.length; k++) assert.equal(plans[k], plans[0], `plan ${k + 1} moved: ${plans.join(' → ')}`);
+});
+
+test('the inversion pass reads a group as its fold does: a pin on a leaf of another lineage doesn\'t cap it', () => {
+  // N lists m0 and m1, but m1's own L2 is M, so a fold of N moves m0 alone,
+  // and m1's pin-max-level of 1 isn't N's to keep. The carried plan holds
+  // the younger m2 and m3 at L2 and the older m0 at L1: an inversion, since
+  // m0 can fold to L2 through N. Read with m1's cap, m0 looked as deep as it
+  // could go, and the seeded plan kept the younger group deeper.
+  const nodes: Node[] = [
+    ['L1-A', 1, ['m0'], 20, 'N'],
+    ['L1-F', 1, ['m1'], 20, 'M'],
+    ['L1-Y', 1, ['m2', 'm3'], 20, 'Y'],
+    ['N', 2, ['L1-A', 'L1-F'], 10, null],
+    ['M', 2, ['L1-F'], 10, null],
+    ['Y', 2, ['L1-Y'], 10, null],
+  ];
+  const summaries = new Map<string, SummaryEntry>();
+  for (const [id, level, sourceIds, tokens, parentId] of nodes) {
+    summaries.set(id, {
+      id, level, content: id, tokens, sourceLevel: level - 1, sourceIds, created: 0,
+      sourceRange: { first: sourceIds[0]!, last: sourceIds[sourceIds.length - 1]! },
+      ...(parentId ? { parentId } : {}),
+    });
+  }
+  const previous = new Map([['m0', 1], ['m1', 1], ['m2', 2], ['m3', 2]]);
+  const inputs: PickerInputs = {
+    chunks: ['L1-A', 'L1-F', 'L1-Y', 'L1-Y'].map((l1Id, i) => ({
+      id: `m${i}`, sequence: i, rawTokens: 100, currentResolution: previous.get(`m${i}`) ?? 0,
+      lockedByAgent: false, pinned: false, l1Id,
+    })),
+    summaries, headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const tree = new SummaryTree(inputs);
+  const params = {
+    previous, targetTokens: 55, foldAtTokens: 60, windowTokens: 1000, now: 100, mergeThreshold: 6,
+    rawZone: new Set<string>(), pinCaps: new Map([['m1', 1]]),
+  };
+  const levels = (F: ReadonlyMap<string, number>) => inputs.chunks.map((c) => F.get(c.id) ?? 0).join('');
+  const seeded = planControlledFrontier(inputs, tree, params);
+  const scratch = planControlledFrontier(inputs, tree, { ...params, seedFromCarried: false });
+  assert.equal(levels(scratch.resolutions), '2111', 'premise: from scratch, N folds and the younger group stays at L1');
+  assert.equal(levels(seeded.resolutions), levels(scratch.resolutions), 'the seeded plan folds N as the from-scratch cut does');
 });
