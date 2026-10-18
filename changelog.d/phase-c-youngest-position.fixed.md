@@ -27,7 +27,10 @@
     an older chunk already at the deepest level its group can render at
     (lineage top, or a pin-max-level on a group-mate) is no evidence of
     inversion — without that, a seeded plan could alternate between two
-    frontiers on an imperfect tree.
+    frontiers on an imperfect tree. A chunk whose group has a raw-zone,
+    pinned or locked member of its own lineage is part of a boundary-cut
+    fold, which a from-scratch cut makes too, and isn't lowered — lowering it
+    moved the plan once on unchanged inputs.
     Bootstrap is unchanged. `kvStableSeedFromCarried: false` restores the
     from-scratch ideal of design §13.4 while keeping the new phase-C walk; it
     is not a rollback to the previous release's planner.

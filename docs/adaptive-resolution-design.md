@@ -942,9 +942,10 @@ small, and the solve is indistinguishable from the old polite pass — nothing
 is legislated. The old behaviors (dead band, reach, emergency) are all regions
 of one parameter space instead of three code paths. A from-scratch solve is
 age/salience-monotone **by construction** (fold order = priority order),
-except at a boundary-cut fold: a group that straddles the raw tail, a pin or
-a lock folds its other members while older chunks beside it stay raw. Apart from
-that, the inversion class of bug cannot be produced by it. A carried-seeded
+except at a boundary-cut fold: a group with a raw-zone, pinned or locked
+member of its own lineage folds its other members while older chunks beside
+it stay raw. Apart from that, the inversion class of bug cannot be produced
+by it. A carried-seeded
 solve (the default since `kvStableSeedFromCarried`) inherits the carried
 profile, so an inverted carried profile is lowered to the older level before
 the phases run and re-folds in fold order, a boundary-cut fold excepted;

@@ -17,7 +17,9 @@
  *    inverted.
  *
  * And the inversion pass reads a group as its fold does: a pin-max-level on
- * a leaf the group lists but doesn't render takes no part (#186 R3-3).
+ * a leaf the group lists but doesn't render takes no part (#186 R3-3), and
+ * nor does a protected leaf of another lineage make the group a boundary-cut
+ * fold (R3-4's guard).
  */
 
 import { test } from 'node:test';
@@ -190,4 +192,43 @@ test('the inversion pass reads a group as its fold does: a pin on a leaf of anot
   const scratch = planControlledFrontier(inputs, tree, { ...params, seedFromCarried: false });
   assert.equal(levels(scratch.resolutions), '2111', 'premise: from scratch, N folds and the younger group stays at L1');
   assert.equal(levels(seeded.resolutions), levels(scratch.resolutions), 'the seeded plan folds N as the from-scratch cut does');
+});
+
+test('a protected leaf of another lineage doesn\'t make a group a boundary-cut fold', () => {
+  // N lists m1 and m2, but m2's own L1 is L1-Z, and m2 is in the raw zone.
+  // The carried plan holds the younger m1 at L1 through N and the older m0
+  // raw: an inversion, since m0 can fold through L1-A. N's fold moves m1
+  // alone, so m2 doesn't make it a boundary-cut fold, and m1 is lowered. Read
+  // as one, the seeded plan kept m1 folded and m0 raw.
+  const nodes: Node[] = [
+    ['L1-A', 1, ['m0'], 10, null],
+    ['N', 1, ['m1', 'm2'], 10, null],
+    ['L1-Z', 1, ['m2'], 10, null],
+  ];
+  const summaries = new Map<string, SummaryEntry>();
+  for (const [id, level, sourceIds, tokens, parentId] of nodes) {
+    summaries.set(id, {
+      id, level, content: id, tokens, sourceLevel: level - 1, sourceIds, created: 0,
+      sourceRange: { first: sourceIds[0]!, last: sourceIds[sourceIds.length - 1]! },
+      ...(parentId ? { parentId } : {}),
+    });
+  }
+  const previous = new Map([['m0', 0], ['m1', 1], ['m2', 0]]);
+  const inputs: PickerInputs = {
+    chunks: ['L1-A', 'N', 'L1-Z'].map((l1Id, i) => ({
+      id: `m${i}`, sequence: i, rawTokens: 100, currentResolution: previous.get(`m${i}`) ?? 0,
+      lockedByAgent: false, pinned: false, l1Id,
+    })),
+    summaries, headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
+  };
+  const tree = new SummaryTree(inputs);
+  const params = {
+    previous, targetTokens: 220, foldAtTokens: 230, windowTokens: 1000, now: 100, mergeThreshold: 6,
+    rawZone: new Set(['m2']),
+  };
+  const levels = (F: ReadonlyMap<string, number>) => inputs.chunks.map((c) => F.get(c.id) ?? 0).join('');
+  const seeded = planControlledFrontier(inputs, tree, params);
+  const scratch = planControlledFrontier(inputs, tree, { ...params, seedFromCarried: false });
+  assert.equal(levels(scratch.resolutions), '100', 'premise: from scratch, the older m0 folds and m1 stays raw');
+  assert.equal(levels(seeded.resolutions), levels(scratch.resolutions), 'the seeded plan lowers m1 as the from-scratch cut has it');
 });

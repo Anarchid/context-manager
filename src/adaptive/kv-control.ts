@@ -1210,22 +1210,25 @@ function planUnreported(
       nodeFoldable.set(node.id, ok);
       return ok;
     };
-    // A chunk whose group at its carried level holds a hard-protected member
-    // is part of a boundary-cut fold: the group straddles the raw tail, a
-    // pin or a lock, and its other members fold with the protected ones held,
-    // so a younger one can sit folded beside older raw chunks without being
-    // an inversion. So it isn't lowered as inverted, which moved the plan once
-    // on unchanged inputs after such a fold (R3-4). The group is the chunk's
-    // lineage at its carried level, which lists it, since the carried
-    // frontier was projected to a valid cut above. Each node's members are
-    // read once.
+    // A chunk whose group at its carried level has a hard-protected member
+    // (in the raw zone, pinned or locked) is part of a boundary-cut fold: the
+    // group's other members fold with the protected ones held, so a younger
+    // one can sit folded beside older raw chunks without being an inversion.
+    // So it isn't lowered as inverted, which moved the plan once on unchanged
+    // inputs after such a fold (R3-4). The group is the chunk's lineage at its
+    // carried level, which lists it, since the carried frontier was projected
+    // to a valid cut above. Its members are the leaves whose own lineage there
+    // is that node, as for canRenderAt: a protected leaf the node lists under
+    // another lineage takes no part in its fold. Each node's members are read
+    // once.
     const boundaryCutMemo = new Map<SummaryId, boolean>();
     const boundaryCut = (chunkId: ChunkId, lvl: number): boolean => {
       const node = tree.ancestorAt(chunkId, lvl);
       if (!node) return false;
       let cut = boundaryCutMemo.get(node.id);
       if (cut === undefined) {
-        cut = node.leafChunkIds.some((leafId) => p.rawZone.has(leafId) || immovable.has(leafId));
+        cut = node.leafChunkIds.some((leafId) => (p.rawZone.has(leafId) || immovable.has(leafId))
+          && tree.ancestorAt(leafId, lvl)?.id === node.id);
         boundaryCutMemo.set(node.id, cut);
       }
       return cut;
