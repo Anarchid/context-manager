@@ -1,15 +1,16 @@
 /**
- * Replanned on unchanged inputs, a seeded plan settles.
+ * Replanned on unchanged inputs, a seeded plan keeps its frontier. Each of
+ * these stores once made it alternate:
  *
  * 1. A nested tree (every node has one parent, and every listing agrees with
  *    lineage) whose L3 spans two parentless L1s. L3-0 lists L2-0, L2-1 and
- *    L2-2, and L1-6 and L1-7 (m14 to m17), between L2-1's leaves and L2-2's,
- *    have no parent. Seeded from the bootstrap plan, the inversion pass reads
+ *    L2-2. L1-6 and L1-7 (m14 to m17), between L2-1's leaves and L2-2's, have
+ *    no parent. Seeded from the bootstrap plan, the inversion pass reads
  *    m18 and m19 (at L3 through L3-0) as deeper than the older m14 to m17 (at
  *    L1, as deep as their lineage goes) and lowers them, which breaks L3-0.
  *    The next compile folds L3-0 back, so the plan alternates.
  * 2. A store with a second L1 over the same leaves. R-2 lists m0 and m1, as
- *    L1-0 does, and m0's lineage is R-2. The plan alternates between
+ *    L1-0 does, and m0's lineage is R-2. The plan alternated between
  *    rendering both L1s (173 tokens) and rendering m0 and m1 raw (348).
  * 3. The first store with L1-6 and L1-7 re-pointed at L3-0, which still
  *    doesn't list m14 to m17 (R3-2). Their parent links reach L3-0, where
@@ -118,14 +119,14 @@ test('replanned on unchanged inputs, a seeded plan keeps its frontier (an L3 ove
   for (let k = 1; k < plans.length; k++) assert.equal(plans[k], plans[0], `plan ${k + 1} moved: ${plans.join(' → ')}`);
 });
 
-test('replanned on unchanged inputs, seeded plans settle (a second L1 over the same leaves)', () => {
+test('replanned on unchanged inputs, a seeded plan keeps its frontier (a second L1 over the same leaves)', () => {
   const plans = replan([[92, 'R-2'], [152, 'L1-0'], [139, 'L1-1'], [148, 'L1-1'], [146, 'L1-1'], [61, 'L1-2']], [
     ['L1-0', 1, ['m0', 'm1'], 24, null],
     ['L1-1', 1, ['m2', 'm3', 'm4'], 43, null],
     ['L1-2', 1, ['m5'], 26, null],
     ['R-2', 1, ['m0', 'm1'], 45, null],
   ], { targetTokens: 271, foldAtTokens: 284, windowTokens: 1476, now: 12, mergeThreshold: 3 }, 6);
-  assert.equal(plans[5], plans[4], `still moving at plan 6: ${plans.join(' → ')}`);
+  for (let k = 1; k < plans.length; k++) assert.equal(plans[k], plans[0], `plan ${k + 1} moved: ${plans.join(' → ')}`);
 });
 
 test('replanned on unchanged inputs, a seeded plan keeps its frontier (L1s re-pointed at an L3 that doesn\'t list them)', () => {

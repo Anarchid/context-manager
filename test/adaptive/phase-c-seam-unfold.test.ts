@@ -225,6 +225,7 @@ test('carried growth: the seeded ideal never raises a deep group across repeated
  */
 test('carried growth with a pin-max-level: the seeded ideal never raises a deep group', () => {
   const pinned = growthReplay({ turns: 400, pinCaps: new Map([['c-00040', 2]]) });
+  assert.ok(pinned.folds >= 2, `premise: crossed W at least twice (folds=${pinned.folds})`);
   assert.equal(pinned.deepRaises, 0, `${pinned.deepRaises} leaves were raised from L3 or deeper`);
 });
 
