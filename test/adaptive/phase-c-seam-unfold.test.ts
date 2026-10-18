@@ -271,6 +271,9 @@ test('seeded ideal: a large budget raise takes the from-scratch allocation; a mo
     for (const c of ch.chunks) { const l = F.get(c.id) ?? 0; h[l] = (h[l] ?? 0) + 1; }
     return h;
   };
+  // Each chunk's level, in chunk order: two plans agree only chunk by chunk.
+  const levels = (F: ReadonlyMap<ChunkId, number>) => ch.chunks.map((c) => F.get(c.id) ?? 0).join('');
+  const atLevel = (F: ReadonlyMap<ChunkId, number>, level: number) => ch.chunks.filter((c) => (F.get(c.id) ?? 0) === level).map((c) => c.id);
   // Tight: 1,290 foldable leaves must fit in ~1,600 → deep L3s.
   const tight = solve(new Map(), 1600, 2150);
   assert.ok((hist(tight.resolutions)[3] ?? 0) > 0, 'tight budget folds to L3');
@@ -280,10 +283,10 @@ test('seeded ideal: a large budget raise takes the from-scratch allocation; a mo
   const big = solve(tight.resolutions, 12_800, 17_200);
   const bigScratch = solve(tight.resolutions, 12_800, 17_200, false);
   assert.equal(big.seedingReleased, true, 'hysteresis released on a large raise');
-  assert.deepEqual(hist(big.resolutions), hist(bigScratch.resolutions), 'same allocation as from scratch');
+  assert.equal(levels(big.resolutions), levels(bigScratch.resolutions), 'the same levels as from scratch, chunk by chunk');
 
   // Modest raise (×1.1): headroom goes to the seam; the deep groups stay.
   const small = solve(tight.resolutions, 1760, 2365);
   assert.notEqual(small.seedingReleased, true, 'hysteresis kept on a modest raise');
-  assert.equal(hist(small.resolutions)[3], hist(tight.resolutions)[3], 'L3 leaves unchanged');
+  assert.deepEqual(atLevel(small.resolutions, 3), atLevel(tight.resolutions, 3), 'the same L3 leaves');
 });

@@ -17,7 +17,8 @@
  *   protections (flat zone / pins / locked); then pack youngest-position-
  *   first back toward the target. Phases A/B only deepen what is carried;
  *   only phase C un-folds. An inverted carried profile is lowered before the
- *   phases run so it heals oldest-first; monotone over-depth is kept (the
+ *   phases run so it heals in fold order (ascending salience, then oldest);
+ *   monotone over-depth is kept (the
  *   hysteresis that stops a band boundary from flapping with the balance of
  *   production and growth). Bootstrap (nothing carried) is from scratch.
  * - PERTURBATION is exact, not modeled: `kvCost` — the tokens the provider

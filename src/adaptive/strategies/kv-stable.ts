@@ -11,7 +11,8 @@
  * It minimizes real prefix churn: it holds the flat zone (head/tail/pinned)
  * raw, never folds locked chunks, honors V2 leveled pins (`pinLevel` /
  * `pinMaxLevel`) as fixed levels / hard fold-depth caps, and reconciles a
- * from-scratch relevance-ideal cut against the carried frontier under a
+ * relevance-ideal cut (seeded from the carried frontier unless
+ * `kvStableSeedFromCarried` is false) against the carried frontier under a
  * perturbation TRUST REGION P (exact kvCost, not a spatial gate) — adopting
  * the ideal within P, amortizing bigger repairs via suffix adoption, and
  * exceeding P only with a recorded override. There is no emergency path.
