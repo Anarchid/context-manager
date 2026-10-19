@@ -23,6 +23,8 @@ import {
   DEFAULT_MAX_REQUEST_IMAGES,
   DEFAULT_MAX_REQUEST_IMAGE_BYTES,
   liveImageLimitsWarning,
+  ceilingBoundLine,
+  ceilingSetLimits,
   resolveLiveImageLimits,
 } from '../live-image-limits.js';
 
@@ -158,6 +160,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   private readonly imageStripDepthTokens: number;
   /** Whether the image limits' warning has been said (once per instance). */
   private imageLimitsWarningReported = false;
+  /** Which ceilings have been said to strip the live window (once each per instance). */
+  private readonly ceilingBoundReported = { images: false, bytes: false };
 
   private anchor: Sequence = 0;
   private store: JsStore | null = null;
@@ -446,6 +450,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       }
     }
 
+    const ceilingSet = ceilingSetLimits(this.configuredImageLimits);
     let keptImages = 0;
     let keptImageBytes = 0;
     // Entries are in timeline order; the policy counts newest-first.
@@ -458,6 +463,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         const bytes = imageBlockBytes(block);
         const overCount = maxLive > 0 && keptImages >= maxLive;
         const overBytes = maxLiveBytes > 0 && keptImageBytes + bytes > maxLiveBytes;
+        if (overCount && ceilingSet.images) this.reportCeilingBoundOnce('images');
+        if (overBytes && ceilingSet.bytes) this.reportCeilingBoundOnce('bytes');
         if (tooDeep || overCount || overBytes) {
           return { type: 'text', text: IMAGE_PLACEHOLDER } as ContentBlock;
         }
@@ -466,6 +473,14 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         return block;
       });
     }
+  }
+
+  /** Say once that a request ceiling, rather than a limit the options set, has
+   *  stripped an image from the live window (see ceilingSetLimits). */
+  private reportCeilingBoundOnce(kind: 'images' | 'bytes'): void {
+    if (this.ceilingBoundReported[kind]) return;
+    this.ceilingBoundReported[kind] = true;
+    this.diag.warn(ceilingBoundLine(this.name, kind, this.configuredImageLimits, this.imageLimitsDefaulted));
   }
 
   // --------------------------------------------------------------------------

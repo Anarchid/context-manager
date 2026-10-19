@@ -319,6 +319,84 @@ describe("the memory strategy's warning names a compression budget above the byt
   });
 });
 
+describe('the line when an image first falls past a request ceiling', () => {
+  /** Run `steps` (each adds images and compiles) on a fresh store, and return
+   *  the ceiling lines said and the last compile's image pattern. */
+  async function ceilingLines(
+    strategy: ContextStrategy,
+    steps: number[],
+  ): Promise<{ lines: string[]; last: string }> {
+    const lines: string[] = [];
+    const original = console.warn;
+    console.warn = (...parts: unknown[]) => { lines.push(parts.map(String).join(' ')); };
+    const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
+    let n = 0;
+    let last = '';
+    try {
+      for (const add of steps) {
+        for (let i = 0; i < add; i++) manager.addMessage('user', imageMessage(`img-${++n}`));
+        last = pattern((await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 })).messages, n);
+      }
+      return { lines: lines.filter((line) => line.includes('the live window reached')), last };
+    } finally {
+      console.warn = original;
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  for (const [name, make] of Object.entries(STRATEGIES)) {
+    it(`${name}: says once which ceiling an image fell past, and what it held`, async () => {
+      const cases = [
+        [{ maxLiveImages: 0, maxRequestImages: 2 }, 'maxRequestImages 2, which holds maxLiveImages 0 (no limit) to it'],
+        [{ maxLiveImages: 5, maxRequestImages: 2 }, 'maxRequestImages 2, which holds maxLiveImages 5 to it'],
+        [{ maxRequestImages: 2 }, 'maxRequestImages 2, which holds maxLiveImages 6 (default) to it'],
+        [{ maxLiveImages: 0, maxLiveImageBytes: 0, maxRequestImageBytes: 8 },
+          'maxRequestImageBytes 8 bytes, which holds maxLiveImageBytes 0 (no limit) to it'],
+      ] as const;
+      for (const [options, said] of cases) {
+        // Three images, then two more: the ceiling strips at the first compile
+        // and again at the second, and it's said once.
+        const { lines } = await ceilingLines(make(options), [3, 2]);
+        assert.equal(lines.length, 1, `said once for ${JSON.stringify(options)}: ${JSON.stringify(lines)}`);
+        assert.ok(lines[0]!.includes(`the live window reached ${said}, so older images are now shown as placeholders`), lines[0]);
+      }
+    });
+
+    it(`${name}: says nothing when the host's own limit strips, or nothing falls past the ceiling`, async () => {
+      for (const [options, steps] of [
+        [{ maxLiveImages: 2 }, [3, 2]],
+        [{ maxLiveImages: 2, maxRequestImages: 2 }, [3, 2]],
+        [{ maxLiveImages: 0, maxRequestImages: 2 }, [1, 1]],
+      ] as const) {
+        const { lines } = await ceilingLines(make(options), [...steps]);
+        assert.deepEqual(lines, [], `nothing said for ${JSON.stringify(options)}`);
+      }
+    });
+  }
+
+  it('the memory strategy says it when its hysteresis watermark trims against a ceiling', async () => {
+    const { lines, last } = await ceilingLines(
+      memory({ maxLiveImages: 0, maxRequestImages: 4, imageStripHysteresisRatio: 0.5 }),
+      [5],
+    );
+    assert.equal(last, '...II', 'one trim to half the ceiling');
+    assert.equal(lines.length, 1, JSON.stringify(lines));
+    assert.ok(lines[0]!.includes('the live window reached maxRequestImages 4, which holds maxLiveImages 0 (no limit) to it'), lines[0]);
+  });
+
+  it('the memory strategy says it when its hysteresis watermark trims against the byte ceiling', async () => {
+    const { lines, last } = await ceilingLines(
+      memory({ maxLiveImages: 0, maxLiveImageBytes: 0, maxRequestImageBytes: 16, imageStripHysteresisRatio: 0.5 }),
+      [5],
+    );
+    assert.equal(last, '...II', 'one trim to half the ceiling');
+    assert.equal(lines.length, 1, JSON.stringify(lines));
+    assert.ok(lines[0]!.includes('the live window reached maxRequestImageBytes 16 bytes, which holds maxLiveImageBytes 0 (no limit) to it'), lines[0]);
+  });
+});
+
 describe('compression prompts within the request ceilings', () => {
   it('carry at most maxRequestImages, the newest messages first', () => {
     const prepared = new Prepared({ maxRequestImages: 2 }).prepare(

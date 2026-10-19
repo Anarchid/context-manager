@@ -1158,7 +1158,8 @@ export interface AutobiographicalConfig {
    * which nothing here counts, and for image blocks a host adds outside the
    * compile. 0 = no ceiling. A value that isn't 0 or a finite number above it
    * takes the default, and the strategy's warning at initialize names it. A
-   * fraction is floored.
+   * fraction is floored. Under a window limit of 0 or above this ceiling, the
+   * strategy says once, the first time an image falls past it.
    */
   maxRequestImages?: number;
 
@@ -1175,8 +1176,9 @@ export interface AutobiographicalConfig {
    * messages carry: their text, their JSON, and any documents or other media,
    * which nothing here counts. It doesn't follow `MEMBRANE_MAX_REQUEST_BYTES`,
    * so a host that changes membrane's cap sets this to match. 0 = no ceiling.
-   * A value that isn't 0 or a finite number above it takes the default, as
-   * for `maxRequestImages`.
+   * A value that isn't 0 or a finite number above it takes the default, and
+   * the strategy says once when an image first falls past it, as for
+   * `maxRequestImages`.
    */
   maxRequestImageBytes?: number;
 

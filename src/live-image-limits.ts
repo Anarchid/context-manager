@@ -94,6 +94,51 @@ export function resolveLiveImageLimits(configured: ConfiguredImageLimits): LiveI
 
 const MiB = 1024 * 1024;
 
+/** A byte figure as the strategies' lines give it: in MiB when it's a whole
+ *  number of them, and in bytes otherwise, so two figures that differ never
+ *  read alike. */
+function showBytes(n: number): string {
+  return n % MiB === 0 ? `${n / MiB} MiB` : `${n} bytes`;
+}
+
+/**
+ * Which of the window's limits a request ceiling sets: a limit the host gave
+ * as none (0, or anything that isn't a positive finite number) or above its
+ * ceiling, where that ceiling is itself a limit. The window then keeps the
+ * ceiling's worth. (With no ceiling the window keeps the limit as given, so
+ * the two never match there.)
+ */
+export function ceilingSetLimits(configured: ConfiguredImageLimits): { images: boolean; bytes: boolean } {
+  const { target, ceiling } = resolveLiveImageLimits(configured);
+  return {
+    images: target.images === ceiling.images && asLimit(configured.maxLiveImages) !== ceiling.images,
+    bytes: target.bytes === ceiling.bytes && asLimit(configured.maxLiveImageBytes) !== ceiling.bytes,
+  };
+}
+
+/**
+ * The line a strategy says once for each ceiling, the first time an image
+ * meets the live window full to a ceiling that sets its limit (see
+ * ceilingSetLimits): which ceiling, at what value, and the window limit of 0
+ * or above it that the ceiling held, so an operator who set no limit sees
+ * where one now applies.
+ */
+export function ceilingBoundLine(
+  strategy: string,
+  kind: 'images' | 'bytes',
+  configured: ConfiguredImageLimits,
+  defaulted: ReadonlySet<string>,
+): string {
+  const ceiling = resolveLiveImageLimits(configured).ceiling;
+  const [ceilingName, limitName, value, show] = kind === 'images'
+    ? ['maxRequestImages', 'maxLiveImages', configured.maxLiveImages, String] as const
+    : ['maxRequestImageBytes', 'maxLiveImageBytes', configured.maxLiveImageBytes, showBytes] as const;
+  const limit = asLimit(value) === 0 ? `${value} (no limit)` : show(asLimit(value));
+  const mark = (name: string) => (defaulted.has(name) ? ' (default)' : '');
+  return `[${strategy}] the live window reached ${ceilingName} ${show(ceiling[kind])}${mark(ceilingName)}, ` +
+    `which holds ${limitName} ${limit}${mark(limitName)} to it, so older images are now shown as placeholders`;
+}
+
 /**
  * The warning a strategy gives once, when it initializes, or null when there
  * is nothing to say: a ceiling configured as something other than 0 or a
@@ -112,7 +157,7 @@ export function liveImageLimitsWarning(
   const said: string[] = [];
   const ceiling = resolveLiveImageLimits(configured).ceiling;
   const count = (n: number) => String(n);
-  const bytes = (n: number) => (n % MiB === 0 ? `${n / MiB} MiB` : `${n} bytes`);
+  const bytes = showBytes;
   const setting = (name: string, shown: string) => `${name} ${shown}${defaulted.has(name) ? ' (default)' : ''}`;
   if (!wellFormedCeiling(configured.maxRequestImages)) {
     said.push(`maxRequestImages ${configured.maxRequestImages} isn't 0 or a finite number above it, so the default ${count(ceiling.images)} applies`);

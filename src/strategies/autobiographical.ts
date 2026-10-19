@@ -83,6 +83,8 @@ import {
   DEFAULT_MAX_REQUEST_IMAGE_BYTES,
   clampToCeiling,
   liveImageLimitsWarning,
+  ceilingBoundLine,
+  ceilingSetLimits,
   resolveLiveImageLimits,
 } from '../live-image-limits.js';
 import type { MessageId } from '../types/message.js';
@@ -16075,6 +16077,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       .filter(({ idx }) => this.hasImageBlock(entries[idx].content))
       .sort((a, b) => b.pos - a.pos);
 
+    const ceilingSet = ceilingSetLimits(this.configuredImageLimits());
     let keptImages = 0;
     let keptImageBytes = 0;
     for (const { idx, pos } of ordered) {
@@ -16087,6 +16090,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const blockBytes = AutobiographicalStrategy.imageBlockBytes(block);
         const overCount = maxLive > 0 && keptImages >= maxLive;
         const overBytes = maxLiveBytes > 0 && keptImageBytes + blockBytes > maxLiveBytes;
+        if (overCount && ceilingSet.images) this.reportCeilingBoundOnce('images');
+        if (overBytes && ceilingSet.bytes) this.reportCeilingBoundOnce('bytes');
         if (belowMark || tooDeep || overCount || overBytes) {
           // Stats-neutral (2026-07-12): every budgeting site now tallies at
           // POST-STRIP prices (see postStripEstimates), so the bucket never
@@ -16142,7 +16147,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const messages = store.getAll();
     const w = this.imageWatermark();
     // Walk newest-first with the given limits; return the sequence of the
-    // first message holding an image that does not fit (or undefined).
+    // first message holding an image that does not fit (or undefined), and
+    // which limits it passes.
+    let misfitBy = { images: false, bytes: false };
     const firstMisfit = (depthCap: number, countCap: number, bytesCap: number): number | undefined => {
       let depth = 0, count = 0, bytes = 0;
       for (let i = messages.length - 1; i >= 0; i--) {
@@ -16151,9 +16158,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         for (const b of m.content) {
           if (b.type !== 'image') continue;
           const size = AutobiographicalStrategy.imageBlockBytes(b);
-          const misfit = (depthCap > 0 && depth > depthCap) || (countCap > 0 && count >= countCap) ||
-            (bytesCap > 0 && bytes + size > bytesCap);
-          if (misfit) return m.sequence;
+          misfitBy = {
+            images: countCap > 0 && count >= countCap,
+            bytes: bytesCap > 0 && bytes + size > bytesCap,
+          };
+          if ((depthCap > 0 && depth > depthCap) || misfitBy.images || misfitBy.bytes) return m.sequence;
           count++;
           bytes += size;
         }
@@ -16162,6 +16171,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return undefined;
     };
     if (firstMisfit(stripDepth, maxLive, maxLiveBytes) === undefined) return; // no limit binds
+    const ceilingSet = ceilingSetLimits(this.configuredImageLimits());
+    if (misfitBy.images && ceilingSet.images) this.reportCeilingBoundOnce('images');
+    if (misfitBy.bytes && ceilingSet.bytes) this.reportCeilingBoundOnce('bytes');
     const next = firstMisfit(
       stripDepth > 0 ? Math.floor(stripDepth * ratio) : 0,
       maxLive > 0 ? Math.max(0, Math.floor(maxLive * ratio)) || 1 : 0,
@@ -16282,6 +16294,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Byte wall default: 20 MiB of base64, under the default request byte
    *  ceiling (24 MiB), which leaves room under membrane's 28 MiB cap. */
   protected static readonly DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
+
+  /** Which ceilings have been said to strip the live window (once each per instance). */
+  private readonly ceilingBoundReported = { images: false, bytes: false };
+
+  /** Say once that a request ceiling, rather than a limit the host set, has
+   *  stripped an image from the live window (see ceilingSetLimits). */
+  private reportCeilingBoundOnce(kind: 'images' | 'bytes'): void {
+    if (this.ceilingBoundReported[kind]) return;
+    this.ceilingBoundReported[kind] = true;
+    this.diag.warn(ceilingBoundLine(this.name, kind, this.configuredImageLimits(), this.imageLimitsDefaulted()));
+  }
 
   /** The image limits the host didn't give, whose values are defaults. */
   private imageLimitsDefaulted(): ReadonlySet<string> {
