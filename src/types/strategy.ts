@@ -241,9 +241,11 @@ export interface ContextStrategy {
    * a caller that appends to a compiled request without recompiling, such
    * as a turn's continuation rounds: the strategy's compile keeps the images
    * its window counts within `target`, and the caller can let the request
-   * grow to `ceiling` before compiling it again. It only reports the figures:
-   * a caller bounds what it appends, and what it injects at compile time.
-   * Absent on a strategy with no live-image window.
+   * grow to `ceiling` before compiling it again. Both count the images the
+   * window counts (see `AutobiographicalConfig.maxLiveImages`), not every
+   * image a request can carry. It only reports the figures: a caller bounds
+   * what it appends, and what it injects at compile time. Absent on a
+   * strategy with no live-image window.
    */
   liveImageLimits?(): LiveImageLimits;
 }

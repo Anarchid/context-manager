@@ -7115,12 +7115,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the next compile's stable prefix and fold diff are measured against
       // the request before it.
       const prevCacheKeys = this._prevCacheKeys;
+      let entries: ContextEntry[];
       try {
-        return this.selectPath(store, budget, opts);
+        entries = this.selectPath(store, budget, opts);
       } catch (err) {
         this._prevCacheKeys = prevCacheKeys;
         throw err;
       }
+      // Only a render this select returns says the ceiling line: one it
+      // refused threw above, and a dry select never comes here. Every select
+      // path strips its render last (applyImageStripping, `sent`), so the
+      // hits are this render's.
+      this.reportCeilingHits();
+      return entries;
     }
     // A dry run commits nothing, and that includes what a select leaves for
     // the next one and for observers: the cache-marker baseline the next
@@ -16046,8 +16053,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  `RenderStats.total` equal to the real rendered size.
    *
    *  `opts.sent`: the render is a selection's own, so a ceiling it strips
-   *  against says its line (reportCeilingBoundOnce). A layout rendered only to
-   *  compare against, such as kv-unified's kept one, leaves it unset. */
+   *  against says its line once select returns it (reportCeilingHits). A
+   *  layout rendered only to compare against, such as kv-unified's kept one,
+   *  leaves it unset. */
   protected applyImageStripping(entries: ContextEntry[], store: MessageStoreView, opts: { sent?: boolean } = {}): void {
     // Count and bytes within the request ceilings; 0 = unlimited.
     const { images: maxLive, bytes: maxLiveBytes } = this.liveImageLimits().target;
@@ -16082,6 +16090,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       .sort((a, b) => b.pos - a.pos);
 
     const ceilingSet = ceilingSetLimits(this.configuredImageLimits());
+    const hits = { images: false, bytes: false };
     let keptImages = 0;
     let keptImageBytes = 0;
     for (const { idx, pos } of ordered) {
@@ -16094,10 +16103,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const blockBytes = AutobiographicalStrategy.imageBlockBytes(block);
         const overCount = maxLive > 0 && keptImages >= maxLive;
         const overBytes = maxLiveBytes > 0 && keptImageBytes + blockBytes > maxLiveBytes;
-        // Only the selections' own renders say the ceiling line (`sent`), not
-        // a layout rendered to compare against, such as kv-unified's kept one.
-        if (opts.sent && overCount && ceilingSet.images) this.reportCeilingBoundOnce('images');
-        if (opts.sent && overBytes && ceilingSet.bytes) this.reportCeilingBoundOnce('bytes');
+        if (overCount && ceilingSet.images) hits.images = true;
+        if (overBytes && ceilingSet.bytes) hits.bytes = true;
         if (belowMark || tooDeep || overCount || overBytes) {
           // Stats-neutral (2026-07-12): every budgeting site now tallies at
           // POST-STRIP prices (see postStripEstimates), so the bucket never
@@ -16112,6 +16119,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return block;
       });
     }
+    // A selection's own render (`sent`) leaves what its ceilings stripped for
+    // select to report once it returns that render; the last such strip is
+    // the render it returns. A layout rendered only to compare against, such
+    // as kv-unified's kept one, leaves nothing.
+    if (opts.sent) this._ceilingHitsThisRender = hits;
   }
 
   /** imageStripHysteresisRatio: images in messages at or before this
@@ -16177,9 +16189,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return undefined;
     };
     if (firstMisfit(stripDepth, maxLive, maxLiveBytes) === undefined) return; // no limit binds
-    const ceilingSet = ceilingSetLimits(this.configuredImageLimits());
-    if (misfitBy.images && ceilingSet.images) this.reportCeilingBoundOnce('images');
-    if (misfitBy.bytes && ceilingSet.bytes) this.reportCeilingBoundOnce('bytes');
+    // A ceiling that moves the watermark strips every later render by it, so
+    // the next render a select returns reports it (reportCeilingHits). A dry
+    // advance is undone, so it leaves nothing.
+    if (!this._dryRunSelect) {
+      const ceilingSet = ceilingSetLimits(this.configuredImageLimits());
+      if (misfitBy.images && ceilingSet.images) this._ceilingMovedWatermark.images = true;
+      if (misfitBy.bytes && ceilingSet.bytes) this._ceilingMovedWatermark.bytes = true;
+    }
     const next = firstMisfit(
       stripDepth > 0 ? Math.floor(stripDepth * ratio) : 0,
       maxLive > 0 ? Math.max(0, Math.floor(maxLive * ratio)) || 1 : 0,
@@ -16303,16 +16320,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Which ceilings have been said to strip the live window (once each per instance). */
   private readonly ceilingBoundReported = { images: false, bytes: false };
+  /** The ceilings the last selection's render stripped against (applyImageStripping, `sent`). */
+  private _ceilingHitsThisRender = { images: false, bytes: false };
+  /** The ceilings that have moved the hysteresis watermark, outside a dry run. */
+  private readonly _ceilingMovedWatermark = { images: false, bytes: false };
 
-  /** Say once that a request ceiling, rather than a limit the host set, has
-   *  stripped an image from the live window (see ceilingSetLimits). A dry
-   *  select, a preview or an observer's reconstruction says nothing and
-   *  leaves the line for the first render that's sent. */
-  private reportCeilingBoundOnce(kind: 'images' | 'bytes'): void {
-    if (this._dryRunSelect) return;
-    if (this.ceilingBoundReported[kind]) return;
-    this.ceilingBoundReported[kind] = true;
-    this.diag.warn(ceilingBoundLine(this.name, kind, this.configuredImageLimits(), this.imageLimitsDefaulted()));
+  /** Say once for each ceiling, when a select returns a render that a
+   *  request ceiling, rather than a limit the host set, stripped (see
+   *  ceilingSetLimits), directly or through the watermark it moved. A dry
+   *  select, a preview, an observer's reconstruction or a refused select
+   *  says nothing, and the line waits for the first render returned. */
+  private reportCeilingHits(): void {
+    for (const kind of ['images', 'bytes'] as const) {
+      const hit = this._ceilingHitsThisRender[kind] || this._ceilingMovedWatermark[kind];
+      if (!hit || this.ceilingBoundReported[kind]) continue;
+      this.ceilingBoundReported[kind] = true;
+      this.diag.warn(ceilingBoundLine(this.name, kind, this.configuredImageLimits(), this.imageLimitsDefaulted()));
+    }
   }
 
   /** The image limits whose values are defaults: those the library's default

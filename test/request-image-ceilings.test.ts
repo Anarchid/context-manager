@@ -263,6 +263,10 @@ describe('the image limits warning', () => {
               'maxLiveImages 600 is above maxRequestImages 500 (default)']],
           // A byte budget given as null takes its default, and is marked so.
           [{ maxLiveImageBytes: null, maxRequestImageBytes: 2 * MiB }, ['maxLiveImageBytes 20 MiB (default) is above maxRequestImageBytes 2 MiB']],
+          [{ maxLiveImageBytes: undefined, maxRequestImageBytes: 2 * MiB }, ['maxLiveImageBytes 20 MiB (default) is above maxRequestImageBytes 2 MiB']],
+          [{ maxLiveImageBytes: 30 * MiB, maxRequestImageBytes: -1 },
+            ["maxRequestImageBytes -1 isn't 0 or a finite number above it, so the default 24 MiB applies",
+              'maxLiveImageBytes 30 MiB is above maxRequestImageBytes 24 MiB (default)']],
           [{ maxLiveImages: 8, maxRequestImages: 0 }, null],
           [{ maxLiveImageBytes: 30 * MiB, maxRequestImageBytes: 0 }, null],
         ] as const;
@@ -425,30 +429,45 @@ describe('the line when an image first falls past a request ceiling', () => {
       // bytes; then a 16-byte image fills the byte ceiling, and the next one
       // falls past it.
       const strategy = make({ maxLiveImages: 0, maxLiveImageBytes: 0, maxRequestImages: 3, maxRequestImageBytes: 16 });
-      const { byStep } = await ceilingLines(strategy, [{ add: 4, bytes: 4 }, { add: 1, bytes: 16 }, { add: 1, bytes: 4 }]);
-      assert.equal(byStep[0]!.length, 1);
+      const { byStep, patterns } = await ceilingLines(strategy, [{ add: 4, bytes: 4 }, { add: 1, bytes: 16 }, { add: 1, bytes: 4 }]);
+      assert.deepEqual(patterns, ['.III', '....I', '.....I'], 'the count, then the bytes, strip');
+      assert.deepEqual(byStep.map((step) => step.length), [1, 1, 0], JSON.stringify(byStep));
       assert.ok(byStep[0]![0]!.includes('an image fell past maxRequestImages 3'), byStep[0]![0]);
-      assert.equal(byStep.flat().filter((line) => line.includes('maxRequestImageBytes')).length, 1, JSON.stringify(byStep));
-      assert.equal(byStep.flat().length, 2, JSON.stringify(byStep));
+      assert.ok(byStep[1]![0]!.includes('an image fell past maxRequestImageBytes 16 bytes'), byStep[1]![0]);
     });
 
-    it(`${name}: says nothing from a preview, and leaves the line for the first compile that's sent`, async () => {
-      const strategy = make({ maxLiveImages: 0, maxRequestImages: 2 });
-      const said: string[] = [];
-      const original = console.warn;
-      console.warn = (...parts: unknown[]) => { said.push(parts.map(String).join(' ')); };
-      const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
-      const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
-      try {
-        for (let i = 1; i <= 3; i++) manager.addMessage('user', imageMessage(`img-${i}`));
-        await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 }, undefined, { dryRun: true });
-        assert.deepEqual(said.filter((line) => line.includes('an image fell past')), [], 'a dry compile says nothing');
-        await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
-        assert.equal(said.filter((line) => line.includes('an image fell past')).length, 1, 'the sent compile says it');
-      } finally {
-        console.warn = original;
-        await manager.close();
-        rmSync(dir, { recursive: true, force: true });
+    it(`${name}: says it for a single image bigger than the byte ceiling`, async () => {
+      const { byStep, patterns } = await ceilingLines(make({ maxLiveImageBytes: 0, maxRequestImageBytes: 8 }), [{ add: 1, bytes: 12 }]);
+      assert.deepEqual(patterns, ['.'], 'the one image is past the ceiling on its own');
+      assert.equal(byStep[0]!.length, 1, JSON.stringify(byStep));
+      assert.ok(byStep[0]![0]!.includes('an image fell past maxRequestImageBytes 8 bytes, which holds maxLiveImageBytes 0 (no limit) to it'), byStep[0]![0]);
+    });
+
+    it(`${name}: says nothing from a dry compile, and leaves the line for the first compile that's sent`, async () => {
+      for (const [options, said0] of [
+        [{ maxLiveImages: 0, maxRequestImages: 2 }, 'an image fell past maxRequestImages 2'],
+        [{ maxLiveImageBytes: 0, maxRequestImageBytes: 8 }, 'an image fell past maxRequestImageBytes 8 bytes'],
+      ] as const) {
+        const strategy = make(options);
+        const said: string[] = [];
+        const original = console.warn;
+        console.warn = (...parts: unknown[]) => { said.push(parts.map(String).join(' ')); };
+        const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
+        const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
+        const ours = () => said.filter((line) => line.includes('an image fell past'));
+        try {
+          for (let i = 1; i <= 3; i++) manager.addMessage('user', imageMessage(`img-${i}`));
+          const dry = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 }, undefined, { dryRun: true });
+          assert.equal(pattern(dry.messages, 3), '.II', `the dry compile strips for ${JSON.stringify(options)}`);
+          assert.deepEqual(ours(), [], `a dry compile says nothing for ${JSON.stringify(options)}`);
+          await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+          assert.equal(ours().length, 1, `the sent compile says it for ${JSON.stringify(options)}`);
+          assert.ok(ours()[0]!.includes(said0), ours()[0]);
+        } finally {
+          console.warn = original;
+          await manager.close();
+          rmSync(dir, { recursive: true, force: true });
+        }
       }
     });
   }
@@ -477,7 +496,7 @@ describe('the line when an image first falls past a request ceiling', () => {
     try {
       for (let i = 1; i <= 3; i++) manager.addMessage('user', imageMessage(`img-${i}`));
       const entries = manager.previewContext({ maxTokens: 1_000_000, reserveForResponse: 0 }, { maxRequestImages: 1 }, { render: true })?.entries ?? [];
-      assert.ok(entries.length > 0, 'the preview rendered its entries');
+      assert.equal(pattern(entries, 3), '..I', 'the preview strips to its own ceiling');
       assert.deepEqual(ours(), [], 'a preview, with its own ceiling, says nothing');
       const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
       assert.equal(pattern(compiled.messages, 3), '.II');
@@ -490,8 +509,12 @@ describe('the line when an image first falls past a request ceiling', () => {
     }
   });
 
-  it("the memory strategy's strip says the line only for a render that's sent, not a layout rendered to compare against", async () => {
-    const strategy = memory({ maxLiveImages: 0, maxRequestImages: 1 });
+  it("the memory strategy's strip leaves the line only from a render that's sent, not a layout rendered to compare against", async () => {
+    for (const options of [
+      { maxLiveImages: 0, maxRequestImages: 1 },
+      { maxLiveImages: 0, maxLiveImageBytes: 0, maxRequestImageBytes: 4 },
+    ]) {
+    const strategy = memory(options);
     const said: string[] = [];
     const original = console.warn;
     console.warn = (...parts: unknown[]) => { said.push(parts.map(String).join(' ')); };
@@ -508,13 +531,73 @@ describe('the line when an image first falls past a request ceiling', () => {
       }));
       const strip = strategy as unknown as {
         applyImageStripping(entries: unknown[], store: unknown, opts?: { sent?: boolean }): void;
+        reportCeilingHits(): void;
       };
       const kept = entries();
       strip.applyImageStripping(kept, view);
-      assert.equal(kept.filter((e) => e.content.some((b) => b.type === 'image')).length, 1, 'the strip ran: the ceiling of 1 replaced one');
-      assert.deepEqual(ours(), [], 'a layout rendered to compare against says nothing');
+      assert.equal(kept.filter((e) => e.content.some((b) => b.type === 'image')).length, 1, 'the strip ran: the ceiling replaced one');
+      strip.reportCeilingHits();
+      assert.deepEqual(ours(), [], `a layout rendered to compare against leaves nothing for ${JSON.stringify(options)}`);
       strip.applyImageStripping(entries(), view, { sent: true });
+      assert.deepEqual(ours(), [], 'the strip itself says nothing: select reports once it returns the render');
+      strip.reportCeilingHits();
       assert.equal(ours().length, 1, JSON.stringify(said));
+    } finally {
+      console.warn = original;
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+    }
+  });
+
+  it('the memory strategy says nothing for a select it refuses, and says it for the next one it returns', async () => {
+    const adaptive = memory({
+      hierarchical: false, adaptiveResolution: true, compressionModel: 'mock', targetChunkTokens: 100,
+      autoTickOnNewMessage: false, maxLiveImages: 0, maxRequestImages: 2,
+    });
+    const said: string[] = [];
+    const original = console.warn;
+    console.warn = (...parts: unknown[]) => { said.push(parts.map(String).join(' ')); };
+    const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy: adaptive });
+    const ours = () => said.filter((line) => line.includes('an image fell past'));
+    try {
+      for (let i = 1; i <= 3; i++) manager.addMessage('user', imageMessage(`img-${i}`));
+      // The newest turn is a call with no result yet: structural repair drops
+      // it, after the strip, and the select refuses.
+      manager.addMessage('Claude', [{ type: 'tool_use', id: 'tu-1', name: 'shot', input: {} }] as ContentBlock[]);
+      await assert.rejects(manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 }));
+      assert.deepEqual(ours(), [], 'a refused select says nothing');
+      manager.addMessage('user', [{ type: 'tool_result', toolUseId: 'tu-1', content: 'done' }] as ContentBlock[]);
+      await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+      assert.equal(ours().length, 1, JSON.stringify(said));
+    } finally {
+      console.warn = original;
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("the memory strategy's watermark leaves the line for the next compile, and a preview's watermark leaves nothing", async () => {
+    // A new message can move the watermark; the line waits for a compile.
+    const said: string[] = [];
+    const original = console.warn;
+    console.warn = (...parts: unknown[]) => { said.push(parts.map(String).join(' ')); };
+    const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
+    const strategy = memory({
+      hierarchical: false, adaptiveResolution: true, compressionModel: 'mock', targetChunkTokens: 100,
+      autoTickOnNewMessage: false, maxLiveImages: 0, maxRequestImages: 10, imageStripHysteresisRatio: 0.5,
+    });
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
+    const ours = () => said.filter((line) => line.includes('an image fell past'));
+    try {
+      for (let i = 1; i <= 3; i++) manager.addMessage('user', imageMessage(`img-${i}`));
+      // A preview with a ceiling of 1 moves the watermark only for itself.
+      const entries = manager.previewContext({ maxTokens: 1_000_000, reserveForResponse: 0 }, { maxRequestImages: 1 }, { render: true })?.entries ?? [];
+      assert.ok(entries.length > 0, 'the preview rendered its entries');
+      const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+      assert.equal(pattern(compiled.messages, 3), 'III', 'the real ceiling of 10 strips nothing');
+      assert.deepEqual(ours(), [], "the preview's hypothetical ceiling left no line");
     } finally {
       console.warn = original;
       await manager.close();
