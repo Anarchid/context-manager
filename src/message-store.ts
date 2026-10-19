@@ -178,6 +178,17 @@ function revisionLeftByLastCountedWrite(store: object, stateId: string): number 
   return sharedLastRevisions.get(store)?.get(stateId);
 }
 
+/** At a MessageStore's construction, before its cache is built: the slot's
+ *  revision, as the baseline the first counted write on this handle compares
+ *  with, where no counted write has left one. Every cache on a handle and
+ *  slot belongs to a MessageStore, so none exists before the baseline, and
+ *  an uncounted write after it moves the revision away from the baseline for
+ *  the first counted write to see (nissa-seru's fourth case on #238: a
+ *  handle just opened, with no counted write yet). */
+function recordBaselineRevision(store: JsStore, stateId: string): void {
+  if (revisionLeftByLastCountedWrite(store, stateId) === undefined) recordRevisionAfterCountedWrite(store, stateId);
+}
+
 /** After a counted write: the revision it leaves, for the next one to compare with. */
 function recordRevisionAfterCountedWrite(store: JsStore, stateId: string): void {
   let m = sharedLastRevisions.get(store);
@@ -369,6 +380,7 @@ export class MessageStore {
       // resolve cache is valid here and must not be rebuilt per child.
       this.blobManager = seed.blobManager;
       this.tokenCalibration = seed.tokenCalibration;
+      recordBaselineRevision(store, this.stateId);
       this.allCache = {
         branchId: store.currentBranch().id,
         sequence: store.currentSequence(),
@@ -388,6 +400,7 @@ export class MessageStore {
       ? `${options.namespace}/messages`
       : DEFAULT_MESSAGE_STATE_ID;
     this.blobManager = new BlobManager(store);
+    recordBaselineRevision(store, this.stateId);
     this.rebuildIndex();
     this.registerHistoryIndexes();
   }

@@ -531,6 +531,38 @@ describe('MessageStore coherence across handles on one branch', () => {
     assert.deepEqual(served, ['r0', 'r1', 'sib', 'sib2']);
   });
 
+  it("a handle's first counted write sees an uncounted write before it (nissa-seru's fourth case on #238)", { skip }, async () => {
+    const texts = (s: MessageStore) => s.getAll().map((m) => (m.content[0] as { text: string }).text);
+    const dir = mkdtempSync(join(tmpdir(), 'cm-gap-baseline-'));
+    const path = join(dir, 'store');
+    const first = JsStore.create({ path });
+    MessageStore.register(first);
+    const writer = new MessageStore(first);
+    const r0 = writer.append('user', [{ type: 'text', text: 'r0' }]);
+    writer.append('user', [{ type: 'text', text: 'r1' }]);
+    first.close();
+    const root = JsStore.open({ path });
+    try {
+      const resident = new MessageStore(root);
+      resident.getAll(); // warm; no counted write yet on this handle
+      new MessageStore((root as ViewStore).view('main')).edit(r0.id, [{ type: 'text', text: 'edited' }]); // not counted on the root
+      new MessageStore(root).append('user', [{ type: 'text', text: 'sib' }]); // the handle's first counted write
+      const cold = texts(new MessageStore(root));
+      assert.deepEqual(cold, ['edited', 'r1', 'sib']);
+      assert.deepEqual(texts(resident), cold, 'the first counted write compared with the baseline the construction recorded');
+      // The variant: the resident's own append before it reads.
+      const resident2 = new MessageStore(root);
+      resident2.getAll();
+      new MessageStore((root as ViewStore).view('main')).edit(r0.id, [{ type: 'text', text: 'edited-again' }]);
+      resident2.append('user', [{ type: 'text', text: 'mine' }]);
+      assert.deepEqual(texts(resident2), texts(new MessageStore(root)));
+      assert.deepEqual(texts(resident2), ['edited-again', 'r1', 'sib', 'mine']);
+    } finally {
+      root.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('a count-preserving edit through another handle is served by a warm cache', { skip }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cm-coherence-'));
     const root = JsStore.create({ path: join(dir, 'store') });
