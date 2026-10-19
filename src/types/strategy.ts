@@ -251,11 +251,13 @@ export interface ContextStrategy {
 }
 
 /**
- * A strategy's live-image limits. Each figure is a count of image blocks or
- * a sum of their inline base64 bytes, and 0 means no limit. `target` is
- * what the window keeps, already within `ceiling` (`maxLiveImages` and
+ * A strategy's live-image limits. Each figure is a count of the image blocks
+ * the window counts (see `AutobiographicalConfig.maxLiveImages`) or a sum of
+ * their inline base64 bytes, and 0 means no limit. `target` is what the
+ * window keeps, already within `ceiling` (`maxLiveImages` and
  * `maxLiveImageBytes`, clamped); `ceiling` is the most one request may carry
- * (`maxRequestImages` and `maxRequestImageBytes`).
+ * (`maxRequestImages` and `maxRequestImageBytes`), which the window keeps
+ * its own images within.
  */
 export interface LiveImageLimits {
   target: { images: number; bytes: number };
@@ -1156,9 +1158,10 @@ export interface AutobiographicalConfig {
    * turn's continuation rounds, to keep its own appends below; nothing here
    * bounds what a caller appends or injects. The provider refuses a request
    * with more than 600 images and documents together (measured 2026-10-13,
-   * and again on 2026-10-19). Default 500, which leaves room for documents,
-   * which nothing here counts, and for image blocks a host adds outside the
-   * compile. 0 = no ceiling. A value that isn't 0 or a finite number above it
+   * and again on 2026-10-19). Default 500, which leaves room for what the
+   * window doesn't count: documents, images nested in tool results and
+   * generated images (see `maxLiveImages`), and image blocks a host adds
+   * outside the compile. 0 = no ceiling. A value that isn't 0 or a finite number above it
    * takes the default, and the strategy's warning at initialize names it. A
    * fraction is floored. Under a window limit of 0 or above this ceiling, the
    * strategy says once, the first time an image falls past it.

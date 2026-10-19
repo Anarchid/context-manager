@@ -1,15 +1,17 @@
 /**
  * The live-image window's limits, clamped to the request ceilings.
  *
- * A strategy's live window keeps images newest-first up to a count
- * (`maxLiveImages`) and a byte budget (`maxLiveImageBytes`). The request
- * ceilings (`maxRequestImages`, `maxRequestImageBytes`) are the most one
- * request may carry at all, so the window's own limits never exceed them:
- * an unlimited (0) target means "up to the ceiling", and a target above the
- * ceiling keeps the ceiling's worth. A caller that appends to a compiled
- * request without recompiling, such as a turn's continuation rounds, can
- * read both through the strategy's `liveImageLimits()` and stop below the
- * ceiling; nothing here bounds what it appends.
+ * A strategy's live window keeps the images it counts (top-level image
+ * blocks; see `AutobiographicalConfig.maxLiveImages`) newest-first up to a
+ * count (`maxLiveImages`) and a byte budget (`maxLiveImageBytes`). The
+ * request ceilings (`maxRequestImages`, `maxRequestImageBytes`) are the most
+ * one request may carry, so the window's own limits never exceed them: an
+ * unlimited (0) target means "up to the ceiling", and a target above the
+ * ceiling keeps the ceiling's worth. What the window doesn't count, it
+ * doesn't bound. A caller that appends to a compiled request without
+ * recompiling, such as a turn's continuation rounds, can read both through
+ * the strategy's `liveImageLimits()` and stop below the ceiling; nothing
+ * here bounds what it appends.
  */
 
 import type { LiveImageLimits } from './types/strategy.js';

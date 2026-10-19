@@ -2560,6 +2560,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibrationProvisional = null;
     this._imageWatermark = undefined;
     this._imageWatermarkLoaded = false;
+    // A ceiling's move of the watermark belongs to the branch it moved on.
+    this._ceilingMovedWatermark.images = false;
+    this._ceilingMovedWatermark.bytes = false;
     this._lastKvStable = null;
     this._storeOrder = new Map();
     this._storeOrderSource = [];
@@ -7115,6 +7118,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the next compile's stable prefix and fold diff are measured against
       // the request before it.
       const prevCacheKeys = this._prevCacheKeys;
+      // What this select's strips record is what it reports. A dry select's
+      // strips, or a refused one's, record too, and are dropped here.
+      this._ceilingHitsThisRender = { images: false, bytes: false };
       let entries: ContextEntry[];
       try {
         entries = this.selectPath(store, budget, opts);
@@ -7124,8 +7130,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       // Only a render this select returns says the ceiling line: one it
       // refused threw above, and a dry select never comes here. Every select
-      // path strips its render last (applyImageStripping, `sent`), so the
-      // hits are this render's.
+      // path strips its render last (applyImageStripping, `sent`), and a
+      // strip with no limits records nothing, so the hits are this render's.
       this.reportCeilingHits();
       return entries;
     }
@@ -16322,14 +16328,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private readonly ceilingBoundReported = { images: false, bytes: false };
   /** The ceilings the last selection's render stripped against (applyImageStripping, `sent`). */
   private _ceilingHitsThisRender = { images: false, bytes: false };
-  /** The ceilings that have moved the hysteresis watermark, outside a dry run. */
+  /** The ceilings that have moved the hysteresis watermark on this branch, outside a dry run. */
   private readonly _ceilingMovedWatermark = { images: false, bytes: false };
 
   /** Say once for each ceiling, when a select returns a render that a
    *  request ceiling, rather than a limit the host set, stripped (see
-   *  ceilingSetLimits), directly or through the watermark it moved. A dry
-   *  select, a preview, an observer's reconstruction or a refused select
-   *  says nothing, and the line waits for the first render returned. */
+   *  ceilingSetLimits), directly or through a watermark it moved on this
+   *  branch while this instance ran. A watermark loaded from the store
+   *  carries no record of what moved it, so a later instance says it when
+   *  its own walk next meets the ceiling. A dry select, a preview, an
+   *  observer's reconstruction or a refused select says nothing, and the
+   *  line waits for the first render returned. */
   private reportCeilingHits(): void {
     for (const kind of ['images', 'bytes'] as const) {
       const hit = this._ceilingHitsThisRender[kind] || this._ceilingMovedWatermark[kind];

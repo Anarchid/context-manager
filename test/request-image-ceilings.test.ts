@@ -430,7 +430,9 @@ describe('the line when an image first falls past a request ceiling', () => {
       // falls past it.
       const strategy = make({ maxLiveImages: 0, maxLiveImageBytes: 0, maxRequestImages: 3, maxRequestImageBytes: 16 });
       const { byStep, patterns } = await ceilingLines(strategy, [{ add: 4, bytes: 4 }, { add: 1, bytes: 16 }, { add: 1, bytes: 4 }]);
-      assert.deepEqual(patterns, ['.III', '....I', '.....I'], 'the count, then the bytes, strip');
+      // At the third step the byte walk drops the 16-byte image and, being
+      // greedy, keeps two older 4-byte ones that still fit (as on main).
+      assert.deepEqual(patterns, ['.III', '....I', '..II.I'], 'the count, then the bytes, strip');
       assert.deepEqual(byStep.map((step) => step.length), [1, 1, 0], JSON.stringify(byStep));
       assert.ok(byStep[0]![0]!.includes('an image fell past maxRequestImages 3'), byStep[0]![0]);
       assert.ok(byStep[1]![0]!.includes('an image fell past maxRequestImageBytes 16 bytes'), byStep[1]![0]);
@@ -564,9 +566,10 @@ describe('the line when an image first falls past a request ceiling', () => {
     try {
       for (let i = 1; i <= 3; i++) manager.addMessage('user', imageMessage(`img-${i}`));
       // The newest turn is a call with no result yet: structural repair drops
-      // it, after the strip, and the select refuses.
+      // it, and the check after the strip refuses the select.
       manager.addMessage('Claude', [{ type: 'tool_use', id: 'tu-1', name: 'shot', input: {} }] as ContentBlock[]);
-      await assert.rejects(manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 }));
+      await assert.rejects(manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 }),
+        { message: /^Structural repair did not retain the newest turn/ });
       assert.deepEqual(ours(), [], 'a refused select says nothing');
       manager.addMessage('user', [{ type: 'tool_result', toolUseId: 'tu-1', content: 'done' }] as ContentBlock[]);
       await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
@@ -578,8 +581,32 @@ describe('the line when an image first falls past a request ceiling', () => {
     }
   });
 
-  it("the memory strategy's watermark leaves the line for the next compile, and a preview's watermark leaves nothing", async () => {
-    // A new message can move the watermark; the line waits for a compile.
+  it("the memory strategy's watermark, moved by a new message, says nothing until a compile returns", async () => {
+    const said: string[] = [];
+    const original = console.warn;
+    console.warn = (...parts: unknown[]) => { said.push(parts.map(String).join(' ')); };
+    const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
+    const manager = await ContextManager.open({
+      path: join(dir, 'store'),
+      strategy: memory({ maxLiveImages: 0, maxRequestImages: 4, imageStripHysteresisRatio: 0.5 }),
+    });
+    const ours = () => said.filter((line) => line.includes('an image fell past'));
+    try {
+      // The fifth image's message moves the watermark past the ceiling of 4.
+      for (let i = 1; i <= 5; i++) manager.addMessage('user', imageMessage(`img-${i}`));
+      assert.deepEqual(ours(), [], 'the new messages say nothing');
+      const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+      assert.equal(pattern(compiled.messages, 5), '...II', 'one trim to half the ceiling');
+      assert.equal(ours().length, 1, JSON.stringify(said));
+      assert.ok(ours()[0]!.includes('an image fell past maxRequestImages 4'), ours()[0]);
+    } finally {
+      console.warn = original;
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("the memory strategy says nothing for a watermark a preview's own ceiling moved", async () => {
     const said: string[] = [];
     const original = console.warn;
     console.warn = (...parts: unknown[]) => { said.push(parts.map(String).join(' ')); };
@@ -591,13 +618,69 @@ describe('the line when an image first falls past a request ceiling', () => {
     const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
     const ours = () => said.filter((line) => line.includes('an image fell past'));
     try {
-      for (let i = 1; i <= 3; i++) manager.addMessage('user', imageMessage(`img-${i}`));
-      // A preview with a ceiling of 1 moves the watermark only for itself.
-      const entries = manager.previewContext({ maxTokens: 1_000_000, reserveForResponse: 0 }, { maxRequestImages: 1 }, { render: true })?.entries ?? [];
-      assert.ok(entries.length > 0, 'the preview rendered its entries');
+      for (let i = 1; i <= 4; i++) manager.addMessage('user', imageMessage(`img-${i}`));
+      // A preview with a ceiling of 2 moves the watermark, for itself only:
+      // its trim to half keeps one image, where the count alone keeps two.
+      const entries = manager.previewContext({ maxTokens: 1_000_000, reserveForResponse: 0 }, { maxRequestImages: 2 }, { render: true })?.entries ?? [];
+      assert.equal(pattern(entries, 4), '...I', "the preview's own watermark trimmed to half its ceiling");
       const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
-      assert.equal(pattern(compiled.messages, 3), 'III', 'the real ceiling of 10 strips nothing');
+      assert.equal(pattern(compiled.messages, 4), 'IIII', 'the real ceiling of 10 strips nothing');
       assert.deepEqual(ours(), [], "the preview's hypothetical ceiling left no line");
+    } finally {
+      console.warn = original;
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('the memory strategy says nothing for a host with no limits, after a preview with a ceiling of its own', async () => {
+    const said: string[] = [];
+    const original = console.warn;
+    console.warn = (...parts: unknown[]) => { said.push(parts.map(String).join(' ')); };
+    const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
+    // Every limit off (the helper sets no depth strip), so the compile's strip has nothing to record.
+    const manager = await ContextManager.open({
+      path: join(dir, 'store'),
+      strategy: memory({
+        hierarchical: false, adaptiveResolution: true, compressionModel: 'mock', targetChunkTokens: 100,
+        autoTickOnNewMessage: false, maxLiveImages: 0, maxLiveImageBytes: 0, maxRequestImages: 0, maxRequestImageBytes: 0,
+      }),
+    });
+    const ours = () => said.filter((line) => line.includes('an image fell past'));
+    try {
+      for (let i = 1; i <= 3; i++) manager.addMessage('user', imageMessage(`img-${i}`));
+      const entries = manager.previewContext({ maxTokens: 1_000_000, reserveForResponse: 0 }, { maxRequestImages: 1 }, { render: true })?.entries ?? [];
+      assert.equal(pattern(entries, 3), '..I', 'the preview strips to its own ceiling');
+      const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+      assert.equal(pattern(compiled.messages, 3), 'III', 'with no limits, the compile keeps every image');
+      assert.deepEqual(ours(), [], "the preview's strip isn't the compile's");
+    } finally {
+      console.warn = original;
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("the memory strategy leaves a watermark's line with the branch it moved on", async () => {
+    const said: string[] = [];
+    const original = console.warn;
+    console.warn = (...parts: unknown[]) => { said.push(parts.map(String).join(' ')); };
+    const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
+    const manager = await ContextManager.open({
+      path: join(dir, 'store'),
+      strategy: memory({ maxLiveImages: 0, maxRequestImages: 4, imageStripHysteresisRatio: 0.5 }),
+    });
+    const ours = () => said.filter((line) => line.includes('an image fell past'));
+    try {
+      manager.addMessage('user', imageMessage('img-1'));
+      const main = manager.currentBranch().name;
+      await manager.fork('busy');
+      // On the fork, new messages move the watermark past the ceiling of 4.
+      for (let i = 2; i <= 5; i++) manager.addMessage('user', imageMessage(`img-${i}`));
+      await manager.switchBranch(main);
+      const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+      assert.equal(pattern(compiled.messages, 1), 'I', 'main holds one image, under its ceiling');
+      assert.deepEqual(ours(), [], "main's compile says nothing for the fork's watermark");
     } finally {
       console.warn = original;
       await manager.close();
