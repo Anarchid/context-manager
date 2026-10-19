@@ -1,6 +1,7 @@
 import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 import type {
   ContextStrategy,
+  LiveImageLimits,
   StrategyContext,
   ReadinessState,
   MessageStoreView,
@@ -18,6 +19,12 @@ import type { JsStore } from '@animalabs/chronicle';
 import { OverBudgetError } from '../adaptive/picker.js';
 import { observeStoreBranch, type StoreBranchGeneration } from '../branch-generation.js';
 import { capContent, cappedPriceExtra } from './message-cap.js';
+import {
+  DEFAULT_MAX_REQUEST_IMAGES,
+  DEFAULT_MAX_REQUEST_IMAGE_BYTES,
+  liveImageLimitsWarning,
+  resolveLiveImageLimits,
+} from '../live-image-limits.js';
 
 /**
  * Options for {@link WindowedPassthroughStrategy}.
@@ -66,13 +73,26 @@ export interface WindowedPassthroughOptions {
    * `imageStripDepthTokens` from the newest message, or past
    * `maxLiveImageBytes` of cumulative inline image bytes (newest-first).
    * Defaults follow `DEFAULT_AUTOBIOGRAPHICAL_CONFIG` (and the memory
-   * strategy's byte wall); 0 disables that dimension. A strip changes the
+   * strategy's byte wall). A count or byte limit of 0 means up to its
+   * request ceiling, below, and a depth of 0 means no depth strip. A strip changes the
    * bytes at that position, which the cache-marker placement absorbs by
    * measurement (the marker falls back to the deepest byte-stable entry).
    */
   maxLiveImages?: number;
   imageStripDepthTokens?: number;
   maxLiveImageBytes?: number;
+  /**
+   * The request ceilings, mirroring `AutobiographicalConfig`: the most images,
+   * and the most inline image bytes, one request may carry. The window keeps
+   * at most these of the images it counts, counted as
+   * `AutobiographicalConfig.maxLiveImages` says, whatever `maxLiveImages` and
+   * `maxLiveImageBytes` say (0 there means up to these), and
+   * `liveImageLimits()` reports them.
+   * Defaults 500 images and 24 MiB; 0 = no ceiling, and a value that isn't 0
+   * or a finite number above it takes the default.
+   */
+  maxRequestImages?: number;
+  maxRequestImageBytes?: number;
 }
 
 /** Text substituted for an image block once it leaves the live-image window
@@ -129,9 +149,15 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
 
   private readonly reAnchorFraction: number;
   private readonly anchorStateIdOverride?: string;
-  private readonly maxLiveImages: number;
+  /** The image limits as configured, with the defaults where unset. */
+  private readonly configuredImageLimits: {
+    maxLiveImages: number; maxLiveImageBytes: number; maxRequestImages: number; maxRequestImageBytes: number;
+  };
+  /** The image limits the options didn't give, whose values are defaults. */
+  private readonly imageLimitsDefaulted: ReadonlySet<string>;
   private readonly imageStripDepthTokens: number;
-  private readonly maxLiveImageBytes: number;
+  /** Whether the image limits' warning has been said (once per instance). */
+  private imageLimitsWarningReported = false;
 
   private anchor: Sequence = 0;
   private store: JsStore | null = null;
@@ -154,15 +180,35 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     this.reAnchorFraction = fraction;
     this.anchorStateIdOverride = options.anchorStateId;
     this.maxMessageTokens = options.maxMessageTokens;
-    this.maxLiveImages = options.maxLiveImages ?? DEFAULT_AUTOBIOGRAPHICAL_CONFIG.maxLiveImages ?? 0;
+    this.configuredImageLimits = {
+      maxLiveImages: options.maxLiveImages ?? DEFAULT_AUTOBIOGRAPHICAL_CONFIG.maxLiveImages ?? 0,
+      maxLiveImageBytes: options.maxLiveImageBytes ?? DEFAULT_MAX_LIVE_IMAGE_BYTES,
+      maxRequestImages: options.maxRequestImages ?? DEFAULT_MAX_REQUEST_IMAGES,
+      maxRequestImageBytes: options.maxRequestImageBytes ?? DEFAULT_MAX_REQUEST_IMAGE_BYTES,
+    };
+    this.imageLimitsDefaulted = new Set(
+      (['maxLiveImages', 'maxLiveImageBytes', 'maxRequestImages', 'maxRequestImageBytes'] as const).filter((key) => options[key] == null),
+    );
     this.imageStripDepthTokens =
       options.imageStripDepthTokens ?? DEFAULT_AUTOBIOGRAPHICAL_CONFIG.imageStripDepthTokens ?? 0;
-    this.maxLiveImageBytes = options.maxLiveImageBytes ?? DEFAULT_MAX_LIVE_IMAGE_BYTES;
+  }
+
+  /**
+   * The live window's count and byte limits, clamped to the request
+   * ceilings, and the ceilings themselves (see ContextStrategy.liveImageLimits).
+   */
+  liveImageLimits(): LiveImageLimits {
+    return resolveLiveImageLimits(this.configuredImageLimits);
   }
 
   async initialize(ctx: StrategyContext): Promise<void> {
     this.store = ctx.store;
     this.ns = ctx.namespace;
+    if (!this.imageLimitsWarningReported) {
+      this.imageLimitsWarningReported = true;
+      const line = liveImageLimitsWarning(this.name, this.configuredImageLimits, this.imageLimitsDefaulted);
+      if (line) this.diag.warn(line);
+    }
     this.stateId = this.anchorStateIdOverride ?? `${ctx.namespace}/windowed:anchor`;
     registerStateIfAbsent(this.store, { id: this.stateId, strategy: 'snapshot' });
     this.loadBranchState();
@@ -384,9 +430,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     messages: StoredMessage[],
     store: MessageStoreView,
   ): void {
-    const maxLive = this.maxLiveImages;
+    // Count and bytes within the request ceilings; 0 = unlimited.
+    const { images: maxLive, bytes: maxLiveBytes } = this.liveImageLimits().target;
     const depthTokens = this.imageStripDepthTokens;
-    const maxLiveBytes = this.maxLiveImageBytes;
     if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return;
 
     // Depth boundary: walk newest→oldest over the whole view (the policy is

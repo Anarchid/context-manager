@@ -106,6 +106,7 @@ export type {
   CompressionHoldOptions,
   CompressionHoldInfo,
   RenderedSummaryInfo,
+  LiveImageLimits,
 } from './types/index.js';
 
 // Accepted rounds and fold receipts

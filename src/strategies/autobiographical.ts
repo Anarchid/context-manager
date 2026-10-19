@@ -5,6 +5,7 @@ import { registerStateIfAbsent } from '../state-registration.js';
 import { phaseChannel } from '../phase-channel.js';
 import type {
   ContextStrategy,
+  LiveImageLimits,
   ResettableStrategy,
   StrategyContext,
   ReadinessState,
@@ -77,6 +78,13 @@ import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
+import {
+  DEFAULT_MAX_REQUEST_IMAGES,
+  DEFAULT_MAX_REQUEST_IMAGE_BYTES,
+  clampToCeiling,
+  liveImageLimitsWarning,
+  resolveLiveImageLimits,
+} from '../live-image-limits.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
@@ -1156,8 +1164,12 @@ interface CompressionInFlightResult {
 interface PreparationCounts {
   serializedMediaReplacements: number;
   imageReplacements: number;
+  /** The inline image byte budget, 0 for none. */
   imageBudgetBytes: number;
   imageBytesKept: number;
+  /** The most images the prompt may carry (maxRequestImages), 0 for none. */
+  imageCountCap: number;
+  imagesKept: number;
 }
 
 /** A compression request after preparation, with what preparation replaced. */
@@ -2409,6 +2421,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Bind to the chronicle store + namespace for persistent strategy state.
     this.store = ctx.store;
     this.ns = ctx.namespace;
+    this.reportImageLimitsWarningOnce();
     // Its tools getter follows the host's declarations (compressionWorkQueued).
     this.hostContext = ctx;
     observeStoreBranch(ctx.store);
@@ -16016,7 +16029,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Post-pass over compiled entries: replace image blocks with a text
    *  placeholder once they fall outside the live-image window — either deeper
    *  than `imageStripDepthTokens` from the newest message, or beyond the
-   *  `maxLiveImages` most-recent images (counted newest-first). Summaries are
+   *  `maxLiveImages` most-recent images (counted newest-first), or past
+   *  `maxLiveImageBytes`, the count and bytes each within its request ceiling
+   *  (liveImageLimits). Summaries are
    *  already text, so they're naturally unaffected. The adjacent
    *  "[image attachment: <name>]" text added at ingest preserves the filename,
    *  so the placeholder itself stays terse. Reduces tokens, so it never pushes
@@ -16028,10 +16043,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  the in-progress render stats by the reclaimed tokens, keeping
    *  `RenderStats.total` equal to the real rendered size. */
   protected applyImageStripping(entries: ContextEntry[], store: MessageStoreView): void {
-    const maxLive = this.config.maxLiveImages ?? 0;             // 0 = unlimited count
+    // Count and bytes within the request ceilings; 0 = unlimited.
+    const { images: maxLive, bytes: maxLiveBytes } = this.liveImageLimits().target;
     const depthTokens = this.config.imageStripDepthTokens ?? 0; // 0 = no depth strip
-    const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
-    if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return; // policy disabled
+    if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return; // no window and no ceilings
 
     const messages = store.getAll();
     const posById = this.positionIndex(messages);
@@ -16122,8 +16137,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const ratio = this.imageHysteresisRatio();
     if (ratio === undefined) return;
     const stripDepth = this.config.imageStripDepthTokens ?? 0;
-    const maxLive = this.config.maxLiveImages ?? 0;
-    const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
+    const { images: maxLive, bytes: maxLiveBytes } = this.liveImageLimits().target;
     if (stripDepth === 0 && maxLive === 0 && maxLiveBytes === 0) return;
     const messages = store.getAll();
     const w = this.imageWatermark();
@@ -16186,7 +16200,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Post-strip token estimate per message index (2026-07-12 tail-starvation
-   * fix). Mirrors `applyImageStripping`: an image beyond the `maxLiveImages`
+   * fix). Mirrors `applyImageStripping`, with the same limits from
+   * liveImageLimits(), the count and bytes within their request ceilings:
+   * an image beyond the `maxLiveImages`
    * newest (counted newest-first) or deeper than `imageStripDepthTokens` of
    * raw estimate from the live end renders as a placeholder — so every place
    * that BUDGETS messages (recent-window walk-back, head/tail sums, middle
@@ -16199,8 +16215,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected postStripEstimates(store: MessageStoreView): number[] {
     const messages = store.getAll();
     const stripDepth = this.config.imageStripDepthTokens ?? 0;
-    const maxLive = this.config.maxLiveImages ?? 0;
-    const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
+    const { images: maxLive, bytes: maxLiveBytes } = this.liveImageLimits().target;
     // A compile asks for this pass more than once (recent-window scan, then
     // the picker inputs). The listing array is the store's own cached view,
     // so its identity, calibration and the knobs key the memo, the
@@ -16264,8 +16279,54 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     messages: readonly StoredMessage[]; calibration: number; stripDepth: number; maxLive: number; maxLiveBytes: number; ratio: number | undefined; out: number[];
   } | null = null;
 
-  /** Byte wall default: 20MB of base64 (API total-request cap is 32MB). */
+  /** Byte wall default: 20 MiB of base64, under the default request byte
+   *  ceiling (24 MiB), which leaves room under membrane's 28 MiB cap. */
   protected static readonly DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
+
+  /** The image limits the host didn't give, whose values are defaults. */
+  private imageLimitsDefaulted(): ReadonlySet<string> {
+    const keys = ['maxLiveImages', 'maxLiveImageBytes', 'maxRequestImages', 'maxRequestImageBytes', 'maxCompressionImageBytes'] as const;
+    return new Set(keys.filter((key) => this.configProvenance[key] !== 'caller' || this.config[key] == null));
+  }
+
+  /** The live-image limits as configured, with the defaults where unset. */
+  private configuredImageLimits(): {
+    maxLiveImages: number; maxLiveImageBytes: number; maxRequestImages: number; maxRequestImageBytes: number;
+  } {
+    return {
+      maxLiveImages: this.config.maxLiveImages ?? 0,
+      maxLiveImageBytes: this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES,
+      maxRequestImages: this.config.maxRequestImages ?? DEFAULT_MAX_REQUEST_IMAGES,
+      maxRequestImageBytes: this.config.maxRequestImageBytes ?? DEFAULT_MAX_REQUEST_IMAGE_BYTES,
+    };
+  }
+
+  /**
+   * The live window's count and byte limits, clamped to the request
+   * ceilings, and the ceilings themselves (see ContextStrategy.liveImageLimits).
+   * The strip, the watermark and the post-strip estimates all read their
+   * limits here, so they can't disagree about them.
+   */
+  liveImageLimits(): LiveImageLimits {
+    return resolveLiveImageLimits(this.configuredImageLimits());
+  }
+
+  /** Whether the image limits' warning has been said (once per instance). */
+  private imageLimitsWarningReported = false;
+
+  /** One line when a configured image limit sits above its request ceiling,
+   *  or a ceiling is malformed and takes its default, so an operator sees why
+   *  the window or a compression prompt keeps fewer images than they set. */
+  private reportImageLimitsWarningOnce(): void {
+    if (this.imageLimitsWarningReported) return;
+    this.imageLimitsWarningReported = true;
+    const line = liveImageLimitsWarning(this.name, {
+      ...this.configuredImageLimits(),
+      maxCompressionImageBytes:
+        this.config.maxCompressionImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
+    }, this.imageLimitsDefaulted());
+    if (line) this.diag.warn(line);
+  }
 
   /** Compression prompts carry head + recall frontier + raw chunk alongside
    *  their images, so they get a tighter image budget than the live window. */
@@ -16307,12 +16368,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected prepareCompressionRequest(request: NormalizedRequest): CompressionPreparation {
     const prepared = { ...request, messages: request.messages.map(message => ({ ...message })) };
     const serializedMediaReplacements = this.stripSerializedCompressionMedia(prepared.messages);
-    const imageBudgetBytes =
-      this.config.maxCompressionImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES;
-    const cap = { keptBytes: 0 };
-    const imageReplacements = this.capCompressionImageBytes(prepared.messages, imageBudgetBytes, cap);
+    // A compression prompt is a request too: at most the request ceilings.
+    const { ceiling } = this.liveImageLimits();
+    const imageBudgetBytes = clampToCeiling(
+      this.config.maxCompressionImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
+      ceiling.bytes,
+    );
+    const imageCountCap = ceiling.images;
+    const cap = { keptBytes: 0, keptImages: 0 };
+    const imageReplacements = this.capCompressionImageBytes(prepared.messages, imageBudgetBytes, cap, imageCountCap);
     return {
       request: prepared, serializedMediaReplacements, imageReplacements, imageBudgetBytes, imageBytesKept: cap.keptBytes,
+      imageCountCap, imagesKept: cap.keptImages,
     };
   }
 
@@ -16354,10 +16421,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     if (counts.imageReplacements > 0) {
       const mib = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)}MiB`;
+      const limits = [
+        ...(counts.imageBudgetBytes > 0 ? [`the ${mib(counts.imageBudgetBytes)} inline image budget`] : []),
+        ...(counts.imageCountCap > 0 ? [`the ${counts.imageCountCap}-image request ceiling`] : []),
+      ].join(' and ');
       this.diag.error(
         `[autobiographical] compression prompt: replaced ${counts.imageReplacements} image(s) with placeholders ` +
-          `to stay under the ${mib(counts.imageBudgetBytes)} inline image budget ` +
-          `(kept ${mib(counts.imageBytesKept)}, newest messages first) [${label}]`,
+          `to stay under ${limits} ` +
+          `(kept ${counts.imagesKept} image(s), ${mib(counts.imageBytesKept)}, newest messages first) [${label}]`,
       );
     }
   }
@@ -16578,26 +16649,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Cap inline image bytes in a COMPRESSION prompt (2026-07-12). The main
+   * Cap inline image bytes in a COMPRESSION prompt (2026-07-12), and with
+   * `capImages` their number (2026-10-19, `maxRequestImages`). The main
    * window enforces `maxLiveImageBytes` through the strip policy; the
    * summarizer's raw-chunk replay had no such wall and leaned on membrane's
    * byte shed instead — which is a transport backstop, not a policy owner
    * (it fired at 27MB on a live merge). Every inline image counts, whatever
    * its shape (see compressionImageBytes), generated images included.
    * Messages are walked newest-first, and the blocks within a message in
-   * order; each image is kept if it fits in what's left of the budget, and
-   * the others become the same loud placeholder the window uses, so the
-   * summarizer is told plainly that it is not seeing them.
+   * order; each image is kept if it fits in what's left of the budget and
+   * of the count, and the others become the same loud placeholder the window
+   * uses, so the summarizer is told plainly that it is not seeing them.
+   * A cap of 0 or less is none.
    * Returns the number of images replaced; `stats`, when given, receives the
-   * bytes kept.
+   * bytes and the images kept.
    */
   protected capCompressionImageBytes(
     messages: Array<{ content: ContentBlock[] }>,
     capBytes: number,
-    stats?: { keptBytes: number },
+    stats?: { keptBytes: number; keptImages?: number },
+    capImages = 0,
   ): number {
-    if (capBytes <= 0) return 0;
+    const countCap = capImages > 0 ? capImages : 0;
+    if (capBytes <= 0 && countCap === 0) return 0;
     let kept = 0;
+    let keptImages = 0;
     let dropped = 0;
     // Recurse into tool_result content: an agent that drives a shell/plotter/
     // browser carries most of its image bytes NESTED in tool results, not as
@@ -16610,8 +16686,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const capped = blocks.map((b) => {
         if (b.type === 'image' || b.type === 'generated_image') {
           const bytes = AutobiographicalStrategy.compressionImageBytes(b);
-          if (kept + bytes <= capBytes) {
+          if ((capBytes <= 0 || kept + bytes <= capBytes) && (countCap === 0 || keptImages < countCap)) {
             kept += bytes;
+            keptImages++;
             return b;
           }
           dropped++;
@@ -16634,7 +16711,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!Array.isArray(m.content)) continue;
       m.content = capBlocks(m.content);
     }
-    if (stats) stats.keptBytes = kept;
+    if (stats) {
+      stats.keptBytes = kept;
+      stats.keptImages = keptImages;
+    }
     return dropped;
   }
 

@@ -79,6 +79,7 @@ export type {
   CalibrationReset,
   RenderStatsCapableStrategy,
   RenderedSummaryInfo,
+  LiveImageLimits,
 } from './strategy.js';
 
 export {
