@@ -480,6 +480,57 @@ describe('MessageStore coherence across handles on one branch', () => {
   // a hospital tool holding root.view('main') while the resident runs on
   // the root — edits an earlier message in place. The resident's own store
   // must serve the edit, although the item count did not change.
+  it("an uncounted write beside a counted one, between a reader's reads, is served (nissa-seru's three cases on #238)", { skip }, async () => {
+    const texts = (store: MessageStore) => store.getAll().map((m) => (m.content[0] as { text: string }).text);
+    const scenario = (run: (root: JsStore, resident: MessageStore, sibling: MessageStore, surgeon: MessageStore, r0: { id: string }, r1: { id: string }) => void): string[][] => {
+      const dir = mkdtempSync(join(tmpdir(), 'cm-gap-'));
+      const root = JsStore.create({ path: join(dir, 'store') });
+      try {
+        MessageStore.register(root);
+        const resident = new MessageStore(root);
+        const r0 = resident.append('user', [{ type: 'text', text: 'r0' }]);
+        const r1 = resident.append('user', [{ type: 'text', text: 'r1' }]);
+        resident.getAll(); // warm
+        const sibling = new MessageStore(root); // counted on the root
+        const surgeon = new MessageStore((root as ViewStore).view('main')); // not counted on the root
+        run(root, resident, sibling, surgeon, r0, r1);
+        return [texts(resident), texts(new MessageStore(root))];
+      } finally {
+        root.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    };
+    // 1. a counted append, then an uncounted edit, then the read
+    let [served, cold] = scenario((_root, _resident, sibling, surgeon, r0) => {
+      sibling.append('user', [{ type: 'text', text: 'sib' }]);
+      surgeon.edit(r0.id, [{ type: 'text', text: 'edited' }]);
+    });
+    assert.deepEqual(cold, ['edited', 'r1', 'sib']);
+    assert.deepEqual(served, cold, 'case 1: the resident serves the edit, not the extension');
+    // 2. the same, with the resident's own append before it reads
+    [served, cold] = scenario((_root, resident, sibling, surgeon, r0) => {
+      sibling.append('user', [{ type: 'text', text: 'sib' }]);
+      surgeon.edit(r0.id, [{ type: 'text', text: 'edited' }]);
+      resident.append('user', [{ type: 'text', text: 'mine' }]);
+    });
+    assert.deepEqual(cold, ['edited', 'r1', 'sib', 'mine']);
+    assert.deepEqual(served, cold, "case 2: the resident's own append doesn't extend past the edit");
+    // 3. a counted edit, then an uncounted append, then the read
+    [served, cold] = scenario((_root, _resident, sibling, surgeon, _r0, r1) => {
+      sibling.edit(r1.id, [{ type: 'text', text: 'sib-edited' }]);
+      surgeon.append('user', [{ type: 'text', text: 'outside' }]);
+    });
+    assert.deepEqual(cold, ['r0', 'sib-edited', 'outside']);
+    assert.deepEqual(served, cold, "case 3: a counted edit's length is not explained by an uncounted append");
+    // Control: counted writes alone still take the cheap path (no gap is seen).
+    [served, cold] = scenario((_root, _resident, sibling) => {
+      sibling.append('user', [{ type: 'text', text: 'sib' }]);
+      sibling.append('user', [{ type: 'text', text: 'sib2' }]);
+    });
+    assert.deepEqual(served, cold);
+    assert.deepEqual(served, ['r0', 'r1', 'sib', 'sib2']);
+  });
+
   it('a count-preserving edit through another handle is served by a warm cache', { skip }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cm-coherence-'));
     const root = JsStore.create({ path: join(dir, 'store') });

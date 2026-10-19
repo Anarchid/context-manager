@@ -146,6 +146,45 @@ function currentWriteVersion(store: object, stateId: string): number {
   return sharedWriteVersions.get(store)?.get(stateId) ?? 0;
 }
 
+/**
+ * The window the counter can't see (nissa-seru, #238): a write the counter
+ * doesn't count — through another handle on the branch, or a chronicle call
+ * outside MessageStore — between two counted writes. Every counted write
+ * records the revision it leaves (`sharedLastRevisions`); the next counted
+ * write compares the revision it finds with that, and a difference is a gap:
+ * `sharedGapCounts` moves, and a cache built before the move can't be
+ * extended, only rebuilt. Keyed by the JsStore object, as the counter is.
+ */
+const sharedLastRevisions = new WeakMap<object, Map<string, number>>();
+const sharedGapCounts = new WeakMap<object, Map<string, number>>();
+
+function currentGapCount(store: object, stateId: string): number {
+  return sharedGapCounts.get(store)?.get(stateId) ?? 0;
+}
+
+/** Before a counted write: a revision the last counted write didn't leave means an uncounted write happened since. */
+function noteRevisionBeforeCountedWrite(store: JsStore, stateId: string): void {
+  const last = sharedLastRevisions.get(store)?.get(stateId);
+  if (last !== undefined && last !== slotRevision(store, stateId)) {
+    let m = sharedGapCounts.get(store);
+    if (!m) { m = new Map(); sharedGapCounts.set(store, m); }
+    m.set(stateId, (m.get(stateId) ?? 0) + 1);
+  }
+}
+
+/** The revision the last counted write left, or undefined before any. A read
+ *  that finds another revision has an uncounted write since, whoever made it. */
+function revisionLeftByLastCountedWrite(store: object, stateId: string): number | undefined {
+  return sharedLastRevisions.get(store)?.get(stateId);
+}
+
+/** After a counted write: the revision it leaves, for the next one to compare with. */
+function recordRevisionAfterCountedWrite(store: JsStore, stateId: string): void {
+  let m = sharedLastRevisions.get(store);
+  if (!m) { m = new Map(); sharedLastRevisions.set(store, m); }
+  m.set(stateId, slotRevision(store, stateId));
+}
+
 /** Bumped by every mutation except append (main's token for a cache of
  *  per-message facts that survives appends). On this branch getAll's mapped
  *  view is memoised per internal record (storedViews), which an edit or
@@ -336,6 +375,7 @@ export class MessageStore {
         internals: seed.internals as StoredMessageInternal[],
         writeVersion: slotRevision(store, this.stateId),
         writeCount: currentWriteVersion(store, this.stateId),
+        gapCount: currentGapCount(store, this.stateId),
       };
       // The id index is rebuilt from the seeded array on first lookup
       // (indexBranchId starts unset), and the native history indexes are
@@ -561,6 +601,8 @@ export class MessageStore {
      *  how many writes through a MessageStore on this store moved since,
      *  which is how many appends an appends-only extension expects. */
     writeCount: number;
+    /** sharedGapCounts at that point: an uncounted write seen since makes the cache rebuild-only. */
+    gapCount: number;
   } | null = null;
 
   /**
@@ -622,6 +664,7 @@ export class MessageStore {
       this.indexBranchId === this.store.currentBranch().id &&
       this.indexWriteVersion === slotRevision(this.store, this.stateId);
     const cacheWasCurrent = this.cacheIsCurrent();
+    noteRevisionBeforeCountedWrite(this.store, this.stateId);
     const version = bumpWriteVersion(this.store, this.stateId, this.log);
     const record = this.store.appendToStateJsonWithIdentity(
       this.stateId,
@@ -629,6 +672,7 @@ export class MessageStore {
       'id',
       'sequence',
     );
+    recordRevisionAfterCountedWrite(this.store, this.stateId);
     const index = this.length() - 1;
 
     const message: StoredMessage = {
@@ -684,13 +728,17 @@ export class MessageStore {
       // read rebuilds it. Main deferred this to the next read, which on this
       // branch could extend past an uncounted edit (derive.test's surgeon).
       const added = currentWriteVersion(this.store, this.stateId) - 1 - this.allCache.writeCount; // minus this write's own bump
-      // Only counted sibling writes can explain the revision's move; none counted means an uncounted writer.
-      const appended = added > 0 ? this.appendedSince(this.allCache.internals, added + 1) : null;
+      // Only counted sibling writes can explain the revision's move; none
+      // counted, or a gap a counted write saw since the cache was built
+      // (noteRevisionBeforeCountedWrite), means an uncounted writer.
+      const gapFree = this.allCache.gapCount === currentGapCount(this.store, this.stateId);
+      const appended = added > 0 && gapFree ? this.appendedSince(this.allCache.internals, added + 1) : null;
       if (appended) {
         for (const record of appended) this.allCache.internals.push(record);
         this.allCache.sequence = this.store.currentSequence();
         this.allCache.writeVersion = slotRevision(this.store, this.stateId);
         this.allCache.writeCount = currentWriteVersion(this.store, this.stateId);
+        this.allCache.gapCount = currentGapCount(this.store, this.stateId);
         cacheDiag(`append write-through extended (cache wasn't current before the append) stateId=${this.stateId} — ${appended.length} appended record(s), this one included, read by point lookup`, this.log);
       } else {
         cacheDiag(`append write-through dropped (cache wasn't current before the append) stateId=${this.stateId} — the writes since don't explain the slot; the next read rebuilds`, this.log);
@@ -757,9 +805,11 @@ export class MessageStore {
     };
 
     const cacheWasCurrent = this.cacheIsCurrent();
+    noteRevisionBeforeCountedWrite(this.store, this.stateId);
     bumpWriteVersion(this.store, this.stateId, this.log);
     bumpEditVersion(this.store, this.stateId);
     this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
+    recordRevisionAfterCountedWrite(this.store, this.stateId);
     this.indexWriteVersion = slotRevision(this.store, this.stateId);
 
     // Write-through the materialized cache (see append — the cached entry
@@ -814,9 +864,11 @@ export class MessageStore {
     }
 
     const cacheWasCurrent = this.cacheIsCurrent();
+    noteRevisionBeforeCountedWrite(this.store, this.stateId);
     bumpWriteVersion(this.store, this.stateId, this.log);
     bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, index, index + 1);
+    recordRevisionAfterCountedWrite(this.store, this.stateId);
     // Write-through the materialized cache (see append); fall back to
     // invalidation if the cache wasn't current.
     if (
@@ -851,9 +903,11 @@ export class MessageStore {
     if (!target?.bodyGroupId) {
       // Not sharded — defer to normal remove path (re-look up via getInternal
       // since the normal `remove` checks bodyGroupId).
+      noteRevisionBeforeCountedWrite(this.store, this.stateId);
       bumpWriteVersion(this.store, this.stateId, this.log);
       bumpEditVersion(this.store, this.stateId);
-    this.store.redactStateItems(this.stateId, index, index + 1);
+      this.store.redactStateItems(this.stateId, index, index + 1);
+      recordRevisionAfterCountedWrite(this.store, this.stateId);
       this.allCache = null; // rare path: plain invalidation
       this.rebuildIndex();
       this.emit({ type: 'remove', messageId });
@@ -866,9 +920,11 @@ export class MessageStore {
     const { from, to } = bodyBoundsIn(all, index);
     const firstId = all[from].id;
     const lastId = all[to].id;
+    noteRevisionBeforeCountedWrite(this.store, this.stateId);
     bumpWriteVersion(this.store, this.stateId, this.log);
     bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, from, to + 1);
+    recordRevisionAfterCountedWrite(this.store, this.stateId);
     this.allCache = null; // rare path: plain invalidation
     this.rebuildIndex();
     this.emit({ type: 'removeRange', fromId: firstId, toId: lastId });
@@ -909,9 +965,11 @@ export class MessageStore {
       );
     }
 
+    noteRevisionBeforeCountedWrite(this.store, this.stateId);
     bumpWriteVersion(this.store, this.stateId, this.log);
     bumpEditVersion(this.store, this.stateId);
     this.store.redactStateItems(this.stateId, fromIndex, toIndex + 1);
+    recordRevisionAfterCountedWrite(this.store, this.stateId);
     this.allCache = null; // rare path: plain invalidation
     this.rebuildIndex();
 
@@ -1998,11 +2056,17 @@ export class MessageStore {
     const writeCount = currentWriteVersion(this.store, this.stateId);
     if (this.allCache && this.allCache.branchId === branchId && this.allCache.writeVersion !== writeVersion) {
       const added = writeCount - this.allCache.writeCount;
-      const appended = added > 0 ? this.appendedSince(this.allCache.internals, added) : null;
+      // Two tells of an uncounted write: a counted write since the cache saw a
+      // gap (gapCount), or the slot's revision isn't the one the last counted
+      // write left (an uncounted write after it). Either way, rebuild.
+      const gapFree = this.allCache.gapCount === currentGapCount(this.store, this.stateId)
+        && revisionLeftByLastCountedWrite(this.store, this.stateId) === writeVersion;
+      const appended = added > 0 && gapFree ? this.appendedSince(this.allCache.internals, added) : null;
       if (appended) {
         for (const record of appended) this.allCache.internals.push(record);
         this.allCache.writeVersion = writeVersion;
         this.allCache.writeCount = writeCount;
+        this.allCache.gapCount = currentGapCount(this.store, this.stateId);
         this.allCache.sequence = sequence;
         return this.allCache.internals;
       }
@@ -2012,7 +2076,7 @@ export class MessageStore {
     const state = this.store.getStateJson(this.stateId);
     const internals =
       !state || !Array.isArray(state) ? [] : (state as StoredMessageInternal[]);
-    this.allCache = { branchId, sequence, internals, writeVersion, writeCount };
+    this.allCache = { branchId, sequence, internals, writeVersion, writeCount, gapCount: currentGapCount(this.store, this.stateId) };
     cacheDiag(`getAllInternal MISS (${missReason}) stateId=${this.stateId} rebuilt ${internals.length} in ${Date.now() - _t}ms`, this.log);
     return internals;
   }
