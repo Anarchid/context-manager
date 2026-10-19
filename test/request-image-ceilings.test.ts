@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
 import { AutobiographicalStrategy, ContextManager, WindowedPassthroughStrategy } from '../src/index.js';
 import type { ContextStrategy } from '../src/index.js';
+import { ceilingBoundLine } from '../src/live-image-limits.js';
 
 const MiB = 1024 * 1024;
 const PLACEHOLDER = '[image not shown: this context keeps only some images]';
@@ -256,6 +257,12 @@ describe('the image limits warning', () => {
           [{ maxRequestImages: 4 }, ['maxLiveImages 6 (default) is above maxRequestImages 4, so the live window keeps at most 4']],
           // An infinite limit is none, like 0, so nothing is said.
           [{ maxLiveImages: Infinity }, null],
+          // A malformed ceiling takes its default, which the later clause marks.
+          [{ maxLiveImages: 600, maxRequestImages: Number.NaN },
+            ["maxRequestImages NaN isn't 0 or a finite number above it, so the default 500 applies",
+              'maxLiveImages 600 is above maxRequestImages 500 (default)']],
+          // A byte budget given as null takes its default, and is marked so.
+          [{ maxLiveImageBytes: null, maxRequestImageBytes: 2 * MiB }, ['maxLiveImageBytes 20 MiB (default) is above maxRequestImageBytes 2 MiB']],
           [{ maxLiveImages: 8, maxRequestImages: 0 }, null],
           [{ maxLiveImageBytes: 30 * MiB, maxRequestImageBytes: 0 }, null],
         ] as const;
@@ -319,26 +326,57 @@ describe("the memory strategy's warning names a compression budget above the byt
   });
 });
 
-describe('the line when an image first falls past a request ceiling', () => {
-  /** Run `steps` (each adds images and compiles) on a fresh store, and return
-   *  the ceiling lines said and the last compile's image pattern. */
-  async function ceilingLines(
-    strategy: ContextStrategy,
-    steps: number[],
-  ): Promise<{ lines: string[]; last: string }> {
+describe("the memory strategy's warning names its default compression budget under a lowered byte ceiling", () => {
+  it('says it, marked as the default, with no clause for a window limit under the ceiling', async () => {
     const lines: string[] = [];
     const original = console.warn;
     console.warn = (...parts: unknown[]) => { lines.push(parts.map(String).join(' ')); };
     const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
+    try {
+      const manager = await ContextManager.open({
+        path: join(dir, 'store'), strategy: memory({ maxLiveImageBytes: 1 * MiB, maxRequestImageBytes: 2 * MiB }),
+      });
+      await manager.close();
+      const ours = lines.filter((line) => line.includes('is above'));
+      assert.equal(ours.length, 1, JSON.stringify(lines));
+      assert.ok(ours[0]!.includes('maxCompressionImageBytes 12 MiB (default) is above maxRequestImageBytes 2 MiB, so a compression prompt keeps at most 2 MiB'), ours[0]);
+      assert.ok(!ours[0]!.includes('maxLiveImageBytes'), ours[0]);
+    } finally {
+      console.warn = original;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('the line when an image first falls past a request ceiling', () => {
+  /** Run `steps` on a fresh store: each adds images (`add`, of `bytes` each,
+   *  4 when not given) and compiles. Returns the ceiling lines each step said,
+   *  in order (a new message can move the memory strategy's watermark, so a
+   *  step's adds count with its compile), the pattern each compile kept, and
+   *  the last pattern. Byte sizes are multiples of 4: the store keeps an
+   *  image's data as the bytes its base64 decodes to, so other lengths
+   *  come back changed. */
+  async function ceilingLines(
+    strategy: ContextStrategy,
+    steps: Array<number | { add: number; bytes: number }>,
+  ): Promise<{ lines: string[]; byStep: string[][]; patterns: string[]; last: string }> {
+    const said: string[] = [];
+    const original = console.warn;
+    console.warn = (...parts: unknown[]) => { said.push(parts.map(String).join(' ')); };
+    const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
     const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
     let n = 0;
-    let last = '';
+    const byStep: string[][] = [];
+    const patterns: string[] = [];
     try {
-      for (const add of steps) {
-        for (let i = 0; i < add; i++) manager.addMessage('user', imageMessage(`img-${++n}`));
-        last = pattern((await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 })).messages, n);
+      for (const step of steps) {
+        const { add, bytes } = typeof step === 'number' ? { add: step, bytes: 4 } : step;
+        const before = said.length;
+        for (let i = 0; i < add; i++) manager.addMessage('user', imageMessage(`img-${++n}`, bytes));
+        patterns.push(pattern((await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 })).messages, n));
+        byStep.push(said.slice(before).filter((line) => line.includes('an image fell past')));
       }
-      return { lines: lines.filter((line) => line.includes('the live window reached')), last };
+      return { lines: byStep.flat(), byStep, patterns, last: patterns[patterns.length - 1] ?? '' };
     } finally {
       console.warn = original;
       await manager.close();
@@ -357,21 +395,60 @@ describe('the line when an image first falls past a request ceiling', () => {
       ] as const;
       for (const [options, said] of cases) {
         // Three images, then two more: the ceiling strips at the first compile
-        // and again at the second, and it's said once.
-        const { lines } = await ceilingLines(make(options), [3, 2]);
-        assert.equal(lines.length, 1, `said once for ${JSON.stringify(options)}: ${JSON.stringify(lines)}`);
-        assert.ok(lines[0]!.includes(`the live window reached ${said}, so older images are now shown as placeholders`), lines[0]);
+        // and again at the second, and it's said once, at the first.
+        const strategy = make(options);
+        const { lines, byStep, patterns } = await ceilingLines(strategy, [3, 2]);
+        assert.deepEqual(patterns, ['.II', '...II'], `the ceiling of 2 strips at each compile for ${JSON.stringify(options)}`);
+        assert.deepEqual(byStep.map((step) => step.length), [1, 0], `said once, at the first step, for ${JSON.stringify(options)}`);
+        assert.ok(lines[0]!.startsWith(`[${strategy.name}] an image fell past ${said}, so images past it are now shown as placeholders`), lines[0]);
+        assert.match(lines[0]!, / ns=/, 'through the namespaced route the warning takes');
       }
     });
 
     it(`${name}: says nothing when the host's own limit strips, or nothing falls past the ceiling`, async () => {
-      for (const [options, steps] of [
-        [{ maxLiveImages: 2 }, [3, 2]],
-        [{ maxLiveImages: 2, maxRequestImages: 2 }, [3, 2]],
-        [{ maxLiveImages: 0, maxRequestImages: 2 }, [1, 1]],
+      for (const [options, steps, kept] of [
+        [{ maxLiveImages: 2 }, [3, 2], '...II'],
+        [{ maxLiveImages: 2, maxRequestImages: 2 }, [3, 2], '...II'],
+        [{ maxLiveImages: 0, maxRequestImages: 2 }, [1, 1], 'II'],
+        // The host's own byte limit strips, under the default byte ceiling.
+        [{ maxLiveImageBytes: 8 }, [3, 2], '...II'],
+        [{ maxLiveImageBytes: 8, maxRequestImageBytes: 8 }, [3, 2], '...II'],
       ] as const) {
-        const { lines } = await ceilingLines(make(options), [...steps]);
+        const { lines, last } = await ceilingLines(make(options), [...steps]);
+        assert.equal(last, kept, `the strip ran for ${JSON.stringify(options)}`);
         assert.deepEqual(lines, [], `nothing said for ${JSON.stringify(options)}`);
+      }
+    });
+
+    it(`${name}: says it once for each ceiling, when each first strips`, async () => {
+      // Four-byte images fill the count ceiling of 3 first, at 12 of the 16
+      // bytes; then a 16-byte image fills the byte ceiling, and the next one
+      // falls past it.
+      const strategy = make({ maxLiveImages: 0, maxLiveImageBytes: 0, maxRequestImages: 3, maxRequestImageBytes: 16 });
+      const { byStep } = await ceilingLines(strategy, [{ add: 4, bytes: 4 }, { add: 1, bytes: 16 }, { add: 1, bytes: 4 }]);
+      assert.equal(byStep[0]!.length, 1);
+      assert.ok(byStep[0]![0]!.includes('an image fell past maxRequestImages 3'), byStep[0]![0]);
+      assert.equal(byStep.flat().filter((line) => line.includes('maxRequestImageBytes')).length, 1, JSON.stringify(byStep));
+      assert.equal(byStep.flat().length, 2, JSON.stringify(byStep));
+    });
+
+    it(`${name}: says nothing from a preview, and leaves the line for the first compile that's sent`, async () => {
+      const strategy = make({ maxLiveImages: 0, maxRequestImages: 2 });
+      const said: string[] = [];
+      const original = console.warn;
+      console.warn = (...parts: unknown[]) => { said.push(parts.map(String).join(' ')); };
+      const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
+      const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
+      try {
+        for (let i = 1; i <= 3; i++) manager.addMessage('user', imageMessage(`img-${i}`));
+        await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 }, undefined, { dryRun: true });
+        assert.deepEqual(said.filter((line) => line.includes('an image fell past')), [], 'a dry compile says nothing');
+        await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+        assert.equal(said.filter((line) => line.includes('an image fell past')).length, 1, 'the sent compile says it');
+      } finally {
+        console.warn = original;
+        await manager.close();
+        rmSync(dir, { recursive: true, force: true });
       }
     });
   }
@@ -383,7 +460,108 @@ describe('the line when an image first falls past a request ceiling', () => {
     );
     assert.equal(last, '...II', 'one trim to half the ceiling');
     assert.equal(lines.length, 1, JSON.stringify(lines));
-    assert.ok(lines[0]!.includes('the live window reached maxRequestImages 4, which holds maxLiveImages 0 (no limit) to it'), lines[0]);
+    assert.ok(lines[0]!.includes('an image fell past maxRequestImages 4, which holds maxLiveImages 0 (no limit) to it'), lines[0]);
+  });
+
+  it('the memory strategy says it from its adaptive selection too, and nothing from a preview', async () => {
+    const adaptive = memory({
+      hierarchical: false, adaptiveResolution: true, compressionModel: 'mock', targetChunkTokens: 100,
+      autoTickOnNewMessage: false, maxLiveImages: 0, maxRequestImages: 2,
+    });
+    const said: string[] = [];
+    const original = console.warn;
+    console.warn = (...parts: unknown[]) => { said.push(parts.map(String).join(' ')); };
+    const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy: adaptive });
+    const ours = () => said.filter((line) => line.includes('an image fell past'));
+    try {
+      for (let i = 1; i <= 3; i++) manager.addMessage('user', imageMessage(`img-${i}`));
+      const entries = manager.previewContext({ maxTokens: 1_000_000, reserveForResponse: 0 }, { maxRequestImages: 1 }, { render: true })?.entries ?? [];
+      assert.ok(entries.length > 0, 'the preview rendered its entries');
+      assert.deepEqual(ours(), [], 'a preview, with its own ceiling, says nothing');
+      const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+      assert.equal(pattern(compiled.messages, 3), '.II');
+      assert.equal(ours().length, 1, JSON.stringify(said));
+      assert.ok(ours()[0]!.includes('an image fell past maxRequestImages 2, which holds maxLiveImages 0 (no limit) to it'), ours()[0]);
+    } finally {
+      console.warn = original;
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("the memory strategy's strip says the line only for a render that's sent, not a layout rendered to compare against", async () => {
+    const strategy = memory({ maxLiveImages: 0, maxRequestImages: 1 });
+    const said: string[] = [];
+    const original = console.warn;
+    console.warn = (...parts: unknown[]) => { said.push(parts.map(String).join(' ')); };
+    const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
+    const ours = () => said.filter((line) => line.includes('an image fell past'));
+    try {
+      for (let i = 1; i <= 2; i++) manager.addMessage('user', imageMessage(`img-${i}`));
+      const view = (manager as unknown as { messageStore: { createView(): unknown } }).messageStore.createView() as {
+        getAll(): Array<{ id: string; participant: string; content: ContentBlock[] }>;
+      };
+      const entries = () => view.getAll().map((m, index) => ({
+        index, sourceMessageId: m.id, sourceRelation: 'copy', participant: m.participant, content: m.content,
+      }));
+      const strip = strategy as unknown as {
+        applyImageStripping(entries: unknown[], store: unknown, opts?: { sent?: boolean }): void;
+      };
+      const kept = entries();
+      strip.applyImageStripping(kept, view);
+      assert.equal(kept.filter((e) => e.content.some((b) => b.type === 'image')).length, 1, 'the strip ran: the ceiling of 1 replaced one');
+      assert.deepEqual(ours(), [], 'a layout rendered to compare against says nothing');
+      strip.applyImageStripping(entries(), view, { sent: true });
+      assert.equal(ours().length, 1, JSON.stringify(said));
+    } finally {
+      console.warn = original;
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("the memory strategy's watermark says nothing when the host's own limit binds", async () => {
+    const { lines, last } = await ceilingLines(memory({ maxLiveImages: 4, imageStripHysteresisRatio: 0.5 }), [5]);
+    assert.equal(last, '...II', 'one trim to half the host limit');
+    assert.deepEqual(lines, []);
+  });
+
+  it('marks only defaults in force: an explicit undefined maxLiveImages is no limit in the memory strategy, and 6 in windowed passthrough', async () => {
+    const auto = await ceilingLines(memory({ maxLiveImages: undefined, maxRequestImages: 2 }), [3]);
+    assert.equal(auto.lines.length, 1, JSON.stringify(auto.lines));
+    assert.ok(auto.lines[0]!.includes('which holds maxLiveImages 0 (no limit) to it,'), auto.lines[0]);
+    const win = await ceilingLines(windowed({ maxLiveImages: undefined, maxRequestImages: 2 }), [3]);
+    assert.equal(win.lines.length, 1, JSON.stringify(win.lines));
+    assert.ok(win.lines[0]!.includes('which holds maxLiveImages 6 (default) to it,'), win.lines[0]);
+  });
+
+  it("doesn't mark a value a subclass's enforced layer gives as a default", async () => {
+    class Enforced extends AutobiographicalStrategy {
+      protected override enforcedConfigLayer() {
+        return { source: 'enforced', values: { maxRequestImages: 2 } };
+      }
+    }
+    const { lines } = await ceilingLines(
+      new Enforced({ headWindowTokens: 0, recentWindowTokens: 1_000_000, hierarchical: true, imageStripDepthTokens: 0, maxLiveImages: 0 } as ConstructorParameters<typeof AutobiographicalStrategy>[0]),
+      [3],
+    );
+    assert.equal(lines.length, 1, JSON.stringify(lines));
+    assert.ok(lines[0]!.includes('an image fell past maxRequestImages 2, which holds'), lines[0]);
+  });
+
+  it('ceilingBoundLine marks a default or malformed ceiling, and gives bytes in MiB', () => {
+    const configured = (o: Record<string, number>) =>
+      ({ maxLiveImages: 0, maxLiveImageBytes: 0, maxRequestImages: 500, maxRequestImageBytes: 24 * MiB, ...o });
+    assert.equal(ceilingBoundLine('s', 'images', configured({}), new Set(['maxRequestImages'])),
+      '[s] an image fell past maxRequestImages 500 (default), which holds maxLiveImages 0 (no limit) to it, so images past it are now shown as placeholders');
+    assert.equal(ceilingBoundLine('s', 'images', configured({ maxRequestImages: Number.NaN, maxLiveImages: 800 }), new Set()),
+      '[s] an image fell past maxRequestImages 500 (default), which holds maxLiveImages 800 to it, so images past it are now shown as placeholders');
+    assert.equal(ceilingBoundLine('s', 'bytes', configured({ maxLiveImageBytes: 30 * MiB }), new Set()),
+      '[s] an image fell past maxRequestImageBytes 24 MiB, which holds maxLiveImageBytes 30 MiB to it, so images past it are now shown as placeholders');
+    assert.equal(ceilingBoundLine('s', 'bytes', configured({ maxLiveImageBytes: 30 * MiB + 1 }), new Set(['maxRequestImageBytes'])),
+      `[s] an image fell past maxRequestImageBytes 24 MiB (default), which holds maxLiveImageBytes ${30 * MiB + 1} bytes to it, so images past it are now shown as placeholders`);
   });
 
   it('the memory strategy says it when its hysteresis watermark trims against the byte ceiling', async () => {
@@ -393,7 +571,7 @@ describe('the line when an image first falls past a request ceiling', () => {
     );
     assert.equal(last, '...II', 'one trim to half the ceiling');
     assert.equal(lines.length, 1, JSON.stringify(lines));
-    assert.ok(lines[0]!.includes('the live window reached maxRequestImageBytes 16 bytes, which holds maxLiveImageBytes 0 (no limit) to it'), lines[0]);
+    assert.ok(lines[0]!.includes('an image fell past maxRequestImageBytes 16 bytes, which holds maxLiveImageBytes 0 (no limit) to it'), lines[0]);
   });
 });
 
@@ -424,16 +602,19 @@ describe('compression prompts within the request ceilings', () => {
   it('keep their byte budget within maxRequestImageBytes, and the images kept are what it lets through', () => {
     const prepared = new Prepared({ maxCompressionImageBytes: 3 * MiB, maxRequestImageBytes: 2 * MiB }).prepare(request([]));
     assert.equal(prepared.imageBudgetBytes, 2 * MiB);
-    for (const none of [0, Infinity]) {
+    for (const none of [0, Infinity, -3, Number.NaN]) {
       assert.equal(new Prepared({ maxCompressionImageBytes: none, maxRequestImageBytes: 8 }).prepare(request([])).imageBudgetBytes, 8,
         `a budget of ${none} is none, so up to the byte ceiling`);
     }
+    assert.equal(new Prepared({ maxCompressionImageBytes: 8.5, maxRequestImageBytes: 100 }).prepare(request([])).imageBudgetBytes, 8,
+      'a fractional budget is floored');
     const walked = new Prepared({ maxCompressionImageBytes: 12, maxRequestImageBytes: 8 }).prepare(
       request([imageBlock('AAAA')], [imageBlock('BBBB')], [imageBlock('CCCC')]),
     );
     assert.equal(walked.imageBudgetBytes, 8);
     assert.equal(walked.imageReplacements, 1, 'under the clamped 8 bytes, two 4-byte images fit and the oldest does not');
     assert.equal(walked.imageBytesKept, 8);
+    assert.deepEqual(walked.request.messages.map((m) => m.content[0]!.type), ['text', 'image', 'image'], 'the oldest is the one replaced');
     assert.equal(new Prepared({ maxCompressionImageBytes: 0, maxRequestImageBytes: 2 * MiB }).prepare(request([])).imageBudgetBytes,
       2 * MiB, 'an unlimited budget means up to the ceiling');
     assert.equal(new Prepared().prepare(request([])).imageBudgetBytes, 12 * MiB, 'the default budget is under the default ceiling');
@@ -455,6 +636,7 @@ describe('compression prompts within the request ceilings', () => {
     const prepared = strategy.prepare(input);
     assert.equal(prepared.imageCountCap, 0);
     assert.equal(prepared.imageReplacements, 1, 'two 4-byte images fit the 8-byte budget, the oldest does not');
+    assert.deepEqual(prepared.request.messages.map((m) => m.content[0]!.type), ['text', 'image', 'image']);
     const logs = captureErrors(() => strategy.send(input, 'no-count'));
     assert.equal(logs.length, 1);
     assert.ok(!logs[0]!.includes('request ceiling'), logs[0]);
@@ -467,5 +649,6 @@ describe('compression prompts within the request ceilings', () => {
       request(...images),
     );
     assert.equal(prepared.imageReplacements, 0);
+    assert.equal(prepared.request.messages.filter((m) => m.content[0]!.type === 'image').length, 501, 'all 501 are still images');
   });
 });

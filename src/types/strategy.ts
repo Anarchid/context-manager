@@ -1173,12 +1173,13 @@ export interface AutobiographicalConfig {
    * refuses, before sending it, a request whose serialized messages exceed
    * its byte cap, 28 MiB unless `MEMBRANE_MAX_REQUEST_BYTES` says otherwise.
    * Default 24 MiB, which leaves 4 MiB of that cap for everything else the
-   * messages carry: their text, their JSON, and any documents or other media,
-   * which nothing here counts. It doesn't follow `MEMBRANE_MAX_REQUEST_BYTES`,
-   * so a host that changes membrane's cap sets this to match. 0 = no ceiling.
-   * A value that isn't 0 or a finite number above it takes the default, and
-   * the strategy says once when an image first falls past it, as for
-   * `maxRequestImages`.
+   * messages carry: their text, their JSON, any documents or other media, and
+   * in the window any images it doesn't count, none of which this counts. It
+   * doesn't follow `MEMBRANE_MAX_REQUEST_BYTES`, so a host that changes
+   * membrane's cap sets this to match. 0 = no ceiling.
+   * A value that isn't 0 or a finite number above it takes the default. Under
+   * a window limit of 0 or above this ceiling, the strategy says once when an
+   * image first falls past it, as for `maxRequestImages`.
    */
   maxRequestImageBytes?: number;
 

@@ -12839,7 +12839,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.postProcessToolEntries(merged);
     // Strip stale images BEFORE placing markers and committing stats, so both
     // describe the post-strip context the agent actually receives.
-    this.applyImageStripping(merged, store);
+    this.applyImageStripping(merged, store, { sent: true });
 
     // The newest stored message is the triggering turn for this compile. A
     // structural repair may rewrite tool blocks, but it must never erase that
@@ -15245,7 +15245,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.postProcessToolEntries(entries);
     // Strip stale images before committing stats so RenderStats.total reflects
     // the post-strip context (this path places no cache markers).
-    this.applyImageStripping(entries, store);
+    this.applyImageStripping(entries, store, { sent: true });
     this.rsEnd();
     return entries;
   }
@@ -16043,8 +16043,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  so the committed render stats (and the cache breakpoints) describe the
    *  post-strip context. As it strips, it decrements the matching raw bucket of
    *  the in-progress render stats by the reclaimed tokens, keeping
-   *  `RenderStats.total` equal to the real rendered size. */
-  protected applyImageStripping(entries: ContextEntry[], store: MessageStoreView): void {
+   *  `RenderStats.total` equal to the real rendered size.
+   *
+   *  `opts.sent`: the render is a selection's own, so a ceiling it strips
+   *  against says its line (reportCeilingBoundOnce). A layout rendered only to
+   *  compare against, such as kv-unified's kept one, leaves it unset. */
+  protected applyImageStripping(entries: ContextEntry[], store: MessageStoreView, opts: { sent?: boolean } = {}): void {
     // Count and bytes within the request ceilings; 0 = unlimited.
     const { images: maxLive, bytes: maxLiveBytes } = this.liveImageLimits().target;
     const depthTokens = this.config.imageStripDepthTokens ?? 0; // 0 = no depth strip
@@ -16090,8 +16094,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const blockBytes = AutobiographicalStrategy.imageBlockBytes(block);
         const overCount = maxLive > 0 && keptImages >= maxLive;
         const overBytes = maxLiveBytes > 0 && keptImageBytes + blockBytes > maxLiveBytes;
-        if (overCount && ceilingSet.images) this.reportCeilingBoundOnce('images');
-        if (overBytes && ceilingSet.bytes) this.reportCeilingBoundOnce('bytes');
+        // Only the selections' own renders say the ceiling line (`sent`), not
+        // a layout rendered to compare against, such as kv-unified's kept one.
+        if (opts.sent && overCount && ceilingSet.images) this.reportCeilingBoundOnce('images');
+        if (opts.sent && overBytes && ceilingSet.bytes) this.reportCeilingBoundOnce('bytes');
         if (belowMark || tooDeep || overCount || overBytes) {
           // Stats-neutral (2026-07-12): every budgeting site now tallies at
           // POST-STRIP prices (see postStripEstimates), so the bucket never
@@ -16299,17 +16305,28 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private readonly ceilingBoundReported = { images: false, bytes: false };
 
   /** Say once that a request ceiling, rather than a limit the host set, has
-   *  stripped an image from the live window (see ceilingSetLimits). */
+   *  stripped an image from the live window (see ceilingSetLimits). A dry
+   *  select, a preview or an observer's reconstruction says nothing and
+   *  leaves the line for the first render that's sent. */
   private reportCeilingBoundOnce(kind: 'images' | 'bytes'): void {
+    if (this._dryRunSelect) return;
     if (this.ceilingBoundReported[kind]) return;
     this.ceilingBoundReported[kind] = true;
     this.diag.warn(ceilingBoundLine(this.name, kind, this.configuredImageLimits(), this.imageLimitsDefaulted()));
   }
 
-  /** The image limits the host didn't give, whose values are defaults. */
+  /** The image limits whose values are defaults: those the library's default
+   *  layer gave or no layer gave, and those the host gave as undefined or
+   *  null where configuredImageLimits then applies a default. For
+   *  maxLiveImages it applies none: an explicit undefined erases the default
+   *  6 and reads as no limit, which is the host's doing. */
   private imageLimitsDefaulted(): ReadonlySet<string> {
     const keys = ['maxLiveImages', 'maxLiveImageBytes', 'maxRequestImages', 'maxRequestImageBytes', 'maxCompressionImageBytes'] as const;
-    return new Set(keys.filter((key) => this.configProvenance[key] !== 'caller' || this.config[key] == null));
+    return new Set(keys.filter((key) => {
+      const source = this.configProvenance[key];
+      if (source === undefined || source === 'library-default') return true;
+      return key !== 'maxLiveImages' && this.config[key] == null;
+    }));
   }
 
   /** The live-image limits as configured, with the defaults where unset. */

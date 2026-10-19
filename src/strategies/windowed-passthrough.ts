@@ -205,6 +205,14 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     return resolveLiveImageLimits(this.configuredImageLimits);
   }
 
+  /** Say once that a request ceiling, rather than a limit the options set, has
+   *  stripped an image from the live window (see ceilingSetLimits). */
+  private reportCeilingBoundOnce(kind: 'images' | 'bytes'): void {
+    if (this.ceilingBoundReported[kind]) return;
+    this.ceilingBoundReported[kind] = true;
+    this.diag.warn(ceilingBoundLine(this.name, kind, this.configuredImageLimits, this.imageLimitsDefaulted));
+  }
+
   async initialize(ctx: StrategyContext): Promise<void> {
     this.store = ctx.store;
     this.ns = ctx.namespace;
@@ -413,7 +421,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       });
     }
 
-    this.applyImageStripping(entries, messages, store);
+    this.applyImageStripping(entries, messages, store, !opts?.dryRun);
     if (!opts?.dryRun) this.placeCacheMarkers(entries);
     return entries;
   }
@@ -433,6 +441,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     entries: ContextEntry[],
     messages: StoredMessage[],
     store: MessageStoreView,
+    // Whether this render is sent: a preview's (dryRun) says no ceiling line.
+    sent: boolean,
   ): void {
     // Count and bytes within the request ceilings; 0 = unlimited.
     const { images: maxLive, bytes: maxLiveBytes } = this.liveImageLimits().target;
@@ -463,8 +473,8 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         const bytes = imageBlockBytes(block);
         const overCount = maxLive > 0 && keptImages >= maxLive;
         const overBytes = maxLiveBytes > 0 && keptImageBytes + bytes > maxLiveBytes;
-        if (overCount && ceilingSet.images) this.reportCeilingBoundOnce('images');
-        if (overBytes && ceilingSet.bytes) this.reportCeilingBoundOnce('bytes');
+        if (sent && overCount && ceilingSet.images) this.reportCeilingBoundOnce('images');
+        if (sent && overBytes && ceilingSet.bytes) this.reportCeilingBoundOnce('bytes');
         if (tooDeep || overCount || overBytes) {
           return { type: 'text', text: IMAGE_PLACEHOLDER } as ContentBlock;
         }
@@ -473,14 +483,6 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         return block;
       });
     }
-  }
-
-  /** Say once that a request ceiling, rather than a limit the options set, has
-   *  stripped an image from the live window (see ceilingSetLimits). */
-  private reportCeilingBoundOnce(kind: 'images' | 'bytes'): void {
-    if (this.ceilingBoundReported[kind]) return;
-    this.ceilingBoundReported[kind] = true;
-    this.diag.warn(ceilingBoundLine(this.name, kind, this.configuredImageLimits, this.imageLimitsDefaulted));
   }
 
   // --------------------------------------------------------------------------

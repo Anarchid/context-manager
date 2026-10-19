@@ -102,6 +102,21 @@ function showBytes(n: number): string {
 }
 
 /**
+ * The " (default)" a line puts after a setting whose value is a default: one
+ * the host didn't give (`defaulted`), or a ceiling it gave malformed, which
+ * takes its default (see asCeiling).
+ */
+function defaultMark(
+  name: string,
+  configured: ConfiguredImageLimits,
+  defaulted: ReadonlySet<string>,
+): string {
+  const malformedCeiling = (name === 'maxRequestImages' || name === 'maxRequestImageBytes') &&
+    !wellFormedCeiling(configured[name]);
+  return defaulted.has(name) || malformedCeiling ? ' (default)' : '';
+}
+
+/**
  * Which of the window's limits a request ceiling sets: a limit the host gave
  * as none (0, or anything that isn't a positive finite number) or above its
  * ceiling, where that ceiling is itself a limit. The window then keeps the
@@ -118,10 +133,12 @@ export function ceilingSetLimits(configured: ConfiguredImageLimits): { images: b
 
 /**
  * The line a strategy says once for each ceiling, the first time an image
- * meets the live window full to a ceiling that sets its limit (see
- * ceilingSetLimits): which ceiling, at what value, and the window limit of 0
- * or above it that the ceiling held, so an operator who set no limit sees
- * where one now applies.
+ * falls past a ceiling that sets the window's limit (see ceilingSetLimits):
+ * which ceiling, at what value, and the window limit of 0 or above it that
+ * the ceiling held, so an operator who set no limit sees where one now
+ * applies. An image falls past the count ceiling when the window already
+ * keeps the ceiling's worth, and past the byte ceiling when it doesn't fit
+ * with what's kept, a single image bigger than the ceiling included.
  */
 export function ceilingBoundLine(
   strategy: string,
@@ -134,9 +151,9 @@ export function ceilingBoundLine(
     ? ['maxRequestImages', 'maxLiveImages', configured.maxLiveImages, String] as const
     : ['maxRequestImageBytes', 'maxLiveImageBytes', configured.maxLiveImageBytes, showBytes] as const;
   const limit = asLimit(value) === 0 ? `${value} (no limit)` : show(asLimit(value));
-  const mark = (name: string) => (defaulted.has(name) ? ' (default)' : '');
-  return `[${strategy}] the live window reached ${ceilingName} ${show(ceiling[kind])}${mark(ceilingName)}, ` +
-    `which holds ${limitName} ${limit}${mark(limitName)} to it, so older images are now shown as placeholders`;
+  const mark = (name: string) => defaultMark(name, configured, defaulted);
+  return `[${strategy}] an image fell past ${ceilingName} ${show(ceiling[kind])}${mark(ceilingName)}, ` +
+    `which holds ${limitName} ${limit}${mark(limitName)} to it, so images past it are now shown as placeholders`;
 }
 
 /**
@@ -158,7 +175,7 @@ export function liveImageLimitsWarning(
   const ceiling = resolveLiveImageLimits(configured).ceiling;
   const count = (n: number) => String(n);
   const bytes = showBytes;
-  const setting = (name: string, shown: string) => `${name} ${shown}${defaulted.has(name) ? ' (default)' : ''}`;
+  const setting = (name: string, shown: string) => `${name} ${shown}${defaultMark(name, configured, defaulted)}`;
   if (!wellFormedCeiling(configured.maxRequestImages)) {
     said.push(`maxRequestImages ${configured.maxRequestImages} isn't 0 or a finite number above it, so the default ${count(ceiling.images)} applies`);
   }
