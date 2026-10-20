@@ -280,6 +280,39 @@ test('carried growth: a boundary-cut fold at the raw tail settles on unchanged i
 });
 
 /**
+ * Past the trust region, a release's cut goes through step 5 as any ideal
+ * does (review I3). A 36-leaf chain carried at a tight budget and raised: the
+ * seeded plan would pay the whole from-scratch re-read, so seeding is
+ * released. With a trust region of 100 tokens, no changed suffix of the
+ * from-scratch cut fits, and holding the deep carried profile is certifiably
+ * worse, so the quality-gap override adopts the whole cut.
+ */
+test('seeded ideal: past a small trust region, the quality-gap override adopts a release\'s cut whole', () => {
+  const ch = buildChronicleWithChain({ chunkCount: 36, tokensPerChunk: 50, mergeThreshold: 6, recallPairTokens: 100 });
+  const tail = new Set(ch.chunks.slice(-6).map((c) => c.id));
+  const inputs: PickerInputs = {
+    chunks: ch.chunks, summaries: ch.summaries, recallPairTokens: ch.recallPairTokens,
+    headTokens: 0, tailTokens: 300, headChunkIds: new Set(), tailChunkIds: tail,
+  };
+  const tree = new SummaryTree(inputs);
+  let now = 0; for (const c of inputs.chunks) if (c.sequence > now) now = c.sequence;
+  const solve = (previous: ReadonlyMap<ChunkId, number>, target: number, W: number, extra: { seedFromCarried?: boolean; reachTokens?: number } = {}) =>
+    planControlledFrontier(inputs, tree, {
+      previous, foldAtTokens: W, expandAtTokens: target, targetTokens: target, windowTokens: W,
+      rawZone: tail, now, mergeThreshold: 6, ...extra,
+    });
+  const levels = (F: ReadonlyMap<ChunkId, number>) => ch.chunks.map((c) => F.get(c.id) ?? 0).join('');
+  const tight = solve(new Map(), 400, 450);
+  // The whole from-scratch cut: no seeding, and a trust region it fits in.
+  const scratch = solve(tight.resolutions, 1700, 2000, { seedFromCarried: false, reachTokens: 1_000_000 });
+  const raised = solve(tight.resolutions, 1700, 2000, { reachTokens: 100 });
+  assert.equal(raised.seedingReleased, true, 'premise: the raise releases seeding');
+  assert.ok(raised.perturbation > 100, `premise: the cut re-reads past the trust region (${raised.perturbation})`);
+  assert.equal(raised.override, 'quality-gap');
+  assert.equal(levels(raised.resolutions), levels(scratch.resolutions), 'the whole from-scratch cut, chunk by chunk');
+});
+
+/**
  * R2-3: the hysteresis is released when it buys nothing. A chain carried at a
  * tight budget and then given a much larger one: the seeded plan would keep
  * the deep allocation while paying ~95% of the from-scratch rewrite anyway,
