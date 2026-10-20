@@ -464,15 +464,47 @@ function relevanceCut(
     // (#156 review, Greptile P1). Cost: each node/level is accepted at most
     // once, so passes are bounded by accepts + 1 and the memo keeps each
     // rejected group to one attempt per pass.
+    // Phase C only lowers levels (an accept lowers its group, a revert puts
+    // back levels of at least 1), so a chunk that is raw or protected stays
+    // out of reach for the rest of the phase. The walk follows a list of the
+    // chunks still at a level of at least 1 and unprotected, youngest first,
+    // and an accept unlinks each member it takes raw. Restarting at the
+    // youngest position and skipping raw chunks one by one rescanned every
+    // group earlier accepts had taken raw, quadratic in the groups a large
+    // raise un-folds (#156 R4-1). Skipping only the raw run at the young end
+    // still rescanned them behind a youngest group that stays declined.
+    const n = ordered.length;
+    const olderListed = new Int32Array(n); // the next older listed position, or -1
+    const youngerListed = new Int32Array(n); // the next younger listed position, or n
+    let youngestListed = -1;
+    for (let i = 0; i < n; i++) {
+      const id = ordered[i].id;
+      if ((F.get(id) ?? 0) < 1 || rawZone.has(id) || immovable.has(id)) continue;
+      olderListed[i] = youngestListed;
+      if (youngestListed >= 0) youngerListed[youngestListed] = i;
+      youngestListed = i;
+    }
+    if (youngestListed >= 0) youngerListed[youngestListed] = n;
+    const positionOf = new Map(ordered.map((c, i) => [c.id, i] as const));
+    const unlist = (i: number): void => {
+      const older = olderListed[i];
+      const younger = youngerListed[i];
+      if (older >= 0) youngerListed[older] = younger;
+      if (younger < n) olderListed[younger] = older;
+      else youngestListed = older;
+    };
+    const _tc = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
+    let passes = 0;
+    let visits = 0;
     let progressed = true;
     while (progressed && ledger.tokens < target) {
       progressed = false;
-      for (let oi = ordered.length - 1; oi >= 0; oi--) {
+      passes++;
+      for (let oi = youngestListed; oi >= 0; oi = olderListed[oi]) {
         if (ledger.tokens >= target) break;
-        const c = ordered[oi]; // youngest-first
+        visits++;
+        const c = ordered[oi]; // youngest-first, among the listed chunks
         const level = F.get(c.id) ?? 0;
-        if (level < 1) continue;
-        if (rawZone.has(c.id) || immovable.has(c.id)) continue;
         const node = tree.ancestorAt(c.id, level);
         if (!node) continue;
         const attemptKey = `${node.id}:${level}`;
@@ -560,11 +592,17 @@ function relevanceCut(
           // verdict differently — exactly when the naive loop would have
           // re-attempted them.
           attempted.clear();
+          for (const [leafId, , to] of moved) {
+            if (to > 0) continue;
+            const i = positionOf.get(leafId);
+            if (i !== undefined) unlist(i);
+          }
           progressed = true;
           break; // restart from the youngest position
         }
       }
     }
+    if (_tc) log.error(`[kv-timing] phase-c ${Date.now() - _tc}ms passes=${passes} visits=${visits}`);
   }
 
   const _tp = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;

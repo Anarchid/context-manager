@@ -307,3 +307,63 @@ test('seeded ideal: a large budget raise takes the from-scratch allocation; a mo
   assert.notEqual(small.seedingReleased, true, 'hysteresis kept on a modest raise');
   assert.deepEqual(atLevel(small.resolutions, 3), atLevel(tight.resolutions, 3), 'the same L3 leaves');
 });
+
+/**
+ * R4-1: phase C walks only the chunks that can still un-fold. A store carried
+ * at L1 and given a budget near raw un-folds its groups youngest first, one
+ * per pass. Restarting each pass at the youngest position walked every group
+ * already taken raw again, so the walk grew with the square of the groups
+ * un-folded: 139,535 visits here. Skipping only the raw run at the young end
+ * fixed that case, but a youngest group that stays declined (its un-fold
+ * would pass W) pinned the start, and the walk behind it grew the same way.
+ * Counted rather than timed, so a loaded runner can't flake it: under
+ * KV_TIMING the planner logs each phase C's passes and visits.
+ */
+function phaseCRuns(bigYoungGroup: boolean) {
+  const ch = buildChronicleWithChain({ chunkCount: 1296, tokensPerChunk: 50, mergeThreshold: 6, recallPairTokens: 100 });
+  // The youngest group before the raw tail: 10,000 tokens a chunk, so its
+  // un-fold from L1 would pass W and is declined on every pass.
+  if (bigYoungGroup) for (const c of ch.chunks.slice(-12, -6)) c.rawTokens = 10_000;
+  const tail = new Set(ch.chunks.slice(-6).map((c) => c.id));
+  const inputs: PickerInputs = {
+    chunks: ch.chunks, summaries: ch.summaries, recallPairTokens: ch.recallPairTokens,
+    headTokens: 0, tailTokens: 300, headChunkIds: new Set(), tailChunkIds: tail,
+  };
+  const tree = new SummaryTree(inputs);
+  let now = 0; for (const c of inputs.chunks) if (c.sequence > now) now = c.sequence;
+  const previous = new Map(ch.chunks.filter((c) => !tail.has(c.id)).map((c) => [c.id, 1] as const));
+  const lines: string[] = [];
+  const diagnostics = { error: (m: string) => { lines.push(m); }, warn: (m: string) => { lines.push(m); } };
+  const timing = process.env.KV_TIMING;
+  process.env.KV_TIMING = '1';
+  let plan;
+  try {
+    // Every other chunk raw is 64,500 tokens, with the big group at L1 64,600:
+    // the target, under W.
+    const target = bigYoungGroup ? 64_600 : 64_800;
+    plan = planControlledFrontier(inputs, tree, {
+      previous, foldAtTokens: 70_000, expandAtTokens: target, targetTokens: target, windowTokens: 70_000,
+      rawZone: tail, now, mergeThreshold: 6, diagnostics,
+    });
+  } finally {
+    if (timing === undefined) delete process.env.KV_TIMING; else process.env.KV_TIMING = timing;
+  }
+  const runs = lines.flatMap((l) => {
+    const m = /\[kv-timing\] phase-c \d+ms passes=(\d+) visits=(\d+)/.exec(l);
+    return m ? [{ passes: Number(m[1]), visits: Number(m[2]) }] : [];
+  });
+  return { runs, chunks: ch.chunks.length, plan, young: ch.chunks.slice(-12, -6).map((c) => c.id) };
+}
+
+test('phase C: a large raise walks each chunk a bounded number of times, not once per un-fold (R4-1)', () => {
+  const { runs, chunks } = phaseCRuns(false);
+  assert.ok(runs.some((r) => r.passes >= 200), `premise: phase C un-folded about 215 groups, one per pass (${JSON.stringify(runs)})`);
+  for (const r of runs) assert.ok(r.visits <= 3 * chunks, `phase C visited ${r.visits} chunks over ${r.passes} passes`);
+});
+
+test('phase C: a youngest group that stays declined doesn\'t make the walk rescan the groups behind it (R4-1)', () => {
+  const { runs, chunks, plan, young } = phaseCRuns(true);
+  assert.ok(runs.some((r) => r.passes >= 200), `premise: phase C un-folded about 214 groups, one per pass (${JSON.stringify(runs)})`);
+  assert.ok(young.every((id) => plan.resolutions.get(id) === 1), 'premise: the big youngest group stays at L1');
+  for (const r of runs) assert.ok(r.visits <= 3 * chunks, `phase C visited ${r.visits} chunks over ${r.passes} passes`);
+});
