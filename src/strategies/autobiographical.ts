@@ -2703,8 +2703,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._imageWatermark = undefined;
     this._imageWatermarkLoaded = false;
     // A ceiling's move of the watermark belongs to the branch it moved on.
-    this._ceilingMovedWatermark.images = false;
-    this._ceilingMovedWatermark.bytes = false;
+    this._ceilingWatermarkRanges = [];
     this._lastKvStable = null;
     this._storeOrder = new Map();
     this._storeOrderSource = [];
@@ -16627,6 +16626,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const entry = entries[idx];
       const tooDeep = depthTokens > 0 && (pos < 0 || pos < stripStart);
       const belowMark = pos >= 0 && this.belowImageWatermark(messages[pos]!.sequence);
+      // Below the watermark only because a ceiling moved it there, and not
+      // past the depth limit, which strips it anyway: the ceiling decided.
+      if (belowMark && !tooDeep) {
+        const sequence = messages[pos]!.sequence;
+        for (const range of this._ceilingWatermarkRanges) {
+          if (sequence <= range.after || sequence > range.through) continue;
+          if (range.images) hits.images = true;
+          if (range.bytes) hits.bytes = true;
+        }
+      }
       const bucket = bucketAt(pos);
       entry.content = entry.content.map((block) => {
         if (block.type !== 'image') return block;
@@ -16721,34 +16730,37 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
     // Where the watermark lands for given limits: past the first misfit, at
     // the first one of the trim to ratio × each limit, or undefined if no
-    // limit binds. `passed` collects the limits the two walks' misfits pass.
-    const passed = { images: false, bytes: false };
-    const landing = (countCap: number, bytesCap: number, note: boolean): number | undefined => {
+    // limit binds. Both walks stop at the watermark, and the trim's caps are
+    // each no larger than the first walk's, so a landing is always above it.
+    // `passed` is the limits the first misfit passes: what brought the move on.
+    let passed = { images: false, bytes: false };
+    const landing = (countCap: number, bytesCap: number): number | undefined => {
       if (firstMisfit(stripDepth, countCap, bytesCap) === undefined) return undefined;
-      if (note) { passed.images ||= misfitBy.images; passed.bytes ||= misfitBy.bytes; }
-      const at = firstMisfit(
+      passed = misfitBy;
+      return firstMisfit(
         stripDepth > 0 ? Math.floor(stripDepth * ratio) : 0,
         countCap > 0 ? Math.max(0, Math.floor(countCap * ratio)) || 1 : 0,
         bytesCap > 0 ? Math.floor(bytesCap * ratio) : 0,
       );
-      if (note) { passed.images ||= misfitBy.images; passed.bytes ||= misfitBy.bytes; }
-      return at;
     };
-    const next = landing(maxLive, maxLiveBytes, true);
-    if (next === undefined || (w !== undefined && next <= w)) return; // no limit binds, or no advance
-    // The ceilings decide this move when it lands newer, so strips more, than
-    // the limits the host has in force would land it: its depth limit, and a
-    // count or byte limit no ceiling sets (ceilingSetLimits). The move then
-    // strips every later render by it, so the next render a select returns
-    // reports each ceiling whose limit the walks passed (reportCeilingHits).
-    // A dry advance is undone, so it leaves nothing.
+    const next = landing(maxLive, maxLiveBytes);
+    if (next === undefined) return; // no limit binds
+    // `own` is where the limits the host has in force would land this move:
+    // its depth limit, and a count or byte limit no ceiling sets (per
+    // ceilingSetLimits). They strip every image at or before it anyway, so
+    // what earlier moves left for a ceiling stops there. When an image past a
+    // ceiling brought this move on, the images after `own` and through this
+    // landing are stripped only because of that ceiling, and the strips
+    // report it for such an image in the next render a select returns
+    // (reportCeilingHits). A dry advance is undone, so it leaves nothing.
     if (!this._dryRunSelect) {
+      const brought = passed;
       const set = ceilingSetLimits(this.configuredImageLimits());
-      const own = landing(set.images ? 0 : maxLive, set.bytes ? 0 : maxLiveBytes, false);
-      if (own === undefined || next > own) {
-        if (set.images && passed.images) this._ceilingMovedWatermark.images = true;
-        if (set.bytes && passed.bytes) this._ceilingMovedWatermark.bytes = true;
-      }
+      const own = landing(set.images ? 0 : maxLive, set.bytes ? 0 : maxLiveBytes);
+      if (own !== undefined) for (const range of this._ceilingWatermarkRanges) range.after = Math.max(range.after, own);
+      const images = set.images && brought.images;
+      const bytes = set.bytes && brought.bytes;
+      if (images || bytes) this._ceilingWatermarkRanges.push({ after: own ?? w ?? -Infinity, through: next, images, bytes });
     }
     this._imageWatermark = next;
     // Dry selections and observer reconstructions advance it locally only;
@@ -16882,27 +16894,33 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private readonly ceilingBoundReported = { images: false, bytes: false };
   /** The ceilings that decided an image in the last render select returned (applyImageStripping, `returned`). */
   private _ceilingHitsThisRender = { images: false, bytes: false };
-  /** The ceilings that have decided a move of the hysteresis watermark on this branch, outside a dry run. */
-  private readonly _ceilingMovedWatermark = { images: false, bytes: false };
+  /** The sequences a ceiling's move of the hysteresis watermark stripped
+   *  that the host's own limits wouldn't have, after `after` and through
+   *  `through`, with the ceilings an image passed to bring the move on. Set
+   *  by a live move on this branch (maybeAdvanceImageWatermark), read by the
+   *  strips, and kept until the next render a select returns. */
+  private _ceilingWatermarkRanges: Array<{ after: number; through: number; images: boolean; bytes: boolean }> = [];
 
-  /** Say once for each ceiling, when a select returns a render in which an
-   *  image ceiling, rather than a limit the host set, decided that an image
-   *  is stripped (see ceilingsDeciding), or the first render a select
-   *  returns after a ceiling decided a move of the watermark on this branch
-   *  while this instance held it (maybeAdvanceImageWatermark). That render
-   *  needn't hold an image the move stripped: the line says that the ceiling
-   *  acted, and when. A watermark loaded from the store, by a later instance
-   *  or a reload of the branch, carries no record of what moved it, so the
-   *  line waits until this instance's own walk meets the ceiling. A dry
-   *  select, a preview, an observer's reconstruction or a refused select says
-   *  nothing, and the line waits for the first render returned. */
+  /** Say once for each ceiling, when a select returns a render in which
+   *  images are shown as placeholders because an image passed that ceiling,
+   *  rather than because of a limit the host set: an image past the ceiling
+   *  itself (see ceilingsDeciding), or one stripped only by a watermark move
+   *  an image past the ceiling brought on, while this instance held the
+   *  watermark on this branch (maybeAdvanceImageWatermark). A watermark
+   *  loaded from the store, by a later instance or a reload of the branch,
+   *  carries no record of what moved it, so the line waits until this
+   *  instance's own walk meets the ceiling. A dry select, a preview, an
+   *  observer's reconstruction or a refused select says nothing, and the line
+   *  waits for the first render returned. That render ends what a move left
+   *  to report: an image it stripped that the render doesn't hold, such as
+   *  one compressed since, says nothing later. */
   private reportCeilingHits(): void {
     for (const kind of ['images', 'bytes'] as const) {
-      const hit = this._ceilingHitsThisRender[kind] || this._ceilingMovedWatermark[kind];
-      if (!hit || this.ceilingBoundReported[kind]) continue;
+      if (!this._ceilingHitsThisRender[kind] || this.ceilingBoundReported[kind]) continue;
       this.ceilingBoundReported[kind] = true;
       this.diag.warn(ceilingBoundLine(this.name, kind, this.configuredImageLimits(), this.imageLimitsDefaulted()));
     }
+    this._ceilingWatermarkRanges = [];
   }
 
   /** The image limits whose values are defaults: those the library's default

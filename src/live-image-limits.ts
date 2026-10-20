@@ -33,8 +33,10 @@ export const DEFAULT_IMAGE_CEILING = 500;
  * Anthropic adapter checks again, on every request it sends. Over the cap,
  * `transformRequest` refuses the request before sending it
  * (`assertWithinByteBudget`), unless the request sets `shedOversizeImages`,
- * as this package's compression requests do, and then it replaces the oldest
- * images until it fits. 24 MiB of base64 images leaves 4 MiB of that
+ * as this package's compression requests do. Then it replaces images,
+ * oldest first, until the request fits or no image is left, and passes it
+ * on either way; the Anthropic adapter's own check, which never sheds,
+ * refuses one still over the cap. 24 MiB of base64 images leaves 4 MiB of that
  * default cap for everything else the messages carry: their text, their
  * JSON, and any documents or other media.
  */

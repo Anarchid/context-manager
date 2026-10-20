@@ -1228,7 +1228,7 @@ export interface AutobiographicalConfig {
    *  compiled request, so a caller that keeps its requests within the
    *  ceilings recompiles at each image it adds; at about 1,600 tokens an
    *  image, the token budget binds first unless the images are small. A
-   *  fraction is floored.
+   *  fraction is floored, to at least 1.
    *  A hard limit for dense bursts that pack many images into the live window.
    *  The window counts top-level `image` blocks, and measures their bytes by
    *  the length of their base64 `source.data`. So an image nested in a tool
@@ -1307,9 +1307,11 @@ export interface AutobiographicalConfig {
    * for what this doesn't count. 0 = no ceiling. A value that isn't 0 or a
    * finite number above it takes the default, and the strategy's warning at
    * initialize names it. A fraction is floored, to at least 1. Under a
-   * window limit of 0 or above this ceiling, the strategy says once, the
-   * first time this ceiling decides that an image in a render a select
-   * returns is shown as a placeholder.
+   * window limit of 0 or above this ceiling, the strategy says so once, at
+   * the first render a select returns where images are shown as
+   * placeholders because an image passed this ceiling, rather than because
+   * of a limit the host set: the image past it, or those the hysteresis
+   * watermark strips with it.
    */
   imageCeiling?: number;
 
@@ -1325,18 +1327,18 @@ export interface AutobiographicalConfig {
    * injects or appends aren't counted. membrane's byte cap is 28 MiB of
    * serialized messages unless `MEMBRANE_MAX_REQUEST_BYTES` says otherwise,
    * and the default, 24 MiB, leaves 4 MiB of that cap for what this doesn't
-   * count. Where membrane checks a request against its cap, it refuses one
-   * over it before sending, or sheds its oldest images when the request asks
-   * it to, as this strategy's compression requests do (see
-   * `src/live-image-limits.ts` for where it checks). This setting isn't read
-   * from `MEMBRANE_MAX_REQUEST_BYTES`: a host that changes membrane's cap
-   * sets this too, keeping room under the cap for what this doesn't count.
+   * count. membrane refuses a request over its cap before sending it. One
+   * that asks it to shed images, as this strategy's compression requests do,
+   * first has its oldest images replaced until it fits or none is left, and
+   * then only the Anthropic adapter's own check refuses it if it's still
+   * over (`src/live-image-limits.ts` says where each check runs). This
+   * setting isn't read from `MEMBRANE_MAX_REQUEST_BYTES`: a host that changes
+   * membrane's cap sets this too, keeping room under the cap for what this
+   * doesn't count.
    * `imageCeilings()` reports it, as for `imageCeiling`. 0 = no ceiling. A
    * value that isn't 0 or a finite number above it takes the default, and a
    * fraction is floored, to at least 1. Under a window limit of 0 or above
-   * this ceiling, the strategy says once when this ceiling first decides
-   * that an image in a render a select returns is shown as a placeholder, as
-   * for `imageCeiling`.
+   * this ceiling, the strategy says so once, as for `imageCeiling`.
    */
   imageByteCeiling?: number;
 
