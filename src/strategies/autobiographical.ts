@@ -16898,7 +16898,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  that the host's own limits wouldn't have, after `after` and through
    *  `through`, with the ceilings an image passed to bring the move on. Set
    *  by a live move on this branch (maybeAdvanceImageWatermark), read by the
-   *  strips, and kept until the next render a select returns. */
+   *  strips, and kept until each ceiling it holds has been said
+   *  (reportCeilingHits). */
   private _ceilingWatermarkRanges: Array<{ after: number; through: number; images: boolean; bytes: boolean }> = [];
 
   /** Say once for each ceiling, when a select returns a render in which
@@ -16911,16 +16912,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  carries no record of what moved it, so the line waits until this
    *  instance's own walk meets the ceiling. A dry select, a preview, an
    *  observer's reconstruction or a refused select says nothing, and the line
-   *  waits for the first render returned. That render ends what a move left
-   *  to report: an image it stripped that the render doesn't hold, such as
-   *  one compressed since, says nothing later. */
+   *  waits for the first render returned. A move's record stays until each
+   *  ceiling it holds has been said, so a render that leaves its images out,
+   *  such as an adaptive selection at a smaller budget, leaves the line for
+   *  a later one that holds them; a record a later move's cut has emptied
+   *  goes. */
   private reportCeilingHits(): void {
     for (const kind of ['images', 'bytes'] as const) {
       if (!this._ceilingHitsThisRender[kind] || this.ceilingBoundReported[kind]) continue;
       this.ceilingBoundReported[kind] = true;
       this.diag.warn(ceilingBoundLine(this.name, kind, this.configuredImageLimits(), this.imageLimitsDefaulted()));
     }
-    this._ceilingWatermarkRanges = [];
+    const said = this.ceilingBoundReported;
+    this._ceilingWatermarkRanges = this._ceilingWatermarkRanges.filter((range) =>
+      range.after < range.through && ((range.images && !said.images) || (range.bytes && !said.bytes)));
   }
 
   /** The image limits whose values are defaults: those the library's default
