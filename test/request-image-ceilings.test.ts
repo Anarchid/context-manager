@@ -1056,6 +1056,20 @@ describe('the line when an image first falls past an image ceiling', () => {
     assert.deepEqual(ceiling.lines, []);
   });
 
+  it("the memory strategy's watermark says nothing for an image its move stripped that the host's own count limit strips anyway by render time", async () => {
+    // A byte ceiling of 20 and a host count limit of 4, in force. A 16-byte
+    // image and two 4-byte ones: the oldest passes the byte ceiling (24
+    // bytes) at a count of 2, so the move, which lands on it, is the
+    // ceiling's. Two more 4-byte images come before any compile, and fit above
+    // the mark. In the render the oldest is the fifth image, past the host's
+    // count of 4, so the host's limit strips it anyway. (Without the ceiling,
+    // the host's own move at the fifth image strips three.)
+    const messages = [imageMessage('img-1', 16), ...[2, 3, 4, 5].map((i) => imageMessage(`img-${i}`))];
+    const ceiling = await watermarkRun({ maxLiveImages: 4, maxLiveImageBytes: 0, imageByteCeiling: 20, imageStripHysteresisRatio: 0.5 }, messages);
+    assert.equal(ceiling.kept, '.IIII');
+    assert.deepEqual(ceiling.lines, []);
+  });
+
   for (const [kind, options, why] of [
     ['byte', { maxLiveImages: 0, imageCeiling: 4, maxLiveImageBytes: 16 }, 'the host byte limit of 16 lands it where the count ceiling of 4 does'],
     ['count', { maxLiveImages: 4, maxLiveImageBytes: 0, imageByteCeiling: 16 }, 'the host count limit of 4 lands it where the byte ceiling of 16 does'],

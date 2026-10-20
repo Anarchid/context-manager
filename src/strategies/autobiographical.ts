@@ -16759,7 +16759,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // what earlier moves left for a ceiling stops there. When an image past a
     // ceiling brought this move on, the images after `own` and through this
     // landing are stripped only because of that ceiling, and the strips
-    // report it for such an image in the next render a select returns
+    // report it for such an image in a render a select returns
     // (reportCeilingHits). A dry advance is undone, so it leaves nothing.
     if (!this._dryRunSelect) {
       const brought = passed;
