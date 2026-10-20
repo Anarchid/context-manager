@@ -7,11 +7,12 @@
  * ceilings (`imageCeiling`, `imageByteCeiling`) bound those limits: an
  * unlimited (0) limit means "up to the ceiling", and a limit above the
  * ceiling keeps the ceiling's worth. They bound what the window counts and
- * what a compression prompt carries, not a whole request: images nested in
- * tool results, generated images, and whatever a caller injects at compile
- * time or appends to a compiled request aren't counted here. A caller that
- * wants a request within the ceilings counts that request's images itself
- * and compares them with the strategy's `imageCeilings()`.
+ * what a compression prompt carries, not a whole request. In the window,
+ * images nested in tool results and generated images aren't counted, nor is
+ * anything a caller injects at compile time or appends to a compiled
+ * request; a compression prompt counts every image it carries. A caller
+ * that wants a request within the ceilings counts that request's images
+ * itself and compares them with the strategy's `imageCeilings()`.
  */
 
 /**
@@ -24,15 +25,18 @@
 export const DEFAULT_IMAGE_CEILING = 500;
 
 /**
- * membrane refuses, before sending it, a request whose serialized messages
- * exceed its byte cap: 28 MiB unless `MEMBRANE_MAX_REQUEST_BYTES` says
- * otherwise (`assertWithinByteBudget`, membrane 0.5.87 and 0.6.0). It checks
- * when it builds a request through `transformRequest`, which a call's first
- * request and each native tool-loop round go through; an XML-mode
- * continuation round doesn't, and of the provider adapters only the
- * Anthropic adapter checks again, on every request it sends. 24 MiB of base64
- * images leaves 4 MiB of that default cap for everything else the messages
- * carry: their text, their JSON, and any documents or other media.
+ * membrane's byte cap is 28 MiB of serialized messages unless
+ * `MEMBRANE_MAX_REQUEST_BYTES` says otherwise (membrane 0.5.87 and 0.6.0).
+ * It checks a request when it builds it through `transformRequest`, which a
+ * call's first request and each native tool-loop round go through; an
+ * XML-mode continuation round doesn't, and of the provider adapters only the
+ * Anthropic adapter checks again, on every request it sends. Over the cap,
+ * `transformRequest` refuses the request before sending it
+ * (`assertWithinByteBudget`), unless the request sets `shedOversizeImages`,
+ * as this package's compression requests do, and then it replaces the oldest
+ * images until it fits. 24 MiB of base64 images leaves 4 MiB of that
+ * default cap for everything else the messages carry: their text, their
+ * JSON, and any documents or other media.
  */
 export const DEFAULT_IMAGE_BYTE_CEILING = 24 * 1024 * 1024;
 
@@ -151,8 +155,11 @@ export function ceilingSetLimits(configured: ConfiguredImageLimits): { images: b
  * see ceilingSetLimits), when nothing else strips it. Something else strips
  * it when `strippedOtherwise` says so, as the host's depth limit or the
  * memory strategy's hysteresis watermark does, or when it also passes a
- * count or byte limit the host set itself. Only a ceiling that decides
- * changes what the window keeps, so only that one says its line.
+ * count or byte limit the host set itself and has in force, under its
+ * ceiling. A limit the host set above its ceiling isn't in force: the
+ * ceiling holds it, and the warning at initialize says so. Only a ceiling
+ * that decides changes what the window keeps, so only that one says its
+ * line.
  */
 export function ceilingsDeciding(
   over: { images: boolean; bytes: boolean },

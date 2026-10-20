@@ -1229,7 +1229,7 @@ export interface AutobiographicalConfig {
    *  ceilings recompiles at each image it adds; at about 1,600 tokens an
    *  image, the token budget binds first unless the images are small. A
    *  fraction is floored.
-   *  A hard ceiling for dense bursts that pack many images into the live window.
+   *  A hard limit for dense bursts that pack many images into the live window.
    *  The window counts top-level `image` blocks, and measures their bytes by
    *  the length of their base64 `source.data`. So an image nested in a tool
    *  result and a `generated_image` are neither counted nor replaced, and an
@@ -1306,9 +1306,10 @@ export interface AutobiographicalConfig {
    * 2026-10-13, and again on 2026-10-19), and the default, 500, leaves room
    * for what this doesn't count. 0 = no ceiling. A value that isn't 0 or a
    * finite number above it takes the default, and the strategy's warning at
-   * initialize names it. A fraction is floored. Under a window limit of 0 or
-   * above this ceiling, the strategy says once, the first time this ceiling
-   * decides that an image is shown as a placeholder.
+   * initialize names it. A fraction is floored, to at least 1. Under a
+   * window limit of 0 or above this ceiling, the strategy says once, the
+   * first time this ceiling decides that an image in a render a select
+   * returns is shown as a placeholder.
    */
   imageCeiling?: number;
 
@@ -1321,17 +1322,21 @@ export interface AutobiographicalConfig {
    *
    * It doesn't bound a request's bytes: the messages' text and JSON,
    * documents, the images the window doesn't count, and anything a caller
-   * injects or appends aren't counted. membrane refuses, before sending it, a
-   * request whose serialized messages exceed its byte cap, 28 MiB unless
-   * `MEMBRANE_MAX_REQUEST_BYTES` says otherwise, and the default, 24 MiB,
-   * leaves 4 MiB of that cap for what this doesn't count. It doesn't follow
-   * `MEMBRANE_MAX_REQUEST_BYTES`, so a host that changes membrane's cap
-   * changes this with it, keeping room under the cap for what this doesn't
-   * count. `imageCeilings()` reports it, as for `imageCeiling`. 0 = no
-   * ceiling. A value that isn't 0 or a finite number above it takes the
-   * default. Under a window limit of 0 or above this ceiling, the strategy
-   * says once when this ceiling first decides that an image is shown as a
-   * placeholder, as for `imageCeiling`.
+   * injects or appends aren't counted. membrane's byte cap is 28 MiB of
+   * serialized messages unless `MEMBRANE_MAX_REQUEST_BYTES` says otherwise,
+   * and the default, 24 MiB, leaves 4 MiB of that cap for what this doesn't
+   * count. Where membrane checks a request against its cap, it refuses one
+   * over it before sending, or sheds its oldest images when the request asks
+   * it to, as this strategy's compression requests do (see
+   * `src/live-image-limits.ts` for where it checks). This setting isn't read
+   * from `MEMBRANE_MAX_REQUEST_BYTES`: a host that changes membrane's cap
+   * sets this too, keeping room under the cap for what this doesn't count.
+   * `imageCeilings()` reports it, as for `imageCeiling`. 0 = no ceiling. A
+   * value that isn't 0 or a finite number above it takes the default, and a
+   * fraction is floored, to at least 1. Under a window limit of 0 or above
+   * this ceiling, the strategy says once when this ceiling first decides
+   * that an image in a render a select returns is shown as a placeholder, as
+   * for `imageCeiling`.
    */
   imageByteCeiling?: number;
 

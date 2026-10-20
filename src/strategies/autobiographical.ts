@@ -7519,7 +7519,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the request before it.
       const prevCacheKeys = this._prevCacheKeys;
       // What this select's strips record is what it reports. A dry select's
-      // strips, or a refused one's, record too, and are dropped here.
+      // strips, and a refused one's, record too; each live select starts by
+      // clearing what earlier ones left, so it reports its own render's.
       this._ceilingHitsThisRender = { images: false, bytes: false };
       let entries: ContextEntry[];
       try {
@@ -15279,8 +15280,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // topic and isn't a lever the list names (OverBudgetClearedBy).
           // Newer messages can shrink a head that holds images, since the
           // image strip takes the oldest images first (maxLiveImages,
-          // maxLiveImageBytes, imageStripDepthTokens), but whether they'd
-          // strip enough isn't known, so nothing is named for that either.
+          // maxLiveImageBytes, each within its image ceiling, and
+          // imageStripDepthTokens), but whether they'd strip enough isn't
+          // known, so nothing is named for that either.
           clearedBy: [],
           diagnostics: {
             middleCountUnit: 'selection-items',
@@ -16559,7 +16561,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  the count, byte and depth limits (the byte rule is greedy, so a large
    *  newest image can be replaced while smaller older ones stay), the
    *  hysteresis watermark, which strips below them, and the compression
-   *  request's own image byte cap. Windowed passthrough uses the same text. */
+   *  request's own image byte and count caps. Windowed passthrough uses the
+   *  same text. */
   private static readonly IMAGE_PLACEHOLDER = '[image not shown: this context keeps only some images]';
 
   /** Post-pass over compiled entries: replace image blocks with a text
@@ -16695,7 +16698,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Walk newest-first with the given limits; return the sequence of the
     // first message holding an image that does not fit (or undefined), and
     // which limits it passes.
-    let misfitBy = { depth: false, images: false, bytes: false };
+    let misfitBy = { images: false, bytes: false };
     const firstMisfit = (depthCap: number, countCap: number, bytesCap: number): number | undefined => {
       let depth = 0, count = 0, bytes = 0;
       for (let i = messages.length - 1; i >= 0; i--) {
@@ -16705,11 +16708,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (b.type !== 'image') continue;
           const size = AutobiographicalStrategy.imageBlockBytes(b);
           misfitBy = {
-            depth: depthCap > 0 && depth > depthCap,
             images: countCap > 0 && count >= countCap,
             bytes: bytesCap > 0 && bytes + size > bytesCap,
           };
-          if (misfitBy.depth || misfitBy.images || misfitBy.bytes) return m.sequence;
+          if ((depthCap > 0 && depth > depthCap) || misfitBy.images || misfitBy.bytes) return m.sequence;
           count++;
           bytes += size;
         }
@@ -16717,22 +16719,37 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       return undefined;
     };
-    if (firstMisfit(stripDepth, maxLive, maxLiveBytes) === undefined) return; // no limit binds
-    // A ceiling that decides the watermark's move strips every later render
-    // by it, so the next render a select returns reports it
-    // (reportCeilingHits). One the depth limit or a limit the host set also
-    // forces isn't the ceiling's. A dry advance is undone, so it leaves nothing.
+    // Where the watermark lands for given limits: past the first misfit, at
+    // the first one of the trim to ratio × each limit, or undefined if no
+    // limit binds. `passed` collects the limits the two walks' misfits pass.
+    const passed = { images: false, bytes: false };
+    const landing = (countCap: number, bytesCap: number, note: boolean): number | undefined => {
+      if (firstMisfit(stripDepth, countCap, bytesCap) === undefined) return undefined;
+      if (note) { passed.images ||= misfitBy.images; passed.bytes ||= misfitBy.bytes; }
+      const at = firstMisfit(
+        stripDepth > 0 ? Math.floor(stripDepth * ratio) : 0,
+        countCap > 0 ? Math.max(0, Math.floor(countCap * ratio)) || 1 : 0,
+        bytesCap > 0 ? Math.floor(bytesCap * ratio) : 0,
+      );
+      if (note) { passed.images ||= misfitBy.images; passed.bytes ||= misfitBy.bytes; }
+      return at;
+    };
+    const next = landing(maxLive, maxLiveBytes, true);
+    if (next === undefined || (w !== undefined && next <= w)) return; // no limit binds, or no advance
+    // The ceilings decide this move when it lands newer, so strips more, than
+    // the limits the host has in force would land it: its depth limit, and a
+    // count or byte limit no ceiling sets (ceilingSetLimits). The move then
+    // strips every later render by it, so the next render a select returns
+    // reports each ceiling whose limit the walks passed (reportCeilingHits).
+    // A dry advance is undone, so it leaves nothing.
     if (!this._dryRunSelect) {
-      const deciding = ceilingsDeciding(misfitBy, misfitBy.depth, ceilingSetLimits(this.configuredImageLimits()));
-      if (deciding.images) this._ceilingMovedWatermark.images = true;
-      if (deciding.bytes) this._ceilingMovedWatermark.bytes = true;
+      const set = ceilingSetLimits(this.configuredImageLimits());
+      const own = landing(set.images ? 0 : maxLive, set.bytes ? 0 : maxLiveBytes, false);
+      if (own === undefined || next > own) {
+        if (set.images && passed.images) this._ceilingMovedWatermark.images = true;
+        if (set.bytes && passed.bytes) this._ceilingMovedWatermark.bytes = true;
+      }
     }
-    const next = firstMisfit(
-      stripDepth > 0 ? Math.floor(stripDepth * ratio) : 0,
-      maxLive > 0 ? Math.max(0, Math.floor(maxLive * ratio)) || 1 : 0,
-      maxLiveBytes > 0 ? Math.floor(maxLiveBytes * ratio) : 0,
-    );
-    if (next === undefined || (w !== undefined && next <= w)) return;
     this._imageWatermark = next;
     // Dry selections and observer reconstructions advance it locally only;
     // their finally blocks restore it together with the post-strip memo.
@@ -16870,12 +16887,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Say once for each ceiling, when a select returns a render in which an
    *  image ceiling, rather than a limit the host set, decided that an image
-   *  is stripped (see ceilingsDeciding), directly or through a watermark it
-   *  moved on this branch while this instance ran. A watermark loaded from the store
-   *  carries no record of what moved it, so a later instance says it when
-   *  its own walk next meets the ceiling. A dry select, a preview, an
-   *  observer's reconstruction or a refused select says nothing, and the
-   *  line waits for the first render returned. */
+   *  is stripped (see ceilingsDeciding), or the first render a select
+   *  returns after a ceiling decided a move of the watermark on this branch
+   *  while this instance held it (maybeAdvanceImageWatermark). That render
+   *  needn't hold an image the move stripped: the line says that the ceiling
+   *  acted, and when. A watermark loaded from the store, by a later instance
+   *  or a reload of the branch, carries no record of what moved it, so the
+   *  line waits until this instance's own walk meets the ceiling. A dry
+   *  select, a preview, an observer's reconstruction or a refused select says
+   *  nothing, and the line waits for the first render returned. */
   private reportCeilingHits(): void {
     for (const kind of ['images', 'bytes'] as const) {
       const hit = this._ceilingHitsThisRender[kind] || this._ceilingMovedWatermark[kind];
