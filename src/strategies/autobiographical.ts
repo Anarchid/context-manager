@@ -18659,7 +18659,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * select sends each shard as its own message), then `applyImageStripping`,
    * so a message stored after the batch counts toward the images as in a
    * compile. The tool pass that comes between them (postProcessToolEntries)
-   * is left out: it pairs and prunes by the window around these messages.
+   * is left out: it pairs by the window around these messages. What sending
+   * prunes from a message's tool blocks reaches it through `cappedForSend`.
    *
    * Those messages are the recent window's, and the head window's too when
    * no message comes between the two: a compile places the middle's
