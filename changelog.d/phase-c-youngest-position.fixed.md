@@ -22,15 +22,18 @@
     growth crossed W — and the dead-band hold could not keep it, because its
     relevance-gap check compared against that moving ideal. An inverted
     carried profile (a chunk deeper than an older unprotected chunk) is still
-    lowered to the older level so the quality-gap self-heal keeps working;
-    an older chunk already at the deepest level its group can render at
-    (lineage top, or a pin-max-level on a group-mate) is no evidence of
+    lowered to the older level so the quality-gap self-heal keeps working.
+    An older chunk is weighed only against younger chunks at or above the
+    next level its group can render at, so one already at its group's
+    deepest level (lineage top, or a pin-max-level on a group-mate), or
+    whose lineage skips past the younger chunk's level, is no evidence of
     inversion — without that, a seeded plan could alternate between two
-    frontiers on an imperfect tree. A chunk whose group has a raw-zone,
-    pinned or locked member of its own lineage is part of a boundary-cut
-    fold, which a from-scratch cut makes too, and isn't lowered — lowering it
-    moved the plan once on unchanged inputs.
-    Bootstrap is unchanged.
+    frontiers on an imperfect tree, or lower a whole younger band on every
+    compile. A chunk whose group has a raw-zone, pinned or locked member of
+    its own lineage is part of a boundary-cut fold, which a from-scratch cut
+    makes too, and isn't lowered — lowering it moved the plan once on
+    unchanged inputs.
+    Seeding doesn't apply to bootstrap.
   - **Cost, stated:** keeping monotone over-depth IS the hysteresis, and the
     quality-gap check cannot see it (relevance loss only scores depth past
     the age cap, and the seeded ideal keeps the carried depth). Depth the
@@ -41,8 +44,9 @@
     from-scratch re-cut's re-read anyway, or a re-read where the re-cut pays
     none, the from-scratch cut is taken instead, so a large raise is not
     spent keeping a tight-budget allocation. Past the trust region, a release
-    adopts only the newest part of the from-scratch cut that fits within it,
-    and the plan keeps the depth further back. A shed, a hold in the dead band
+    is adopted as any ideal past it is: its newest part that fits within the
+    trust region, with the depth further back kept, or the whole cut where the
+    infeasible or quality-gap override applies. A shed, a hold in the dead band
     and a fold at the seam keep the seeded plan, and a seeded plan that
     re-reads nothing is kept without building the re-cut.
   Accept rule, group consistency, protections and the phase A/B fold order

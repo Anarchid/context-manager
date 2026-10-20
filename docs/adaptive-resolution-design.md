@@ -961,13 +961,16 @@ it. A carried-seeded solve (the default; the from-scratch solve is a
 measurement's control arm, set on the controller as `seedFromCarried: false`)
 inherits the carried profile, so an inverted carried profile is lowered to the
 older level before the phases run and re-folds in fold order. A boundary-cut
-fold isn't lowered, and an older chunk already at the deepest level its group
-can render at is no evidence of inversion. Monotone over-depth is kept — that
+fold isn't lowered, and an older chunk is weighed only against younger chunks
+at or above the next level its group can render at: one already at its
+group's deepest level, or whose lineage skips past the younger chunk's level,
+is no evidence of inversion. Monotone over-depth is kept — that
 retained depth is the hysteresis. Where the carried frontier is under
 expandAt, as after a budget raise, and the seeded plan would pay ≥ 90% of a
 from-scratch re-read anyway, or a re-read where the from-scratch cut pays
 none, the from-scratch cut is taken (`seedingReleased`); past P, as for any
-ideal, its newest part that fits within P is adopted.
+ideal, its newest part that fits within P is adopted, or the whole cut where
+the infeasible or quality-gap override applies.
 
 **Cheap-moment scheduling (v2).** The quality-gap threshold makes "repair now
 vs amortize" explicit; a future refinement schedules big adoptions onto turns

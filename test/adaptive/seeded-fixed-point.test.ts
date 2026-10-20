@@ -2,7 +2,7 @@
  * Replanned on unchanged inputs, a seeded plan keeps its frontier. Each of
  * these stores once made it alternate:
  *
- * 1. A nested tree (every node has one parent, and every listing agrees with
+ * 1. A nested tree (no node has two parents, and every listing agrees with
  *    lineage) whose L3 spans two parentless L1s. L3-0 lists L2-0, L2-1 and
  *    L2-2. L1-6 and L1-7 (m14 to m17), between L2-1's leaves and L2-2's, have
  *    no parent. Seeded from the bootstrap plan, the inversion pass reads

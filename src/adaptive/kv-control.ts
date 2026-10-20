@@ -922,13 +922,15 @@ export interface ControlPlanParams {
    * profile (a chunk deeper than an older unprotected chunk) is still lowered
    * to the older level so phase A re-folds it in its own order (ascending
    * salience, then oldest) — the quality-gap self-heal keeps working. An
-   * older chunk already at the deepest level its group can render at is no
+   * older chunk is weighed only against younger chunks at or above the next
+   * level its group can render at, so one already at its group's deepest
+   * level, or whose lineage skips past the younger chunk's level, is no
    * evidence of inversion, and a boundary-cut fold isn't lowered. Where the
    * carried frontier is under expandAt and the seeded cut would pay nearly
    * the whole from-scratch re-read anyway, the from-scratch cut is taken
-   * instead (`ControlPlan.seedingReleased`). Bootstrap (nothing carried) is
-   * unaffected. Default true; `false` builds the ideal from raw every turn,
-   * keeping phase C's walk by youngest position.
+   * instead (`ControlPlan.seedingReleased`). Seeding doesn't apply to
+   * bootstrap (nothing carried). Default true; `false` builds the ideal from
+   * raw every turn, keeping phase C's walk by youngest position.
    */
   seedFromCarried?: boolean;
   /** Quality-gap override threshold (§13.4): a plan within P is rejected — and
@@ -1317,9 +1319,10 @@ function planUnreported(
   // includes a from-scratch cut that re-reads nothing, where the seeded ideal
   // would re-lay a plan on unchanged inputs. A seeded ideal that re-reads
   // nothing is kept without building the other cut. Past the trust region P,
-  // the from-scratch cut is adopted as any ideal past P is, its newest part
+  // the from-scratch cut is adopted as any ideal past P is: its newest part
   // that fits within P (step 5), and that plan reports the release if it takes
-  // any of it. Above expandAt (a shed, a hold, a fold at the seam) the seeded
+  // any of it, or the whole cut where the infeasible or quality-gap override
+  // applies. Above expandAt (a shed, a hold, a fold at the seam) the seeded
   // plan is kept. (#156 R2-3, R3-3; #186 R3-2)
   let seedingReleased = false;
   if (seeded && carriedTokens < expandAt) {
