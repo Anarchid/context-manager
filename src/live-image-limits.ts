@@ -161,7 +161,9 @@ export function ceilingSetLimits(configured: ConfiguredImageLimits): { images: b
  * ceiling. A limit the host set above its ceiling isn't in force: the
  * ceiling holds it, and the warning at initialize says so. Only a ceiling
  * that decides changes what the window keeps, so only that one says its
- * line.
+ * line. An image the watermark strips is the ceiling's when a ceiling's
+ * move alone put it there; the memory strategy credits that from its record
+ * of the move (applyImageStripping), not here.
  */
 export function ceilingsDeciding(
   over: { images: boolean; bytes: boolean },
@@ -194,7 +196,7 @@ export function ceilingBoundLine(
   const limit = asLimit(value) === 0 ? `${value} (no limit)` : show(asLimit(value));
   const mark = (name: string) => defaultMark(name, configured, defaulted);
   return `[${strategy}] an image fell past ${ceilingName} ${show(ceiling[kind])}${mark(ceilingName)}, ` +
-    `which holds ${limitName} ${limit}${mark(limitName)} to it, so images past it are now shown as placeholders`;
+    `which holds ${limitName} ${limit}${mark(limitName)} to it, so older images are now shown as placeholders`;
 }
 
 /**

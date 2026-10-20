@@ -16626,14 +16626,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const entry = entries[idx];
       const tooDeep = depthTokens > 0 && (pos < 0 || pos < stripStart);
       const belowMark = pos >= 0 && this.belowImageWatermark(messages[pos]!.sequence);
-      // Below the watermark only because a ceiling moved it there, and not
-      // past the depth limit, which strips it anyway: the ceiling decided.
+      // The ceilings whose move alone put this message below the watermark,
+      // when the depth limit doesn't strip it anyway.
+      let moved: { images: boolean; bytes: boolean } | undefined;
       if (belowMark && !tooDeep) {
         const sequence = messages[pos]!.sequence;
         for (const range of this._ceilingWatermarkRanges) {
           if (sequence <= range.after || sequence > range.through) continue;
-          if (range.images) hits.images = true;
-          if (range.bytes) hits.bytes = true;
+          moved ??= { images: false, bytes: false };
+          moved.images ||= range.images;
+          moved.bytes ||= range.bytes;
         }
       }
       const bucket = bucketAt(pos);
@@ -16645,6 +16647,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const deciding = ceilingsDeciding({ images: overCount, bytes: overBytes }, belowMark || tooDeep, ceilingSet);
         if (deciding.images) hits.images = true;
         if (deciding.bytes) hits.bytes = true;
+        // A limit the host has in force that this image passes strips it
+        // anyway, so a ceiling's move decided nothing for it.
+        if (moved && !((overCount && !ceilingSet.images) || (overBytes && !ceilingSet.bytes))) {
+          if (moved.images) hits.images = true;
+          if (moved.bytes) hits.bytes = true;
+        }
         if (belowMark || tooDeep || overCount || overBytes) {
           // Stats-neutral (2026-07-12): every budgeting site now tallies at
           // POST-STRIP prices (see postStripEstimates), so the bucket never
@@ -16730,9 +16738,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
     // Where the watermark lands for given limits: past the first misfit, at
     // the first one of the trim to ratio × each limit, or undefined if no
-    // limit binds. Both walks stop at the watermark, and the trim's caps are
-    // each no larger than the first walk's, so a landing is always above it.
-    // `passed` is the limits the first misfit passes: what brought the move on.
+    // limit binds. Both walks stop at the watermark, so a landing is always
+    // above it. `passed` is the limits the first misfit passes: what brought
+    // the move on.
     let passed = { images: false, bytes: false };
     const landing = (countCap: number, bytesCap: number): number | undefined => {
       if (firstMisfit(stripDepth, countCap, bytesCap) === undefined) return undefined;

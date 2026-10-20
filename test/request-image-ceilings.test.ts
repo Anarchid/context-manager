@@ -468,7 +468,7 @@ describe('the line when an image first falls past an image ceiling', () => {
         const { lines, byStep, patterns } = await ceilingLines(strategy, [3, 2]);
         assert.deepEqual(patterns, ['.II', '...II'], `the ceiling of 2 strips at each compile for ${JSON.stringify(options)}`);
         assert.deepEqual(byStep.map((step) => step.length), [1, 0], `said once, at the first step, for ${JSON.stringify(options)}`);
-        assert.ok(lines[0]!.startsWith(`[${strategy.name}] an image fell past ${said}, so images past it are now shown as placeholders`), lines[0]);
+        assert.ok(lines[0]!.startsWith(`[${strategy.name}] an image fell past ${said}, so older images are now shown as placeholders`), lines[0]);
         assert.match(lines[0]!, / ns=/, 'through the namespaced route the warning takes');
       }
     });
@@ -1008,6 +1008,54 @@ describe('the line when an image first falls past an image ceiling', () => {
     assert.deepEqual(ceiling.lines, []);
   });
 
+  it("the memory strategy's watermark names the count ceiling for an image its move stripped that the host's own limit, landing older, keeps", async () => {
+    // A count ceiling of 4 and a host byte limit of 40, in force. When the
+    // fifth image comes (8 bytes, after a 24-byte one and three 4-byte ones),
+    // it passes both: the count ceiling and 44 bytes. The host's limit alone
+    // would trim to 20 bytes, landing on the oldest; the count ceiling's trim,
+    // to 2, lands on the middle image. So the two between are stripped only
+    // because an image passed the count ceiling.
+    const messages = [imageMessage('img-1', 24), ...[2, 3, 4].map((i) => imageMessage(`img-${i}`)), imageMessage('img-5', 8)];
+    const options = { maxLiveImages: 0, maxLiveImageBytes: 40, imageStripHysteresisRatio: 0.5 };
+    const alone = await watermarkRun({ ...options, imageCeiling: 0 }, messages);
+    assert.equal(alone.kept, '.IIII', "the host's limit alone strips the oldest");
+    const ceiling = await watermarkRun({ ...options, imageCeiling: 4 }, messages);
+    assert.equal(ceiling.kept, '...II');
+    assert.equal(ceiling.lines.length, 1, JSON.stringify(ceiling.lines));
+    assert.ok(ceiling.lines[0]!.includes('an image fell past imageCeiling 4'), ceiling.lines[0]);
+  });
+
+  it("the memory strategy's watermark names the byte ceiling for an image its move stripped that the host's own limit, landing older, keeps", async () => {
+    // The mirror, with a byte ceiling of 20 and a host count limit of 4, in
+    // force. When the fifth image comes (8 bytes, after three 4-byte ones and
+    // an 8-byte one), the second-oldest passes the byte ceiling (24 bytes)
+    // while the count is 3. The host's count alone would move the watermark
+    // only at the oldest and trim to 2, landing on the middle image; the byte
+    // ceiling's trim, to 10 bytes, lands on the 8-byte fourth image. So that
+    // one is stripped only because an image passed the byte ceiling.
+    const messages = [...[1, 2, 3].map((i) => imageMessage(`img-${i}`)), imageMessage('img-4', 8), imageMessage('img-5', 8)];
+    const options = { maxLiveImages: 4, maxLiveImageBytes: 0, imageStripHysteresisRatio: 0.5 };
+    const alone = await watermarkRun({ ...options, imageByteCeiling: 0 }, messages);
+    assert.equal(alone.kept, '...II', "the host's count alone strips the three oldest");
+    const ceiling = await watermarkRun({ ...options, imageByteCeiling: 20 }, messages);
+    assert.equal(ceiling.kept, '....I');
+    assert.equal(ceiling.lines.length, 1, JSON.stringify(ceiling.lines));
+    assert.ok(ceiling.lines[0]!.includes('an image fell past imageByteCeiling 20 bytes'), ceiling.lines[0]);
+  });
+
+  it("the memory strategy's watermark says nothing for an image its move stripped that the host's own limit strips anyway by render time", async () => {
+    // A count ceiling of 4 and a host byte limit of 40, in force. The fifth
+    // image passes the count ceiling and moves the watermark onto the middle
+    // image, which the host's limit alone would keep then. A 24-byte image
+    // comes before any compile: above the watermark it fits, but in the
+    // render the middle image no longer fits the host's 40 bytes with the
+    // images kept after it, so the host's limit strips it anyway.
+    const messages = [...[1, 2, 3].map((i) => imageMessage(`img-${i}`, 12)), imageMessage('img-4'), imageMessage('img-5'), imageMessage('img-6', 24)];
+    const ceiling = await watermarkRun({ maxLiveImages: 0, imageCeiling: 4, maxLiveImageBytes: 40, imageStripHysteresisRatio: 0.5 }, messages);
+    assert.equal(ceiling.kept, '...III');
+    assert.deepEqual(ceiling.lines, []);
+  });
+
   for (const [kind, options, why] of [
     ['byte', { maxLiveImages: 0, imageCeiling: 4, maxLiveImageBytes: 16 }, 'the host byte limit of 16 lands it where the count ceiling of 4 does'],
     ['count', { maxLiveImages: 4, maxLiveImageBytes: 0, imageByteCeiling: 16 }, 'the host count limit of 4 lands it where the byte ceiling of 16 does'],
@@ -1077,13 +1125,13 @@ describe('the line when an image first falls past an image ceiling', () => {
     const configured = (o: Record<string, number>) =>
       ({ maxLiveImages: 0, maxLiveImageBytes: 0, imageCeiling: 500, imageByteCeiling: 24 * MiB, ...o });
     assert.equal(ceilingBoundLine('s', 'images', configured({}), new Set(['imageCeiling'])),
-      '[s] an image fell past imageCeiling 500 (default), which holds maxLiveImages 0 (no limit) to it, so images past it are now shown as placeholders');
+      '[s] an image fell past imageCeiling 500 (default), which holds maxLiveImages 0 (no limit) to it, so older images are now shown as placeholders');
     assert.equal(ceilingBoundLine('s', 'images', configured({ imageCeiling: Number.NaN, maxLiveImages: 800 }), new Set()),
-      '[s] an image fell past imageCeiling 500 (default), which holds maxLiveImages 800 to it, so images past it are now shown as placeholders');
+      '[s] an image fell past imageCeiling 500 (default), which holds maxLiveImages 800 to it, so older images are now shown as placeholders');
     assert.equal(ceilingBoundLine('s', 'bytes', configured({ maxLiveImageBytes: 30 * MiB }), new Set()),
-      '[s] an image fell past imageByteCeiling 24 MiB, which holds maxLiveImageBytes 30 MiB to it, so images past it are now shown as placeholders');
+      '[s] an image fell past imageByteCeiling 24 MiB, which holds maxLiveImageBytes 30 MiB to it, so older images are now shown as placeholders');
     assert.equal(ceilingBoundLine('s', 'bytes', configured({ maxLiveImageBytes: 30 * MiB + 1 }), new Set(['imageByteCeiling'])),
-      `[s] an image fell past imageByteCeiling 24 MiB (default), which holds maxLiveImageBytes ${30 * MiB + 1} bytes to it, so images past it are now shown as placeholders`);
+      `[s] an image fell past imageByteCeiling 24 MiB (default), which holds maxLiveImageBytes ${30 * MiB + 1} bytes to it, so older images are now shown as placeholders`);
   });
 
   it('the memory strategy says it when its hysteresis watermark trims against the byte ceiling', async () => {
