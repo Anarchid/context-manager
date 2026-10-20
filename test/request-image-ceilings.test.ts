@@ -940,6 +940,22 @@ describe('the line when an image first falls past an image ceiling', () => {
     assert.ok(lines[0]!.includes('an image fell past imageByteCeiling 20 bytes'), lines[0]);
   });
 
+  it("the memory strategy's watermark names only the count ceiling that decided its move, not the host's own byte limit", async () => {
+    // The byte guard's mirror: a host byte limit of 40, in force, and a count
+    // ceiling of 4. When three 4-byte images come after a 32-byte one, the
+    // host's byte limit misfits the oldest (44 bytes), so the watermark moves
+    // anyway; its own trim, to 20 bytes, lands on that oldest image too. The
+    // count ceiling's trim, to 2, lands newer, on the second-oldest: the
+    // count ceiling decided, and the byte limit is the host's.
+    const { lines, patterns } = await ceilingLines(
+      memory({ maxLiveImages: 0, imageCeiling: 4, maxLiveImageBytes: 40, imageStripHysteresisRatio: 0.5 }),
+      [{ add: 1, bytes: 32 }, { add: 3, bytes: 4 }],
+    );
+    assert.deepEqual(patterns, ['I', '..II'], 'the count trim strips the second-oldest image too');
+    assert.equal(lines.length, 1, JSON.stringify(lines));
+    assert.ok(lines[0]!.includes('an image fell past imageCeiling 4'), lines[0]);
+  });
+
   it("the memory strategy's watermark credits the ceiling that brought the move, where the trim stops at the depth", async () => {
     // A count ceiling of 4 and a 20,000-token depth limit. The fifth image's
     // message brings the ceiling's misfit on the oldest, with nothing past
