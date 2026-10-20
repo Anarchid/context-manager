@@ -14,13 +14,12 @@
     level first (`for level = max..1 { youngest-first }`), which raised the
     youngest L3 group — the one right after the deep band — before any L1 at
     the seam.
-  - **The ideal cut is seeded from the carried frontier**
-    (`kvStableSeedFromCarried`, default `true`): phases A/B only deepen what
-    is carried (same salience-then-oldest, level-by-level order) and only
-    phase C un-folds. The from-scratch cut re-decided every band boundary
-    from the current balance of production and growth, so a deep group was
-    raised when a new mid-level summary landed and re-deepened when growth
-    crossed W — and the dead-band hold could not keep it, because its
+  - **The ideal cut is seeded from the carried frontier**: phases A/B only
+    deepen what is carried (same salience-then-oldest, level-by-level order)
+    and only phase C un-folds. The from-scratch cut re-decided every band
+    boundary from the current balance of production and growth, so a deep
+    group was raised when a new mid-level summary landed and re-deepened when
+    growth crossed W — and the dead-band hold could not keep it, because its
     relevance-gap check compared against that moving ideal. An inverted
     carried profile (a chunk deeper than an older unprotected chunk) is still
     lowered to the older level so the quality-gap self-heal keeps working;
@@ -31,9 +30,7 @@
     pinned or locked member of its own lineage is part of a boundary-cut
     fold, which a from-scratch cut makes too, and isn't lowered — lowering it
     moved the plan once on unchanged inputs.
-    Bootstrap is unchanged. `kvStableSeedFromCarried: false` restores the
-    from-scratch ideal of design §13.4 while keeping the new phase-C walk; it
-    is not a rollback to the previous release's planner.
+    Bootstrap is unchanged.
   - **Cost, stated:** keeping monotone over-depth IS the hysteresis, and the
     quality-gap check cannot see it (relevance loss only scores depth past
     the age cap, and the seeded ideal keeps the carried depth). Depth the

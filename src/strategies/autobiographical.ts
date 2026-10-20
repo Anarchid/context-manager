@@ -14526,7 +14526,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           ? this.config.kvStableReachTokens
           : this.runtimeTransitionPaceTokens ?? this.config.kvStableReachTokens,
         qualityGapRatio: this.config.kvStableQualityGapRatio,
-        seedFromCarried: this.config.kvStableSeedFromCarried,
         mergeThreshold: this.config.mergeThreshold,
         goalTotalTokens: preparedBudget?.totalBudget,
         goalTargetTokens: preparedBudget?.targetBudget,

@@ -1,44 +1,17 @@
 /**
  * The seeding option's default and its path through the strategy
- * (#156 review, nissa item 2): `planControlledFrontier` seeds by default,
- * `KvStableStrategy` forwards the option untouched, and the autobiographical
- * strategy threads `kvStableSeedFromCarried` into the solver it builds.
+ * (#156 review, nissa item 2): `planControlledFrontier` seeds by default, and
+ * `KvStableStrategy` forwards its `seedFromCarried` option untouched, which a
+ * measurement's from-scratch arm sets. No recipe key sets it.
  */
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { AutobiographicalStrategy } from '../../src/strategies/autobiographical.js';
 import { KvStableStrategy, type KvStableOptions } from '../../src/adaptive/strategies/kv-stable.js';
 import type { PickerInputs } from '../../src/adaptive/picker.js';
 import { Picker } from '../../src/adaptive/picker.js';
-import { buildChronicleWithChain, MockChronicle } from './harness.js';
-
-const optsOf = (s: KvStableStrategy): KvStableOptions => (s as unknown as { opts: KvStableOptions }).opts;
-
-class Exposed extends AutobiographicalStrategy {
-  solver(inputs: PickerInputs): KvStableStrategy | null {
-    this.buildPicker(inputs);
-    return (this as unknown as { _lastKvStable: KvStableStrategy | null })._lastKvStable;
-  }
-}
-
-function inputs(): PickerInputs {
-  const ch = buildChronicleWithChain({ chunkCount: 36, tokensPerChunk: 100, mergeThreshold: 6, recallPairTokens: 100 });
-  return {
-    chunks: ch.chunks, summaries: ch.summaries, recallPairTokens: ch.recallPairTokens,
-    headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set(),
-  };
-}
-
-test('kvStableSeedFromCarried threads from strategy config into the kv-stable solver', () => {
-  const dflt = new Exposed({ foldingStrategy: 'kv-stable', adaptiveResolution: true } as never).solver(inputs());
-  assert.ok(dflt, 'kv-stable solver built');
-  assert.equal(optsOf(dflt).seedFromCarried, undefined, 'unset config leaves the solver default (true) in force');
-  const off = new Exposed({ foldingStrategy: 'kv-stable', adaptiveResolution: true, kvStableSeedFromCarried: false } as never).solver(inputs());
-  assert.ok(off);
-  assert.equal(optsOf(off).seedFromCarried, false, 'an explicit false is preserved');
-});
+import { MockChronicle } from './harness.js';
 
 /** The review's carried-growth stream, driven through Picker + KvStableStrategy
  *  (the production path) instead of planControlledFrontier directly. */

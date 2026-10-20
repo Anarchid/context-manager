@@ -887,8 +887,9 @@ As shipped (`planControlledFrontier`, `kv-control.ts` — regenerated rev 5.1):
 ```
 solve(tree, F_prev, W, P):
   ideal = relevanceCut(tree, target, W, base)
-      -- base = the carried frontier (`kvStableSeedFromCarried`, default true;
-      --   raw on bootstrap or when false), with an inverted carried profile
+      -- base = the carried frontier, or raw on bootstrap and in a
+      --   measurement's from-scratch arm (the controller's
+      --   `seedFromCarried: false`), with an inverted carried profile
       --   lowered first so it re-folds in fold order; no P anywhere:
       -- phase A: fold in salience-then-age priority order, level-by-level,
       --   under the shape prior, toward the target;
@@ -956,7 +957,8 @@ age/salience-monotone **by construction** (fold order = priority order),
 except at a boundary-cut fold: a group with a raw-zone, pinned or locked
 member of its own lineage folds its other members while older chunks beside it
 stay raw. Apart from that, the inversion class of bug cannot be produced by
-it. A carried-seeded solve (the default since `kvStableSeedFromCarried`)
+it. A carried-seeded solve (the default; the from-scratch solve is a
+measurement's control arm, set on the controller as `seedFromCarried: false`)
 inherits the carried profile, so an inverted carried profile is lowered to the
 older level before the phases run and re-folds in fold order. A boundary-cut
 fold isn't lowered, and an older chunk already at the deepest level its group
