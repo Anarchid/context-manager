@@ -1,7 +1,7 @@
 import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 import type {
   ContextStrategy,
-  LiveImageLimits,
+  ImageCeilings,
   StrategyContext,
   ReadinessState,
   MessageStoreView,
@@ -20,12 +20,14 @@ import { OverBudgetError } from '../adaptive/picker.js';
 import { observeStoreBranch, type StoreBranchGeneration } from '../branch-generation.js';
 import { capContent, cappedPriceExtra } from './message-cap.js';
 import {
-  DEFAULT_MAX_REQUEST_IMAGES,
-  DEFAULT_MAX_REQUEST_IMAGE_BYTES,
+  DEFAULT_IMAGE_CEILING,
+  DEFAULT_IMAGE_BYTE_CEILING,
   liveImageLimitsWarning,
   ceilingBoundLine,
   ceilingSetLimits,
+  ceilingsDeciding,
   resolveLiveImageLimits,
+  type ResolvedImageLimits,
 } from '../live-image-limits.js';
 
 /**
@@ -76,7 +78,7 @@ export interface WindowedPassthroughOptions {
    * `maxLiveImageBytes` of cumulative inline image bytes (newest-first).
    * Defaults follow `DEFAULT_AUTOBIOGRAPHICAL_CONFIG` (and the memory
    * strategy's byte wall). A count or byte limit of 0 means up to its
-   * request ceiling, below, and a depth of 0 means no depth strip. A strip changes the
+   * image ceiling, below, and a depth of 0 means no depth strip. A strip changes the
    * bytes at that position, which the cache-marker placement absorbs by
    * measurement (the marker falls back to the deepest byte-stable entry).
    */
@@ -84,17 +86,18 @@ export interface WindowedPassthroughOptions {
   imageStripDepthTokens?: number;
   maxLiveImageBytes?: number;
   /**
-   * The request ceilings, mirroring `AutobiographicalConfig`: the most images,
-   * and the most inline image bytes, one request may carry. The window keeps
-   * at most these of the images it counts, counted as
+   * The image ceilings, mirroring `AutobiographicalConfig.imageCeiling` and
+   * `imageByteCeiling`: the most top-level image blocks, and the most of
+   * their inline image bytes, the window keeps, counted as
    * `AutobiographicalConfig.maxLiveImages` says, whatever `maxLiveImages` and
-   * `maxLiveImageBytes` say (0 there means up to these), and
-   * `liveImageLimits()` reports them.
+   * `maxLiveImageBytes` say (0 there means up to these). They don't bound a
+   * whole request: what the window doesn't count, and what a caller injects
+   * or appends, isn't counted. `imageCeilings()` reports them.
    * Defaults 500 images and 24 MiB; 0 = no ceiling, and a value that isn't 0
    * or a finite number above it takes the default.
    */
-  maxRequestImages?: number;
-  maxRequestImageBytes?: number;
+  imageCeiling?: number;
+  imageByteCeiling?: number;
 }
 
 /** Text substituted for an image block once it leaves the live-image window
@@ -153,7 +156,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   private readonly anchorStateIdOverride?: string;
   /** The image limits as configured, with the defaults where unset. */
   private readonly configuredImageLimits: {
-    maxLiveImages: number; maxLiveImageBytes: number; maxRequestImages: number; maxRequestImageBytes: number;
+    maxLiveImages: number; maxLiveImageBytes: number; imageCeiling: number; imageByteCeiling: number;
   };
   /** The image limits the options didn't give, whose values are defaults. */
   private readonly imageLimitsDefaulted: ReadonlySet<string>;
@@ -187,26 +190,34 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     this.configuredImageLimits = {
       maxLiveImages: options.maxLiveImages ?? DEFAULT_AUTOBIOGRAPHICAL_CONFIG.maxLiveImages ?? 0,
       maxLiveImageBytes: options.maxLiveImageBytes ?? DEFAULT_MAX_LIVE_IMAGE_BYTES,
-      maxRequestImages: options.maxRequestImages ?? DEFAULT_MAX_REQUEST_IMAGES,
-      maxRequestImageBytes: options.maxRequestImageBytes ?? DEFAULT_MAX_REQUEST_IMAGE_BYTES,
+      imageCeiling: options.imageCeiling ?? DEFAULT_IMAGE_CEILING,
+      imageByteCeiling: options.imageByteCeiling ?? DEFAULT_IMAGE_BYTE_CEILING,
     };
     this.imageLimitsDefaulted = new Set(
-      (['maxLiveImages', 'maxLiveImageBytes', 'maxRequestImages', 'maxRequestImageBytes'] as const).filter((key) => options[key] == null),
+      (['maxLiveImages', 'maxLiveImageBytes', 'imageCeiling', 'imageByteCeiling'] as const).filter((key) => options[key] == null),
     );
     this.imageStripDepthTokens =
       options.imageStripDepthTokens ?? DEFAULT_AUTOBIOGRAPHICAL_CONFIG.imageStripDepthTokens ?? 0;
   }
 
   /**
-   * The live window's count and byte limits, clamped to the request
-   * ceilings, and the ceilings themselves (see ContextStrategy.liveImageLimits).
+   * The image ceilings (see ContextStrategy.imageCeilings), as the window
+   * applies them: a malformed one at its default, a fraction floored.
    */
-  liveImageLimits(): LiveImageLimits {
+  imageCeilings(): ImageCeilings {
+    const { ceiling } = this.resolvedImageLimits();
+    return { imageCeiling: ceiling.images, imageByteCeiling: ceiling.bytes };
+  }
+
+  /** The live window's count and byte limits, kept within the image
+   *  ceilings, and the ceilings themselves. */
+  private resolvedImageLimits(): ResolvedImageLimits {
     return resolveLiveImageLimits(this.configuredImageLimits);
   }
 
-  /** Say once that a request ceiling, rather than a limit the options set, has
-   *  stripped an image from the live window (see ceilingSetLimits). */
+  /** Say once that an image ceiling, rather than a limit the options set,
+   *  has decided that an image is stripped from the live window (see
+   *  ceilingsDeciding). */
   private reportCeilingBoundOnce(kind: 'images' | 'bytes'): void {
     if (this.ceilingBoundReported[kind]) return;
     this.ceilingBoundReported[kind] = true;
@@ -441,11 +452,12 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     entries: ContextEntry[],
     messages: StoredMessage[],
     store: MessageStoreView,
-    // Whether this render is sent: a preview's (dryRun) says no ceiling line.
-    sent: boolean,
+    // Whether select returns this render: only such a render says a
+    // ceiling's line. A preview's (dryRun) doesn't, nor any other caller's.
+    returned = false,
   ): void {
-    // Count and bytes within the request ceilings; 0 = unlimited.
-    const { images: maxLive, bytes: maxLiveBytes } = this.liveImageLimits().target;
+    // Count and bytes within the image ceilings; 0 = unlimited.
+    const { images: maxLive, bytes: maxLiveBytes } = this.resolvedImageLimits().target;
     const depthTokens = this.imageStripDepthTokens;
     if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return;
 
@@ -473,8 +485,11 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         const bytes = imageBlockBytes(block);
         const overCount = maxLive > 0 && keptImages >= maxLive;
         const overBytes = maxLiveBytes > 0 && keptImageBytes + bytes > maxLiveBytes;
-        if (sent && overCount && ceilingSet.images) this.reportCeilingBoundOnce('images');
-        if (sent && overBytes && ceilingSet.bytes) this.reportCeilingBoundOnce('bytes');
+        if (returned) {
+          const deciding = ceilingsDeciding({ images: overCount, bytes: overBytes }, tooDeep, ceilingSet);
+          if (deciding.images) this.reportCeilingBoundOnce('images');
+          if (deciding.bytes) this.reportCeilingBoundOnce('bytes');
+        }
         if (tooDeep || overCount || overBytes) {
           return { type: 'text', text: IMAGE_PLACEHOLDER } as ContentBlock;
         }

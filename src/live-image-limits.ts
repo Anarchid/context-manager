@@ -1,38 +1,50 @@
 /**
- * The live-image window's limits, clamped to the request ceilings.
+ * The live-image window's limits, kept within the image ceilings.
  *
  * A strategy's live window keeps the images it counts (top-level image
  * blocks; see `AutobiographicalConfig.maxLiveImages`) newest-first up to a
- * count (`maxLiveImages`) and a byte budget (`maxLiveImageBytes`). The
- * request ceilings (`maxRequestImages`, `maxRequestImageBytes`) are the most
- * one request may carry, so the window's own limits never exceed them: an
- * unlimited (0) target means "up to the ceiling", and a target above the
- * ceiling keeps the ceiling's worth. What the window doesn't count, it
- * doesn't bound. A caller that appends to a compiled request without
- * recompiling, such as a turn's continuation rounds, can read both through
- * the strategy's `liveImageLimits()` and stop below the ceiling; nothing
- * here bounds what it appends.
+ * count (`maxLiveImages`) and a byte budget (`maxLiveImageBytes`). The image
+ * ceilings (`imageCeiling`, `imageByteCeiling`) bound those limits: an
+ * unlimited (0) limit means "up to the ceiling", and a limit above the
+ * ceiling keeps the ceiling's worth. They bound what the window counts and
+ * what a compression prompt carries, not a whole request: images nested in
+ * tool results, generated images, and whatever a caller injects at compile
+ * time or appends to a compiled request aren't counted here. A caller that
+ * wants a request within the ceilings counts that request's images itself
+ * and compares them with the strategy's `imageCeilings()`.
  */
-
-import type { LiveImageLimits } from './types/strategy.js';
 
 /**
  * The provider refuses a request carrying more than 600 images and documents
  * together ("too many images and documents: 601 + 0 > 600", measured
- * 2026-10-13 and again on 2026-10-19). 500 leaves room for documents, which
- * nothing here counts, and for image blocks a host adds outside the compile.
+ * 2026-10-13 and again on 2026-10-19). 500 leaves room for what the ceilings
+ * don't count: documents, images nested in tool results, generated images,
+ * and images a caller injects or appends.
  */
-export const DEFAULT_MAX_REQUEST_IMAGES = 500;
+export const DEFAULT_IMAGE_CEILING = 500;
 
 /**
  * membrane refuses, before sending it, a request whose serialized messages
  * exceed its byte cap: 28 MiB unless `MEMBRANE_MAX_REQUEST_BYTES` says
- * otherwise (membrane 0.5.87 and 0.6.0, `assertWithinByteBudget`, checked at
- * every round of a tool loop). 24 MiB of base64 images leaves 4 MiB of that
- * default cap for everything else the messages carry: their text, their JSON,
- * and any documents or other media.
+ * otherwise (`assertWithinByteBudget`, membrane 0.5.87 and 0.6.0). It checks
+ * when it builds a request through `transformRequest`, which a call's first
+ * request and each native tool-loop round go through; an XML-mode
+ * continuation round doesn't, and of the provider adapters only the
+ * Anthropic adapter checks again, on every request it sends. 24 MiB of base64
+ * images leaves 4 MiB of that default cap for everything else the messages
+ * carry: their text, their JSON, and any documents or other media.
  */
-export const DEFAULT_MAX_REQUEST_IMAGE_BYTES = 24 * 1024 * 1024;
+export const DEFAULT_IMAGE_BYTE_CEILING = 24 * 1024 * 1024;
+
+/** A strategy's image limits as its window applies them. Each figure is a
+ *  count of the images the window counts or a sum of their inline base64
+ *  bytes, and 0 is no limit. `target` is what the window keeps, already
+ *  within `ceiling` (`maxLiveImages` and `maxLiveImageBytes`, clamped);
+ *  `ceiling` is `imageCeiling` and `imageByteCeiling`. */
+export interface ResolvedImageLimits {
+  target: { images: number; bytes: number };
+  ceiling: { images: number; bytes: number };
+}
 
 /** A window limit as the window reads it: a whole number of 1 or more, or 0
  *  for none. Any value that isn't a positive finite number (0, a negative,
@@ -75,15 +87,15 @@ export function clampToCeiling(target: number, ceiling: number): number {
 export interface ConfiguredImageLimits {
   maxLiveImages: number;
   maxLiveImageBytes: number;
-  maxRequestImages: number;
-  maxRequestImageBytes: number;
+  imageCeiling: number;
+  imageByteCeiling: number;
 }
 
 /** The limits a strategy's window applies, and the ceilings above them. */
-export function resolveLiveImageLimits(configured: ConfiguredImageLimits): LiveImageLimits {
+export function resolveLiveImageLimits(configured: ConfiguredImageLimits): ResolvedImageLimits {
   const ceiling = {
-    images: asCeiling(configured.maxRequestImages, DEFAULT_MAX_REQUEST_IMAGES),
-    bytes: asCeiling(configured.maxRequestImageBytes, DEFAULT_MAX_REQUEST_IMAGE_BYTES),
+    images: asCeiling(configured.imageCeiling, DEFAULT_IMAGE_CEILING),
+    bytes: asCeiling(configured.imageByteCeiling, DEFAULT_IMAGE_BYTE_CEILING),
   };
   return {
     target: {
@@ -113,17 +125,17 @@ function defaultMark(
   configured: ConfiguredImageLimits,
   defaulted: ReadonlySet<string>,
 ): string {
-  const malformedCeiling = (name === 'maxRequestImages' || name === 'maxRequestImageBytes') &&
+  const malformedCeiling = (name === 'imageCeiling' || name === 'imageByteCeiling') &&
     !wellFormedCeiling(configured[name]);
   return defaulted.has(name) || malformedCeiling ? ' (default)' : '';
 }
 
 /**
- * Which of the window's limits a request ceiling sets: a limit the host gave
- * as none (0, or anything that isn't a positive finite number) or above its
- * ceiling, where that ceiling is itself a limit. The window then keeps the
- * ceiling's worth. (With no ceiling the window keeps the limit as given, so
- * the two never match there.)
+ * Which of the window's limits a ceiling sets: a limit the host gave as none
+ * (0, or anything that isn't a positive finite number) or above its ceiling,
+ * where that ceiling is itself a limit. The window then keeps the ceiling's
+ * worth. (With no ceiling the window keeps the limit as given, so the two
+ * never match there.)
  */
 export function ceilingSetLimits(configured: ConfiguredImageLimits): { images: boolean; bytes: boolean } {
   const { target, ceiling } = resolveLiveImageLimits(configured);
@@ -134,13 +146,31 @@ export function ceilingSetLimits(configured: ConfiguredImageLimits): { images: b
 }
 
 /**
- * The line a strategy says once for each ceiling, the first time an image
- * falls past a ceiling that sets the window's limit (see ceilingSetLimits):
- * which ceiling, at what value, and the window limit of 0 or above it that
- * the ceiling held, so an operator who set no limit sees where one now
- * applies. An image falls past the count ceiling when the window already
- * keeps the ceiling's worth, and past the byte ceiling when it doesn't fit
- * with what's kept, a single image bigger than the ceiling included.
+ * Which ceilings decide that an image is stripped: those whose limit it
+ * passes (`over`) where the ceiling sets the window's limit (`ceilingSet`,
+ * see ceilingSetLimits), when nothing else strips it. Something else strips
+ * it when `strippedOtherwise` says so, as the host's depth limit or the
+ * memory strategy's hysteresis watermark does, or when it also passes a
+ * count or byte limit the host set itself. Only a ceiling that decides
+ * changes what the window keeps, so only that one says its line.
+ */
+export function ceilingsDeciding(
+  over: { images: boolean; bytes: boolean },
+  strippedOtherwise: boolean,
+  ceilingSet: { images: boolean; bytes: boolean },
+): { images: boolean; bytes: boolean } {
+  const otherwise = strippedOtherwise || (over.images && !ceilingSet.images) || (over.bytes && !ceilingSet.bytes);
+  return otherwise ? { images: false, bytes: false } : { images: over.images, bytes: over.bytes };
+}
+
+/**
+ * The line a strategy says once for each ceiling, the first time that
+ * ceiling decides that an image is stripped (see ceilingsDeciding): which
+ * ceiling, at what value, and the window limit of 0 or above it that the
+ * ceiling held, so an operator who set no limit sees where one now applies.
+ * An image passes the count ceiling when the window already keeps the
+ * ceiling's worth, and the byte ceiling when it doesn't fit with what's
+ * kept, a single image bigger than the ceiling included.
  */
 export function ceilingBoundLine(
   strategy: string,
@@ -150,8 +180,8 @@ export function ceilingBoundLine(
 ): string {
   const ceiling = resolveLiveImageLimits(configured).ceiling;
   const [ceilingName, limitName, value, show] = kind === 'images'
-    ? ['maxRequestImages', 'maxLiveImages', configured.maxLiveImages, String] as const
-    : ['maxRequestImageBytes', 'maxLiveImageBytes', configured.maxLiveImageBytes, showBytes] as const;
+    ? ['imageCeiling', 'maxLiveImages', configured.maxLiveImages, String] as const
+    : ['imageByteCeiling', 'maxLiveImageBytes', configured.maxLiveImageBytes, showBytes] as const;
   const limit = asLimit(value) === 0 ? `${value} (no limit)` : show(asLimit(value));
   const mark = (name: string) => defaultMark(name, configured, defaulted);
   return `[${strategy}] an image fell past ${ceilingName} ${show(ceiling[kind])}${mark(ceilingName)}, ` +
@@ -178,11 +208,11 @@ export function liveImageLimitsWarning(
   const count = (n: number) => String(n);
   const bytes = showBytes;
   const setting = (name: string, shown: string) => `${name} ${shown}${defaultMark(name, configured, defaulted)}`;
-  if (!wellFormedCeiling(configured.maxRequestImages)) {
-    said.push(`maxRequestImages ${configured.maxRequestImages} isn't 0 or a finite number above it, so the default ${count(ceiling.images)} applies`);
+  if (!wellFormedCeiling(configured.imageCeiling)) {
+    said.push(`imageCeiling ${configured.imageCeiling} isn't 0 or a finite number above it, so the default ${count(ceiling.images)} applies`);
   }
-  if (!wellFormedCeiling(configured.maxRequestImageBytes)) {
-    said.push(`maxRequestImageBytes ${configured.maxRequestImageBytes} isn't 0 or a finite number above it, so the default ${bytes(ceiling.bytes)} applies`);
+  if (!wellFormedCeiling(configured.imageByteCeiling)) {
+    said.push(`imageByteCeiling ${configured.imageByteCeiling} isn't 0 or a finite number above it, so the default ${bytes(ceiling.bytes)} applies`);
   }
   const above = (
     name: string, value: number | undefined, ceilingName: string, limit: number, keeps: string, show: (n: number) => string,
@@ -192,8 +222,8 @@ export function liveImageLimitsWarning(
       said.push(`${setting(name, show(v))} is above ${setting(ceilingName, show(limit))}, so ${keeps} at most ${show(limit)}`);
     }
   };
-  above('maxLiveImages', configured.maxLiveImages, 'maxRequestImages', ceiling.images, 'the live window keeps', count);
-  above('maxLiveImageBytes', configured.maxLiveImageBytes, 'maxRequestImageBytes', ceiling.bytes, 'the live window keeps', bytes);
-  above('maxCompressionImageBytes', configured.maxCompressionImageBytes, 'maxRequestImageBytes', ceiling.bytes, 'a compression prompt keeps', bytes);
+  above('maxLiveImages', configured.maxLiveImages, 'imageCeiling', ceiling.images, 'the live window keeps', count);
+  above('maxLiveImageBytes', configured.maxLiveImageBytes, 'imageByteCeiling', ceiling.bytes, 'the live window keeps', bytes);
+  above('maxCompressionImageBytes', configured.maxCompressionImageBytes, 'imageByteCeiling', ceiling.bytes, 'a compression prompt keeps', bytes);
   return said.length === 0 ? null : `[${strategy}] ${said.join('; ')}`;
 }

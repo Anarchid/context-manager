@@ -8,6 +8,7 @@ import type {
   PendingWork,
 } from './context.js';
 import type { OverBudgetClearedBy } from '../adaptive/picker.js';
+import { DEFAULT_IMAGE_BYTE_CEILING, DEFAULT_IMAGE_CEILING } from '../live-image-limits.js';
 
 /**
  * Read-only view of the message store for strategies.
@@ -237,31 +238,28 @@ export interface ContextStrategy {
   takeSelectionCause?(): string | undefined;
 
   /**
-   * The live-image window's limits and the request ceilings above them, for
-   * a caller that appends to a compiled request without recompiling, such
-   * as a turn's continuation rounds: the strategy's compile keeps the images
-   * its window counts within `target`, and the caller can let the request
-   * grow to `ceiling` before compiling it again. Both count the images the
-   * window counts (see `AutobiographicalConfig.maxLiveImages`), not every
-   * image a request can carry. It only reports the figures: a caller bounds
-   * what it appends, and what it injects at compile time. Absent on a
-   * strategy with no live-image window.
+   * The image ceilings this strategy keeps its live window within and holds
+   * a compression prompt to (`imageCeiling` and `imageByteCeiling`, 0 for
+   * none). They're configuration, not usage: they bound the images the
+   * window counts (top-level image blocks; see
+   * `AutobiographicalConfig.maxLiveImages`), not every image a request
+   * carries, and nothing here bounds what a caller injects at compile time
+   * or appends to a compiled request. A caller that wants its request within
+   * them counts that request's images itself, every shape included, and
+   * compares the counts with these. Absent on a strategy with no live-image
+   * window.
    */
-  liveImageLimits?(): LiveImageLimits;
+  imageCeilings?(): ImageCeilings;
 }
 
 /**
- * A strategy's live-image limits. Each figure is a count of the image blocks
- * the window counts (see `AutobiographicalConfig.maxLiveImages`) or a sum of
- * their inline base64 bytes, and 0 means no limit. `target` is what the
- * window keeps, already within `ceiling` (`maxLiveImages` and
- * `maxLiveImageBytes`, clamped); `ceiling` is the most one request may carry
- * (`maxRequestImages` and `maxRequestImageBytes`), which the window keeps
- * its own images within.
+ * A strategy's image ceilings (see ContextStrategy.imageCeilings): the most
+ * images, and the most inline base64 image bytes, its live window keeps and
+ * a compression prompt carries. 0 is no ceiling.
  */
-export interface LiveImageLimits {
-  target: { images: number; bytes: number };
-  ceiling: { images: number; bytes: number };
+export interface ImageCeilings {
+  imageCeiling: number;
+  imageByteCeiling: number;
 }
 
 /** What a rendered summary covers, for layout reporting. */
@@ -1083,19 +1081,20 @@ export interface AutobiographicalConfig {
   /** Maximum number of images kept "live" (sent as real image blocks) in the
    *  compiled context. Counted newest-first across the whole window; images
    *  beyond this many are replaced with a text placeholder. Kept within
-   *  `maxRequestImages`, so 0 means up to that ceiling. A window kept at the
-   *  ceiling leaves a caller that appends to the compiled request no room
-   *  below it once it's full, so that caller recompiles at each image it
-   *  adds; at about 1,600 tokens an image, the token budget binds first
-   *  unless the images are small. A fraction is floored.
+   *  `imageCeiling`, so 0 means up to that ceiling. A window kept at the
+   *  ceiling leaves no room under it for images a caller appends to the
+   *  compiled request, so a caller that keeps its requests within the
+   *  ceilings recompiles at each image it adds; at about 1,600 tokens an
+   *  image, the token budget binds first unless the images are small. A
+   *  fraction is floored.
    *  A hard ceiling for dense bursts that pack many images into the live window.
    *  The window counts top-level `image` blocks, and measures their bytes by
    *  the length of their base64 `source.data`. So an image nested in a tool
    *  result and a `generated_image` are neither counted nor replaced, and an
    *  image with a `data:` URL counts but its bytes don't. In the window,
-   *  every live-image limit and request ceiling below counts the same way; a
+   *  every live-image limit and image ceiling below counts the same way; a
    *  compression prompt counts every image, nested and generated ones
-   *  included (see `maxRequestImages`). */
+   *  included (see `imageCeiling`). */
   maxLiveImages?: number;
   /** Token depth from the newest message beyond which images are stripped to a
    *  text placeholder, even though the surrounding text stays verbatim. Measured
@@ -1116,11 +1115,11 @@ export interface AutobiographicalConfig {
    * Byte wall for live images (2026-07-12): keep inline images newest-first
    * only while their cumulative base64 size stays under this budget — on top
    * of `maxLiveImages` / `imageStripDepthTokens`. Default 20 MiB of base64.
-   * The window keeps at most `maxRequestImageBytes` whatever this says, and 0
+   * The window keeps at most `imageByteCeiling` whatever this says, and 0
    * here means up to that ceiling. It counts the bytes of the images the
    * window counts (see `maxLiveImages`), not the request's other bytes, so on
    * its own it can't keep a request under membrane's byte cap: see
-   * `maxRequestImageBytes`.
+   * `imageByteCeiling`.
    */
   maxLiveImageBytes?: number;
 
@@ -1142,51 +1141,56 @@ export interface AutobiographicalConfig {
    * live window's: the prompt also carries the head, the recall frontier and
    * the raw chunk. Newest-first; older images become loud placeholders.
    * Default 12MB of base64. A compression prompt carries at most
-   * `maxRequestImages` images and `maxRequestImageBytes` bytes whatever this
+   * `imageCeiling` images and `imageByteCeiling` bytes whatever this
    * says, and 0 here, or any value that isn't a positive finite number, means
    * up to the byte ceiling.
    */
   maxCompressionImageBytes?: number;
 
   /**
-   * The most images one request may carry (2026-10-19). The live window keeps
-   * at most this many of the images it counts (see `maxLiveImages`),
-   * whatever `maxLiveImages` says, so a `maxLiveImages` of 0 means up to this
-   * many. A compression prompt carries at most this many images, nested ones
-   * and generated ones included. `liveImageLimits()` reports it, for a
-   * caller that appends to a compiled request without recompiling, such as a
-   * turn's continuation rounds, to keep its own appends below; nothing here
-   * bounds what a caller appends or injects. The provider refuses a request
-   * with more than 600 images and documents together (measured 2026-10-13,
-   * and again on 2026-10-19). Default 500, which leaves room for what the
-   * window doesn't count: documents, images nested in tool results and
-   * generated images (see `maxLiveImages`), and image blocks a host adds
-   * outside the compile. 0 = no ceiling. A value that isn't 0 or a finite number above it
-   * takes the default, and the strategy's warning at initialize names it. A
-   * fraction is floored. Under a window limit of 0 or above this ceiling, the
-   * strategy says once, the first time an image falls past it.
+   * The most top-level image blocks a strategy's live window keeps, whatever
+   * `maxLiveImages` says, and the most images a compression prompt carries
+   * (2026-10-19). A `maxLiveImages` of 0 means up to this many. The window
+   * counts top-level `image` blocks (see `maxLiveImages`); a compression
+   * prompt counts every image, nested ones and generated ones included.
+   *
+   * It doesn't bound a whole request. The window's images nested in tool
+   * results and its generated images aren't counted, and neither is
+   * anything a caller injects at compile time or appends to a compiled
+   * request; `imageCeilings()` reports this ceiling, so such a caller can
+   * count its request's images itself and compare. The provider refuses a
+   * request with more than 600 images and documents together (measured
+   * 2026-10-13, and again on 2026-10-19), and the default, 500, leaves room
+   * for what this doesn't count. 0 = no ceiling. A value that isn't 0 or a
+   * finite number above it takes the default, and the strategy's warning at
+   * initialize names it. A fraction is floored. Under a window limit of 0 or
+   * above this ceiling, the strategy says once, the first time this ceiling
+   * decides that an image is shown as a placeholder.
    */
-  maxRequestImages?: number;
+  imageCeiling?: number;
 
   /**
-   * The most inline image bytes (base64) one request may carry (2026-10-19),
-   * as `maxRequestImages` is for their number. The live window keeps at most
-   * this many bytes of the images it counts (see `maxLiveImages`), whatever
-   * `maxLiveImageBytes` says, and a
-   * compression prompt carries at most this many bytes of its images.
-   * `liveImageLimits()` reports it, as for `maxRequestImages`. membrane
-   * refuses, before sending it, a request whose serialized messages exceed
-   * its byte cap, 28 MiB unless `MEMBRANE_MAX_REQUEST_BYTES` says otherwise.
-   * Default 24 MiB, which leaves 4 MiB of that cap for everything else the
-   * messages carry: their text, their JSON, any documents or other media, and
-   * in the window any images it doesn't count, none of which this counts. It
-   * doesn't follow `MEMBRANE_MAX_REQUEST_BYTES`, so a host that changes
-   * membrane's cap sets this to match. 0 = no ceiling.
-   * A value that isn't 0 or a finite number above it takes the default. Under
-   * a window limit of 0 or above this ceiling, the strategy says once when an
-   * image first falls past it, as for `maxRequestImages`.
+   * The most inline image bytes (base64) of the top-level image blocks a
+   * strategy's live window keeps, whatever `maxLiveImageBytes` says, and the
+   * most of its images' bytes a compression prompt carries (2026-10-19). A
+   * `maxLiveImageBytes` of 0 means up to this many. The window measures an
+   * image by the length of its base64 `source.data` (see `maxLiveImages`).
+   *
+   * It doesn't bound a request's bytes: the messages' text and JSON,
+   * documents, the images the window doesn't count, and anything a caller
+   * injects or appends aren't counted. membrane refuses, before sending it, a
+   * request whose serialized messages exceed its byte cap, 28 MiB unless
+   * `MEMBRANE_MAX_REQUEST_BYTES` says otherwise, and the default, 24 MiB,
+   * leaves 4 MiB of that cap for what this doesn't count. It doesn't follow
+   * `MEMBRANE_MAX_REQUEST_BYTES`, so a host that changes membrane's cap
+   * changes this with it, keeping room under the cap for what this doesn't
+   * count. `imageCeilings()` reports it, as for `imageCeiling`. 0 = no
+   * ceiling. A value that isn't 0 or a finite number above it takes the
+   * default. Under a window limit of 0 or above this ceiling, the strategy
+   * says once when this ceiling first decides that an image is shown as a
+   * placeholder, as for `imageCeiling`.
    */
-  maxRequestImageBytes?: number;
+  imageByteCeiling?: number;
 
   /**
    * Merge grouping: exclude candidates whose OWN source span exceeds the
@@ -1998,6 +2002,8 @@ Write naturally, as recollection of what you experienced.`,
   maxMessageTokens: 0,
   maxLiveImages: 6,
   imageStripDepthTokens: 30000,
+  imageCeiling: DEFAULT_IMAGE_CEILING,
+  imageByteCeiling: DEFAULT_IMAGE_BYTE_CEILING,
   positionedRecallPairs: true,
   recallHeaderTemplate: '[Recall {id}]',
   compressionRefusalCurveFallbacks: 3,

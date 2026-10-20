@@ -109,9 +109,9 @@ describe('Live image policy', () => {
       maxLiveImages: 0,
       imageStripDepthTokens: 0,
       maxLiveImageBytes: 0,
-      // The request ceilings bound an unlimited window too.
-      maxRequestImages: 0,
-      maxRequestImageBytes: 0,
+      // The image ceilings bound an unlimited window too.
+      imageCeiling: 0,
+      imageByteCeiling: 0,
     });
     const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
 

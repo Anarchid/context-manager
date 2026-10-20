@@ -5,7 +5,7 @@ import { registerStateIfAbsent } from '../state-registration.js';
 import { phaseChannel } from '../phase-channel.js';
 import type {
   ContextStrategy,
-  LiveImageLimits,
+  ImageCeilings,
   ResettableStrategy,
   StrategyContext,
   ReadinessState,
@@ -79,13 +79,15 @@ import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReas
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
 import {
-  DEFAULT_MAX_REQUEST_IMAGES,
-  DEFAULT_MAX_REQUEST_IMAGE_BYTES,
+  DEFAULT_IMAGE_CEILING,
+  DEFAULT_IMAGE_BYTE_CEILING,
   clampToCeiling,
   liveImageLimitsWarning,
   ceilingBoundLine,
   ceilingSetLimits,
+  ceilingsDeciding,
   resolveLiveImageLimits,
+  type ResolvedImageLimits,
 } from '../live-image-limits.js';
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
@@ -1169,7 +1171,7 @@ interface PreparationCounts {
   /** The inline image byte budget, 0 for none. */
   imageBudgetBytes: number;
   imageBytesKept: number;
-  /** The most images the prompt may carry (maxRequestImages), 0 for none. */
+  /** The most images the prompt may carry (imageCeiling), 0 for none. */
   imageCountCap: number;
   imagesKept: number;
 }
@@ -7130,7 +7132,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       // Only a render this select returns says the ceiling line: one it
       // refused threw above, and a dry select never comes here. Every select
-      // path strips its render last (applyImageStripping, `sent`), and a
+      // path strips its render last (applyImageStripping, `returned`), and a
       // strip with no limits records nothing, so the hits are this render's.
       this.reportCeilingHits();
       return entries;
@@ -12852,7 +12854,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.postProcessToolEntries(merged);
     // Strip stale images BEFORE placing markers and committing stats, so both
     // describe the post-strip context the agent actually receives.
-    this.applyImageStripping(merged, store, { sent: true });
+    this.applyImageStripping(merged, store, { returned: true });
 
     // The newest stored message is the triggering turn for this compile. A
     // structural repair may rewrite tool blocks, but it must never erase that
@@ -15258,7 +15260,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.postProcessToolEntries(entries);
     // Strip stale images before committing stats so RenderStats.total reflects
     // the post-strip context (this path places no cache markers).
-    this.applyImageStripping(entries, store, { sent: true });
+    this.applyImageStripping(entries, store, { returned: true });
     this.rsEnd();
     return entries;
   }
@@ -16045,8 +16047,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  placeholder once they fall outside the live-image window — either deeper
    *  than `imageStripDepthTokens` from the newest message, or beyond the
    *  `maxLiveImages` most-recent images (counted newest-first), or past
-   *  `maxLiveImageBytes`, the count and bytes each within its request ceiling
-   *  (liveImageLimits). Summaries are
+   *  `maxLiveImageBytes`, the count and bytes each within its image ceiling
+   *  (resolvedImageLimits). Summaries are
    *  already text, so they're naturally unaffected. The adjacent
    *  "[image attachment: <name>]" text added at ingest preserves the filename,
    *  so the placeholder itself stays terse. Reduces tokens, so it never pushes
@@ -16058,13 +16060,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  the in-progress render stats by the reclaimed tokens, keeping
    *  `RenderStats.total` equal to the real rendered size.
    *
-   *  `opts.sent`: the render is a selection's own, so a ceiling it strips
-   *  against says its line once select returns it (reportCeilingHits). A
-   *  layout rendered only to compare against, such as kv-unified's kept one,
-   *  leaves it unset. */
-  protected applyImageStripping(entries: ContextEntry[], store: MessageStoreView, opts: { sent?: boolean } = {}): void {
-    // Count and bytes within the request ceilings; 0 = unlimited.
-    const { images: maxLive, bytes: maxLiveBytes } = this.liveImageLimits().target;
+   *  `opts.returned`: select returns this render, so a ceiling that decides
+   *  an image here says its line once select has returned it
+   *  (reportCeilingHits). A layout rendered only to compare against, such as
+   *  kv-unified's kept one, and any other caller's render, leave it unset. */
+  protected applyImageStripping(entries: ContextEntry[], store: MessageStoreView, opts: { returned?: boolean } = {}): void {
+    // Count and bytes within the image ceilings; 0 = unlimited.
+    const { images: maxLive, bytes: maxLiveBytes } = this.resolvedImageLimits().target;
     const depthTokens = this.config.imageStripDepthTokens ?? 0; // 0 = no depth strip
     if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return; // no window and no ceilings
 
@@ -16109,8 +16111,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const blockBytes = AutobiographicalStrategy.imageBlockBytes(block);
         const overCount = maxLive > 0 && keptImages >= maxLive;
         const overBytes = maxLiveBytes > 0 && keptImageBytes + blockBytes > maxLiveBytes;
-        if (overCount && ceilingSet.images) hits.images = true;
-        if (overBytes && ceilingSet.bytes) hits.bytes = true;
+        const deciding = ceilingsDeciding({ images: overCount, bytes: overBytes }, belowMark || tooDeep, ceilingSet);
+        if (deciding.images) hits.images = true;
+        if (deciding.bytes) hits.bytes = true;
         if (belowMark || tooDeep || overCount || overBytes) {
           // Stats-neutral (2026-07-12): every budgeting site now tallies at
           // POST-STRIP prices (see postStripEstimates), so the bucket never
@@ -16125,11 +16128,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return block;
       });
     }
-    // A selection's own render (`sent`) leaves what its ceilings stripped for
-    // select to report once it returns that render; the last such strip is
+    // A render select returns (`returned`) leaves what its ceilings decided
+    // for select to report once it has returned it; the last such strip is
     // the render it returns. A layout rendered only to compare against, such
     // as kv-unified's kept one, leaves nothing.
-    if (opts.sent) this._ceilingHitsThisRender = hits;
+    if (opts.returned) this._ceilingHitsThisRender = hits;
   }
 
   /** imageStripHysteresisRatio: images in messages at or before this
@@ -16166,14 +16169,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const ratio = this.imageHysteresisRatio();
     if (ratio === undefined) return;
     const stripDepth = this.config.imageStripDepthTokens ?? 0;
-    const { images: maxLive, bytes: maxLiveBytes } = this.liveImageLimits().target;
+    const { images: maxLive, bytes: maxLiveBytes } = this.resolvedImageLimits().target;
     if (stripDepth === 0 && maxLive === 0 && maxLiveBytes === 0) return;
     const messages = store.getAll();
     const w = this.imageWatermark();
     // Walk newest-first with the given limits; return the sequence of the
     // first message holding an image that does not fit (or undefined), and
     // which limits it passes.
-    let misfitBy = { images: false, bytes: false };
+    let misfitBy = { depth: false, images: false, bytes: false };
     const firstMisfit = (depthCap: number, countCap: number, bytesCap: number): number | undefined => {
       let depth = 0, count = 0, bytes = 0;
       for (let i = messages.length - 1; i >= 0; i--) {
@@ -16183,10 +16186,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (b.type !== 'image') continue;
           const size = AutobiographicalStrategy.imageBlockBytes(b);
           misfitBy = {
+            depth: depthCap > 0 && depth > depthCap,
             images: countCap > 0 && count >= countCap,
             bytes: bytesCap > 0 && bytes + size > bytesCap,
           };
-          if ((depthCap > 0 && depth > depthCap) || misfitBy.images || misfitBy.bytes) return m.sequence;
+          if (misfitBy.depth || misfitBy.images || misfitBy.bytes) return m.sequence;
           count++;
           bytes += size;
         }
@@ -16195,13 +16199,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return undefined;
     };
     if (firstMisfit(stripDepth, maxLive, maxLiveBytes) === undefined) return; // no limit binds
-    // A ceiling that moves the watermark strips every later render by it, so
-    // the next render a select returns reports it (reportCeilingHits). A dry
-    // advance is undone, so it leaves nothing.
+    // A ceiling that decides the watermark's move strips every later render
+    // by it, so the next render a select returns reports it
+    // (reportCeilingHits). One the depth limit or a limit the host set also
+    // forces isn't the ceiling's. A dry advance is undone, so it leaves nothing.
     if (!this._dryRunSelect) {
-      const ceilingSet = ceilingSetLimits(this.configuredImageLimits());
-      if (misfitBy.images && ceilingSet.images) this._ceilingMovedWatermark.images = true;
-      if (misfitBy.bytes && ceilingSet.bytes) this._ceilingMovedWatermark.bytes = true;
+      const deciding = ceilingsDeciding(misfitBy, misfitBy.depth, ceilingSetLimits(this.configuredImageLimits()));
+      if (deciding.images) this._ceilingMovedWatermark.images = true;
+      if (deciding.bytes) this._ceilingMovedWatermark.bytes = true;
     }
     const next = firstMisfit(
       stripDepth > 0 ? Math.floor(stripDepth * ratio) : 0,
@@ -16242,7 +16247,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Post-strip token estimate per message index (2026-07-12 tail-starvation
    * fix). Mirrors `applyImageStripping`, with the same limits from
-   * liveImageLimits(), the count and bytes within their request ceilings:
+   * resolvedImageLimits(), the count and bytes within their image ceilings:
    * an image beyond the `maxLiveImages`
    * newest (counted newest-first) or deeper than `imageStripDepthTokens` of
    * raw estimate from the live end renders as a placeholder — so every place
@@ -16256,7 +16261,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected postStripEstimates(store: MessageStoreView): number[] {
     const messages = store.getAll();
     const stripDepth = this.config.imageStripDepthTokens ?? 0;
-    const { images: maxLive, bytes: maxLiveBytes } = this.liveImageLimits().target;
+    const { images: maxLive, bytes: maxLiveBytes } = this.resolvedImageLimits().target;
     // A compile asks for this pass more than once (recent-window scan, then
     // the picker inputs). The listing array is the store's own cached view,
     // so its identity, calibration and the knobs key the memo, the
@@ -16320,21 +16325,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     messages: readonly StoredMessage[]; calibration: number; stripDepth: number; maxLive: number; maxLiveBytes: number; ratio: number | undefined; out: number[];
   } | null = null;
 
-  /** Byte wall default: 20 MiB of base64, under the default request byte
+  /** Byte wall default: 20 MiB of base64, under the default image byte
    *  ceiling (24 MiB), which leaves room under membrane's 28 MiB cap. */
   protected static readonly DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
 
   /** Which ceilings have been said to strip the live window (once each per instance). */
   private readonly ceilingBoundReported = { images: false, bytes: false };
-  /** The ceilings the last selection's render stripped against (applyImageStripping, `sent`). */
+  /** The ceilings that decided an image in the last render select returned (applyImageStripping, `returned`). */
   private _ceilingHitsThisRender = { images: false, bytes: false };
-  /** The ceilings that have moved the hysteresis watermark on this branch, outside a dry run. */
+  /** The ceilings that have decided a move of the hysteresis watermark on this branch, outside a dry run. */
   private readonly _ceilingMovedWatermark = { images: false, bytes: false };
 
-  /** Say once for each ceiling, when a select returns a render that a
-   *  request ceiling, rather than a limit the host set, stripped (see
-   *  ceilingSetLimits), directly or through a watermark it moved on this
-   *  branch while this instance ran. A watermark loaded from the store
+  /** Say once for each ceiling, when a select returns a render in which an
+   *  image ceiling, rather than a limit the host set, decided that an image
+   *  is stripped (see ceilingsDeciding), directly or through a watermark it
+   *  moved on this branch while this instance ran. A watermark loaded from the store
    *  carries no record of what moved it, so a later instance says it when
    *  its own walk next meets the ceiling. A dry select, a preview, an
    *  observer's reconstruction or a refused select says nothing, and the
@@ -16354,7 +16359,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  maxLiveImages it applies none: an explicit undefined erases the default
    *  6 and reads as no limit, which is the host's doing. */
   private imageLimitsDefaulted(): ReadonlySet<string> {
-    const keys = ['maxLiveImages', 'maxLiveImageBytes', 'maxRequestImages', 'maxRequestImageBytes', 'maxCompressionImageBytes'] as const;
+    const keys = ['maxLiveImages', 'maxLiveImageBytes', 'imageCeiling', 'imageByteCeiling', 'maxCompressionImageBytes'] as const;
     return new Set(keys.filter((key) => {
       const source = this.configProvenance[key];
       if (source === undefined || source === 'library-default') return true;
@@ -16364,30 +16369,39 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** The live-image limits as configured, with the defaults where unset. */
   private configuredImageLimits(): {
-    maxLiveImages: number; maxLiveImageBytes: number; maxRequestImages: number; maxRequestImageBytes: number;
+    maxLiveImages: number; maxLiveImageBytes: number; imageCeiling: number; imageByteCeiling: number;
   } {
     return {
       maxLiveImages: this.config.maxLiveImages ?? 0,
       maxLiveImageBytes: this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES,
-      maxRequestImages: this.config.maxRequestImages ?? DEFAULT_MAX_REQUEST_IMAGES,
-      maxRequestImageBytes: this.config.maxRequestImageBytes ?? DEFAULT_MAX_REQUEST_IMAGE_BYTES,
+      imageCeiling: this.config.imageCeiling ?? DEFAULT_IMAGE_CEILING,
+      imageByteCeiling: this.config.imageByteCeiling ?? DEFAULT_IMAGE_BYTE_CEILING,
     };
   }
 
   /**
-   * The live window's count and byte limits, clamped to the request
-   * ceilings, and the ceilings themselves (see ContextStrategy.liveImageLimits).
-   * The strip, the watermark and the post-strip estimates all read their
-   * limits here, so they can't disagree about them.
+   * The live window's count and byte limits, kept within the image
+   * ceilings, and the ceilings themselves. The strip, the watermark, the
+   * post-strip estimates and a compression prompt all read their limits
+   * here, so they can't disagree about them.
    */
-  liveImageLimits(): LiveImageLimits {
+  private resolvedImageLimits(): ResolvedImageLimits {
     return resolveLiveImageLimits(this.configuredImageLimits());
+  }
+
+  /**
+   * The image ceilings (see ContextStrategy.imageCeilings), as the window
+   * applies them: a malformed one at its default, a fraction floored.
+   */
+  imageCeilings(): ImageCeilings {
+    const { ceiling } = this.resolvedImageLimits();
+    return { imageCeiling: ceiling.images, imageByteCeiling: ceiling.bytes };
   }
 
   /** Whether the image limits' warning has been said (once per instance). */
   private imageLimitsWarningReported = false;
 
-  /** One line when a configured image limit sits above its request ceiling,
+  /** One line when a configured image limit sits above its image ceiling,
    *  or a ceiling is malformed and takes its default, so an operator sees why
    *  the window or a compression prompt keeps fewer images than they set. */
   private reportImageLimitsWarningOnce(): void {
@@ -16441,8 +16455,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected prepareCompressionRequest(request: NormalizedRequest): CompressionPreparation {
     const prepared = { ...request, messages: request.messages.map(message => ({ ...message })) };
     const serializedMediaReplacements = this.stripSerializedCompressionMedia(prepared.messages);
-    // A compression prompt is a request too: at most the request ceilings.
-    const { ceiling } = this.liveImageLimits();
+    // A compression prompt carries at most the image ceilings.
+    const { ceiling } = this.resolvedImageLimits();
     const imageBudgetBytes = clampToCeiling(
       this.config.maxCompressionImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
       ceiling.bytes,
@@ -16496,7 +16510,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const mib = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)}MiB`;
       const limits = [
         ...(counts.imageBudgetBytes > 0 ? [`the ${mib(counts.imageBudgetBytes)} inline image budget`] : []),
-        ...(counts.imageCountCap > 0 ? [`the ${counts.imageCountCap}-image request ceiling`] : []),
+        ...(counts.imageCountCap > 0 ? [`the ${counts.imageCountCap}-image ceiling`] : []),
       ].join(' and ');
       this.diag.error(
         `[autobiographical] compression prompt: replaced ${counts.imageReplacements} image(s) with placeholders ` +
@@ -16723,7 +16737,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Cap inline image bytes in a COMPRESSION prompt (2026-07-12), and with
-   * `capImages` their number (2026-10-19, `maxRequestImages`). The main
+   * `capImages` their number (2026-10-19, `imageCeiling`). The main
    * window enforces `maxLiveImageBytes` through the strip policy; the
    * summarizer's raw-chunk replay had no such wall and leaned on membrane's
    * byte shed instead — which is a transport backstop, not a policy owner
