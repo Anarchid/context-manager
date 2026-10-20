@@ -145,6 +145,10 @@ function growthReplay(opts: {
   target?: number; window?: number;
   /** A turn to re-plan on unchanged inputs, after its own plan. */
   replanAt?: number;
+  /** List the oldest L1 directly under its L4, dropped from its L2, so its
+   *  lineage skips L2 and L3: a store the load repair keeps, since the
+   *  pointer names a summary above that lists it (R4-2). */
+  oldestL1UnderL4?: boolean;
 }) {
   const ch = new MockChronicle({ mergeThreshold: 6, recallPairTokens: 100 });
   let n = 0;
@@ -157,6 +161,14 @@ function growthReplay(opts: {
   };
   for (let i = 0; i < 1296; i++) add();
   produce();
+  if (opts.oldestL1UnderL4) {
+    const l1 = ch.summaries.get(ch.chunks[0]!.l1Id!)!;
+    const l2 = ch.summaries.get(l1.parentId!)!;
+    const l4 = ch.summaries.get(ch.summaries.get(l2.parentId!)!.parentId!)!;
+    l2.sourceIds = l2.sourceIds.filter((id) => id !== l1.id);
+    l4.sourceIds = [...l4.sourceIds, l1.id];
+    l1.parentId = l4.id;
+  }
   const TARGET = opts.target ?? 1600, W = opts.window ?? 2150;
   let previous = new Map<ChunkId, number>();
   let prevLayout: ReturnType<typeof renderLayout> | null = null;
@@ -171,6 +183,10 @@ function growthReplay(opts: {
       headTokens: 0, tailTokens: 300, headChunkIds: new Set(), tailChunkIds: tail,
     };
     const tree = new SummaryTree(inputs);
+    if (opts.oldestL1UnderL4 && t === 0) {
+      const levels = [1, 2, 3, 4].map((k) => tree.ancestorAt('c-00000', k)?.level ?? null);
+      assert.deepEqual(levels, [1, null, null, 4], 'premise: the oldest chunk\'s lineage skips L2 and L3');
+    }
     let now = 0; for (const c of inputs.chunks) if (c.sequence > now) now = c.sequence;
     const params = (prev: ReadonlyMap<ChunkId, number>) => ({
       previous: prev, foldAtTokens: W, expandAtTokens: TARGET, targetTokens: TARGET, windowTokens: W,
@@ -227,6 +243,23 @@ test('carried growth with a pin-max-level: the seeded ideal never raises a deep 
   const pinned = growthReplay({ turns: 400, pinCaps: new Map([['c-00040', 2]]) });
   assert.ok(pinned.folds >= 2, `premise: crossed W at least twice (folds=${pinned.folds})`);
   assert.equal(pinned.deepRaises, 0, `${pinned.deepRaises} leaves were raised from L3 or deeper`);
+});
+
+/**
+ * R4-2: an older chunk is weighed only against younger chunks at or above the
+ * next level it can fold to. The oldest L1 here is listed directly by its L4,
+ * so it can't fold to L2 or L3. Weighed against every younger L2 and L3, it
+ * lowered the whole younger band on every seeded compile, and when the hold's
+ * quality-gap check failed the plan took that ideal and raised the youngest
+ * L3 group: 432 leaves over 400 turns. Without that, the store re-reads what
+ * the same stream does on a clean store.
+ */
+test('carried growth: an L1 whose lineage skips to its L4 lowers nothing younger, so the replay re-reads what a clean store does (R4-2)', () => {
+  const skip = growthReplay({ turns: 400, oldestL1UnderL4: true });
+  const clean = growthReplay({ turns: 400 });
+  assert.ok(skip.folds >= 2, `premise: crossed W at least twice (folds=${skip.folds})`);
+  assert.equal(skip.deepRaises, 0, `${skip.deepRaises} leaves were raised from L3 or deeper`);
+  assert.equal(skip.totalPert, clean.totalPert, `re-read: ${skip.totalPert} on the skipping store, ${clean.totalPert} on the clean one`);
 });
 
 /**

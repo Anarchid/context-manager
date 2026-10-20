@@ -1204,7 +1204,6 @@ function planUnreported(
   const seeded = (p.seedFromCarried ?? true) && carriedNonEmpty;
   if (seeded) {
     idealBase = new Map(carried);
-    let olderMin = Number.POSITIVE_INFINITY;
     // Per-node memo for the pin-cap scan below: the verdict depends only on
     // the node, and every member chunk would otherwise rescan the node's
     // leaves (O(N·groupSize) per compile on a 36k-message store).
@@ -1248,27 +1247,41 @@ function planUnreported(
       }
       return cut;
     };
+    // An older chunk is evidence that a younger, deeper chunk is inverted
+    // only if it could fold deeper without passing the younger chunk's level:
+    // it is weighed against younger chunks at or above `next`, the lowest
+    // level above its own where a summary lists it and its group can render. olderMinAt[k] is
+    // the lowest carried level among older unprotected chunks whose `next` is
+    // k. On a nested tree `next` is the chunk's own level plus one, and a
+    // younger chunk deeper than any older chunk is lowered to the lowest such
+    // older level. A lineage can skip levels for a chunk, though: an L1
+    // listed directly by an L4 and dropped from its L2 can't fold to L2 or L3,
+    // and weighed against every younger L2 and L3 it lowered the whole younger
+    // band on every seeded compile (#156 R4-2). An older chunk already at the
+    // deepest level its GROUP can render at has no `next`, so it is no
+    // evidence at all (#156 R2-1: a parentless L1 beside an L3, or a
+    // pin-max-level on a group-mate, otherwise re-lowered the band on every
+    // compile, a two-cycle re-reading the whole layout, and the deep-band
+    // flap back under a pin). A level counts only where its summary lists the
+    // chunk (R3-2), which `ancestorAt` checks, and where no pin-max-level
+    // among the group's foldable leaves caps it (`canRenderAt`).
+    const olderMinAt: number[] = [];
     for (const c of ordered) { // oldest first
       if (p.rawZone.has(c.id) || immovable.has(c.id)) continue;
       const lvl = carried.get(c.id) ?? 0;
-      if (lvl > olderMin && !boundaryCut(c.id, lvl)) idealBase.set(c.id, olderMin);
-      // An older chunk already at the deepest level its GROUP can render at
-      // cannot be folded deeper, so it is no evidence that a younger, deeper
-      // chunk is inverted (#156 R2-1: a parentless L1 beside an L3, or a
-      // pin-max-level on a group-mate, otherwise re-lowered the band on every
-      // compile — a two-cycle re-reading the whole layout, and the deep-band
-      // flap back under a pin). "Deepest" is measured over the group the way
-      // `groupEligible` measures it with shape caps ignored: the lineage's
-      // top, capped by any pin-max-level among the group's foldable leaves.
-      // A level counts only where its summary lists the chunk (R3-2), which
-      // `ancestorAt` checks: a lineage summary that doesn't list the chunk
-      // answers no node there, since the chunk can't render through it.
-      let deepest = 0;
-      for (let k = tree.maxLevel(c.id); k >= 1 && deepest === 0; k--) {
-        const node = tree.ancestorAt(c.id, k);
-        if (node && canRenderAt(node, k)) deepest = k;
+      let olderMin = Number.POSITIVE_INFINITY;
+      for (let k = 1; k <= lvl && k < olderMinAt.length; k++) {
+        const m = olderMinAt[k];
+        if (m !== undefined && m < olderMin) olderMin = m;
       }
-      if (lvl < olderMin && lvl < deepest) olderMin = lvl;
+      if (lvl > olderMin && !boundaryCut(c.id, lvl)) idealBase.set(c.id, olderMin);
+      let next = 0;
+      for (let k = lvl + 1, top = tree.maxLevel(c.id); k <= top; k++) {
+        const node = tree.ancestorAt(c.id, k);
+        if (node && canRenderAt(node, k)) { next = k; break; }
+      }
+      const prev = olderMinAt[next];
+      if (next > 0 && (prev === undefined || lvl < prev)) olderMinAt[next] = lvl;
     }
   }
 
