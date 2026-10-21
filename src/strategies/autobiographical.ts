@@ -163,6 +163,104 @@ function compressionFailureClass(error: unknown): string {
   return typeof status === 'number' ? `${type}:${status}` : type;
 }
 
+/** A thrown value's message, always a string, for a health report, which mustn't throw itself. */
+function failureMessage(thrown: unknown): string {
+  try {
+    if (thrown instanceof Error && typeof thrown.message === 'string' && thrown.message) return thrown.message;
+    return String(thrown);
+  } catch {
+    return 'an error that could not be described';
+  }
+}
+
+/** A thrown value's text on one line, so a line that quotes it stays one line. */
+function oneLine(text: string): string {
+  return text.replace(/\s*[\r\n]+\s*/g, ' ');
+}
+
+/** The most of a thrown value's text that an operator message quotes as its cause. */
+const CAUSE_MAX_CHARS = 180;
+
+/**
+ * A thrown value's text as an operator message's cause: on one line, and cut
+ * to CAUSE_MAX_CHARS with an ellipsis, never inside a surrogate pair, so the
+ * lines after it survive a cut at 500 characters. The whole value is still
+ * in the log line that names the failure, and an attempt's error keeps it as
+ * its `cause`.
+ */
+function causeText(thrown: unknown): string {
+  const text = oneLine(failureMessage(thrown));
+  if (text.length <= CAUSE_MAX_CHARS) return text;
+  let end = CAUSE_MAX_CHARS - 1;
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end--;
+  return `${text.slice(0, end)}…`;
+}
+
+/**
+ * What an operator reads when the store can't read the compression quarantine
+ * ledger: the debt report's `error`, and the error an attempt that would call
+ * the model stops with, since it reads the ledger first. A line saying what
+ * happened, then its cause, its effect and its fix, so a surface that shows it
+ * whole breaks it where a reader looks. With its cause cut to 180
+ * characters (causeText) it stays under 500, where connectome-host's status
+ * notices and agent-framework's alert webhook cut a message.
+ */
+function compressionQuarantineUnreadableMessage(cause: unknown): string {
+  return [
+    'Compression of new conversation has stalled.',
+    `Cause: the store couldn't read this agent's compression quarantine ledger (${causeText(cause)}).`,
+    'Effect: chunks that need the model go unsummarized, so in time its context fills and its turns fail until compression catches up.',
+    'Fix: fix what the cause names; compression then resumes by itself.',
+  ].join('\n');
+}
+
+/**
+ * What an operator reads when the debt report itself fails. Outside the
+ * ledger it reads only the strategy's own state and the options it was
+ * given, so a throw there is a fault in context-manager or in those options.
+ * How to report it is the host's to say.
+ */
+function compressionDebtReportFailedMessage(cause: unknown): string {
+  return [
+    'The compression debt report failed.',
+    `Cause: ${causeText(cause)}`,
+    "Effect: the report can't say whether compression is keeping up. Compression itself may be running normally.",
+    'Fix: this points to a fault in context-manager or in the options it was given. Report it.',
+  ].join('\n');
+}
+
+/**
+ * A compression attempt that couldn't read the compression quarantine ledger.
+ * An attempt that would call the model reads it first, so while it can't be
+ * read each such attempt stops there, and the error says so in the words a
+ * host's report of a failed tick shows an operator. The read's own failure is
+ * its `cause`.
+ */
+class CompressionQuarantineUnreadableError extends Error {
+  constructor(cause: unknown) {
+    super(compressionQuarantineUnreadableMessage(cause), { cause });
+    this.name = 'CompressionQuarantineUnreadableError';
+  }
+}
+
+/**
+ * Whether a merge group still stands as it was recorded: every source present
+ * and unparented. The sweep removes a merge-quarantine record once it
+ * doesn't, the debt report counts a topology refusal only while it does, and
+ * a record neither holds its sources nor is retried or cleared by a valid
+ * merge of its group while it doesn't.
+ */
+function mergeRecordStands(
+  record: Pick<MergeQuarantineRecord, 'sourceIds'>,
+  summaryById: (id: string) => SummaryEntry | undefined,
+): boolean {
+  return record.sourceIds.every((id) => {
+    const summary = summaryById(id);
+    return summary !== undefined && !getSummaryParentId(summary);
+  });
+}
+
 /** A no-call refusal by the caller's provider admission: nothing failed. */
 function isAdmissionDeferral(error: unknown): boolean {
   return (error as { providerAdmission?: unknown } | null)?.providerAdmission === 'deferred';
@@ -339,15 +437,14 @@ export function boundFailureLogText(text: string, max = COMPRESSION_FAILURE_LOG_
 }
 
 /**
- * A bounded string describing a compression failure (one line unless the
- * message itself has newlines), for logs that would otherwise print the
- * error object. A provider error carries the whole
+ * A bounded string describing a compression failure, on one line, for logs
+ * that would otherwise print the error object. A provider error carries the whole
  * request that failed (`rawRequest`); printing the object prints it, and a
  * provider can echo the request in the message too. Every part is bounded.
  */
 function describeCompressionFailure(error: unknown): string {
   try {
-    if (!(error instanceof Error)) return boundFailureLogText(String(error));
+    if (!(error instanceof Error)) return boundFailureLogText(oneLine(String(error)));
     const fields = error as Error & { httpStatus?: unknown; providerErrorCode?: unknown; retryable?: unknown };
     const type = compressionErrorType(error);
     const classification = [
@@ -358,7 +455,7 @@ function describeCompressionFailure(error: unknown): string {
     ].filter((part): part is string => part !== undefined);
     const name = boundFailureLogText(String(error.name), 128);
     const head = classification.length > 0 ? `${name} (${classification.join(', ')})` : name;
-    return boundFailureLogText(`${head}: ${boundFailureLogText(String(error.message))}`);
+    return boundFailureLogText(`${head}: ${boundFailureLogText(oneLine(String(error.message)))}`);
   } catch {
     return '[failure could not be described]';
   }
@@ -2042,8 +2139,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Branch-scoped projection of the append-only quarantine event ledger. */
   private compressionRefusalQuarantine = new Map<string, ActiveCompressionQuarantine>();
-  /** Incremented on every initialize, including every ContextManager branch switch. */
+  /** Advanced by endGeneration(): on every initialize, every ContextManager branch switch included, and at detach(). */
   private compressionBranchGeneration = 0;
+  /** The controller of each provider call out (callProvider), until the call settles. */
+  private readonly callsOut = new Set<AbortController>();
   /**
    * Branch whose derived mirrors completed initialization. This is deliberately
    * absent while initialize() is running: partially loaded summaries/chunks/
@@ -2540,12 +2639,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // interval, not continue using the previously loaded branch.
     this.loadedBranchIdentity = null;
     this.initializingBranchIdentity = null;
-    this.compressionBranchGeneration++;
+    this.endGeneration();
     this.clearBranchMirrors();
     // Damage in the quarantine is named once per load: this load's reads name
-    // what they find, on whatever store, namespace and branch it binds to.
+    // what they find, on whatever store, namespace and branch it binds to. So
+    // is a debt report's failure: a failure that lasts across a branch switch
+    // the manager makes (its switchBranch, a fork, setStrategy) is logged
+    // again for the new load, and the new load logs no recovery from a
+    // failure only an earlier one met. A host that moves the store's branch
+    // itself leaves this load in place until the manager initializes it again.
     this.namedDroppedQuarantineKeys.clear();
     this.namedUnlistedQuarantineState.clear();
+    this.compressionDebtFailureLogged = null;
 
     // Bind to the chronicle store + namespace for persistent strategy state.
     this.store = ctx.store;
@@ -2649,15 +2754,64 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * The manager is done with this strategy (ContextStrategy.detach). A new
    * generation fails every compression and merge still in flight at its next
    * isCompressionBranchCurrent() check, so each discards its result instead
-   * of writing. The loaded identity no longer matches either, so each
-   * entrypoint that requires the loaded branch throws, getSummary() and
-   * getStats() among them, and a drain tick already scheduled does nothing.
-   * None of these checks reads the store, which the manager may close next.
-   * The health reads, such as getCompressionQuarantineStatus(), still never
-   * throw. initialize() starts afresh.
+   * of writing, and ends the provider calls they have out (endGeneration).
+   * The loaded identity no longer matches either, so each entrypoint that
+   * requires the loaded branch throws, getSummary() and getStats() among
+   * them, and a drain tick already scheduled does nothing. None of these
+   * checks reads the store, which the manager may close next. The health
+   * reads, such as getCompressionQuarantineStatus(), still never throw.
+   * initialize() starts afresh.
    */
   detach(): void {
+    this.endGeneration();
+  }
+
+  /**
+   * Start a new generation, for initialize() and detach(). The work of the
+   * one that ends fails its next currency check, and each provider call it
+   * has out is cancelled. Membrane rejects the call at once, during the call
+   * or in its own wait before a retry, and retries nothing. A host's
+   * beforeRequest hook that is running then, or a provider client's wait
+   * inside its own retry, as @anthropic-ai/sdk 0.52.0 waits with no signal,
+   * isn't interrupted: the call ends when that returns, sending nothing more.
+   */
+  private endGeneration(): void {
     this.compressionBranchGeneration++;
+    for (const call of this.callsOut) call.abort();
+  }
+
+  /**
+   * `membrane.complete()` for the current generation's work, with a
+   * controller of its own kept in callsOut while the call is out, so that
+   * the generation's end cancels it. Each site checks its work's currency
+   * just before, with nothing awaited between, so the generation is the
+   * work's own.
+   *
+   * A controller per call, not one signal per generation: a generation lasts
+   * as long as the session, membrane hands the caller's signal to the adapter
+   * as it is when no progress deadline is set, and @anthropic-ai/sdk 0.52.0
+   * adds an abort listener to that signal for each request and never removes
+   * it (fetchWithTimeout). In a probe, one shared signal held 15 listeners
+   * after 15 settled requests, where each per-call signal held one, which
+   * goes with its call.
+   *
+   * A host can end a call too, by a signal it combines with this one in the
+   * membrane it handed in. Its cancellation comes back as itself, and each
+   * site takes it as compressionFailureKind() does, as an 'abort', once the
+   * work's currency check passes: nothing counts it, a compression's or
+   * merge's work stays queued, and a transition summary's caller gets the
+   * cancellation. That check is what tells it from the generation's own
+   * cancellation, since endGeneration() ends the generation before it aborts
+   * the calls.
+   */
+  private async callProvider(membrane: Membrane, request: NormalizedRequest): Promise<NormalizedResponse> {
+    const call = new AbortController();
+    this.callsOut.add(call);
+    try {
+      return await membrane.complete(request, { formatter: this.nativeFormatter, signal: call.signal });
+    } finally {
+      this.callsOut.delete(call);
+    }
   }
 
   /** Drop every branch-derived mirror without touching durable state. */
@@ -4854,13 +5008,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.store.compactState(this.compressionRefusalQuarantineLedgerStateId);
   }
 
-  /** How many quarantine records exist, for a health read that needs only the count. Never throws. */
-  private compressionQuarantineRecordCount(): number {
-    if (!this.store) return 0;
+  /** How many quarantine records exist, for a health read that needs only the
+   *  count, or what kept the ledger from being read. Never throws. */
+  private compressionQuarantineRecordCount(): { count: number } | { error: unknown } {
+    if (!this.store) return { count: 0 };
     try {
-      return this.readCompressionQuarantineProjection().size;
-    } catch {
-      return 0;
+      return { count: this.readCompressionQuarantineProjection().size };
+    } catch (error) {
+      return { error };
     }
   }
 
@@ -6006,9 +6161,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const key = sha256Json(merge.sourceIds);
     const record = this.mergeQuarantine.get(key);
     if (record) {
-      const sources = merge.sourceIds.map((id) => this.summaryById(id));
-      if (sources.some((s) => s === undefined || getSummaryParentId(s))) return;
-      if (this.mergeTopologyProblem(merge.level, sources as SummaryEntry[], this.mergePositionIndex()) !== null) return;
+      if (!mergeRecordStands(merge, (id) => this.summaryById(id))) return;
+      const sources = merge.sourceIds.map((id) => this.summaryById(id)!);
+      if (this.mergeTopologyProblem(merge.level, sources, this.mergePositionIndex()) !== null) return;
       this.mergeQuarantine.delete(key);
       this.persistMergeQuarantine();
       this.diag.warn(`[merge-quarantine] cleared topology record key=${key.slice(0, 12)}: its group is a valid merge again`);
@@ -6055,12 +6210,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected mergeRecordHolds(record: MergeQuarantineRecord, position: ReadonlyMap<MessageId, number>): boolean {
     if (record.lastOutcome === 'topology_violation') return false;
-    const sources: SummaryEntry[] = [];
-    for (const id of record.sourceIds) {
-      const s = this.summaryById(id);
-      if (s === undefined || getSummaryParentId(s)) return false;
-      sources.push(s);
-    }
+    if (!mergeRecordStands(record, (id) => this.summaryById(id))) return false;
+    const sources = record.sourceIds.map((id) => this.summaryById(id)!);
     return this.mergeTopologyProblem(record.level, sources, position) === null;
   }
 
@@ -6083,10 +6234,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // one-message L1s days later) sat next to the open frontier and merged with
   // it, producing L2/L3s that mix the chronicle's opening with weeks-later
   // material. The demand path (#95) never checked adjacency at all. Every
-  // grouping decision and the mint itself now use one index: chunk-owned
-  // messages, positioned by the store listing. Messages no chunk owns (head,
-  // never-chunked) occupy no position, so they never split a run; a hole is
-  // always another live representation.
+  // grouping decision and the mint itself now use one index
+  // (mergePositionIndex): every message of the store listing at its place.
+  // A message no chunk owns renders raw at its own place, between the
+  // summaries around it: a raw pin, a message an unpin freed before the
+  // chunker reaches it, a head window a reset left mid-stream. A summary
+  // across one would hold history from both sides of a message shown between
+  // them, and kv-unified's canonical forest, which has a leaf for every listed
+  // message, rejects such a node ("owns non-contiguous live leaves") at every
+  // compile unless it treeifies or preserves gap-bearing summaries. So such a
+  // message keeps the runs on its two sides apart; at the ends of the store
+  // (the head window before every chunk, the never-chunked frontier) it
+  // splits nothing.
+  // The load-time audit judges ownership alone (ownershipPositionIndex): a
+  // node minted across such a message before this rule has whole ownership,
+  // no owned message between its sources missing, so it stays as it stands,
+  // though kv-unified's forest rejects it.
   // ===========================================================================
 
   /** Store position per message id, refreshed from every listing we see. */
@@ -6095,8 +6258,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _storeOrderSource: ReadonlyArray<{ id: MessageId }> = [];
   /** Load-time audit result (see assertStoreTopology). */
   private topologyViolations: TopologyViolation[] = [];
-  /** Merges refused by executeMerge because they would have minted a crossed node. */
-  private topologyRefusals = 0;
 
   /** `staticSalience` per position of `messages`, kept across appends (the
    *  earlier positions hold the same message objects, so the same values). */
@@ -6149,24 +6310,36 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Position per owned message id (chunk records ∪ live L1 sourceIds): store
-   * order where known, then any owned id the last listing did not contain
-   * (messages appended since) after it, in record order. Without any listing
-   * (hosts that drive the grouping without a store view) this degrades to
-   * record order.
+   * Position per message for merge grouping: every message of the last
+   * listing at its place, whether a chunk owns it or not, then any chunk
+   * member that listing did not contain (appended since) after it, in record
+   * order. Two summaries are adjacent exactly when no listed message stands
+   * between their sources. Without any listing (hosts that drive the
+   * grouping without a store view) this degrades to record order, as
+   * ownershipPositionIndex does.
    */
   protected mergePositionIndex(): Map<MessageId, number> {
-    // Ownership authority = chunk members ∪ live L1 sourceIds (an L1 is
-    // coverage even where its chunk record is missing; see ownedMessageIds).
-    const chunkMember = new Set<MessageId>();
-    const members: MessageId[] = [];
-    for (const ch of this.chunks) for (const m of ch.messages) if (!chunkMember.has(m.id)) { chunkMember.add(m.id); members.push(m.id); }
-    const seen = new Set(chunkMember);
-    for (const id of this.liveL1Ids()) {
-      const s = this.summaryById(id);
-      if (!s) continue;
-      for (const leaf of s.sourceIds) if (!seen.has(leaf)) { seen.add(leaf); members.push(leaf); }
-    }
+    const { members, chunkMember } = this.ownedMembers();
+    const order = this._storeOrder;
+    if (order.size === 0) return new Map(members.map((id, i) => [id, i] as const));
+    const index = new Map(order);
+    let position = this._storeOrderSource.length;
+    for (const id of members) if (!index.has(id) && chunkMember.has(id)) index.set(id, position++);
+    return index;
+  }
+
+  /**
+   * Position per owned message id alone (chunk records ∪ live L1 sourceIds):
+   * store order where known, then any chunk member the last listing did not
+   * contain after it, in record order. The load-time audit's index
+   * (auditStoreTopology), which judges whether each summary's ownership is
+   * whole. A summary minted across a message no chunk owns, before merges
+   * were kept apart at one, still has whole ownership (no owned message
+   * between its sources is missing), so the audit leaves it as it stands,
+   * though kv-unified's forest finds its live leaves non-contiguous.
+   */
+  protected ownershipPositionIndex(): Map<MessageId, number> {
+    const { members, chunkMember } = this.ownedMembers();
     const order = this._storeOrder;
     if (order.size === 0) return new Map(members.map((id, i) => [id, i] as const));
     const known = members.filter((id) => order.has(id)).sort((a, b) => order.get(a)! - order.get(b)!);
@@ -6178,6 +6351,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // hidden (viewFilter) or pruned: it occupies no position at all.
     for (const id of members) if (!index.has(id) && chunkMember.has(id)) index.set(id, position++);
     return index;
+  }
+
+  /** Owned message ids, chunk members first, then live L1 sources: ownership
+   *  authority is chunk members ∪ live L1 sourceIds (an L1 is coverage even
+   *  where its chunk record is missing; see ownedMessageIds). */
+  private ownedMembers(): { members: MessageId[]; chunkMember: Set<MessageId> } {
+    const chunkMember = new Set<MessageId>();
+    const members: MessageId[] = [];
+    for (const ch of this.chunks) for (const m of ch.messages) if (!chunkMember.has(m.id)) { chunkMember.add(m.id); members.push(m.id); }
+    const seen = new Set(chunkMember);
+    for (const id of this.liveL1Ids()) {
+      const s = this.summaryById(id);
+      if (!s) continue;
+      for (const leaf of s.sourceIds) if (!seen.has(leaf)) { seen.add(leaf); members.push(leaf); }
+    }
+    return { members, chunkMember };
   }
 
   /** First live L1 per message id (the fold-path fallback in selectAdaptive),
@@ -6262,7 +6451,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const unplaced = sources.filter((s) =>
       position.get(s.sourceRange.first) === undefined || position.get(s.sourceRange.last) === undefined);
     if (unplaced.length > 0) {
-      return `source position unresolved (pruned or unowned range endpoints): ${unplaced.map((s) => s.id).join(',')}`;
+      return `source position unresolved (range endpoints neither in the store listing nor owned by a chunk): ${unplaced.map((s) => s.id).join(',')}`;
     }
     const runs = this.contiguousSourceRuns(sources, position);
     if (runs.length !== 1) {
@@ -6280,7 +6469,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  operator clears it. */
   protected refuseCrossedMerge(targetLevel: SummaryLevel, sourceIds: string[], reason: string): void {
     this.requireBranchMutation('refuseCrossedMerge');
-    this.topologyRefusals++;
     const head = this.mergeQueue[0];
     const entry = head && head.sourceIds === sourceIds ? head : { level: targetLevel, sourceIds, attempts: 0 };
     if (entry === head) this.dequeueMerge();
@@ -6317,7 +6505,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   auditStoreTopology(messages: ReadonlyArray<{ id: MessageId }>): TopologyViolation[] {
     this.refreshStoreOrder(messages);
-    const position = this.mergePositionIndex();
+    const position = this.ownershipPositionIndex();
     if (position.size === 0) return [];
     const byPosition: MessageId[] = [];
     for (const [id, p] of position) byPosition[p] = id;
@@ -6600,11 +6788,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     for (const s of this.summaries) byId.set(s.id, s);
     let swept = 0;
     for (const [key, record] of [...this.mergeQuarantine]) {
-      const live = record.sourceIds.filter((id) => {
-        const s = byId.get(id);
-        return s !== undefined && !getSummaryParentId(s);
-      });
-      if (live.length !== record.sourceIds.length) {
+      if (!mergeRecordStands(record, (id) => byId.get(id))) {
         this.mergeQuarantine.delete(key);
         swept++;
       }
@@ -6663,10 +6847,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *    it up.
    *
    *  - `level >= 2`: the picker has asked for an L_n covering a contiguous
-   *    range. We gather unmerged L_{n-1} summaries whose source ranges
-   *    fall within that range (de-duplicated against entries already in
-   *    `mergeQueue`) and enqueue a single merge over them. The merge fires
-   *    on the next `tick()`.
+   *    range. We gather unmerged L_{n-1} summaries by
+   *    `enqueueMergeForRange`'s rule (a source counts when either of its
+   *    ends lies in the range; with a range end that has no position, every
+   *    source counts), de-duplicated against entries already in
+   *    `mergeQueue`, and enqueue a merge over the first `mergeThreshold` of
+   *    their longest contiguous run. The merge fires on the next `tick()`.
    *
    * The handler is conservative: it never enqueues a singleton or empty
    * merge, and it never re-enqueues an id that's already pending. That
@@ -6770,7 +6956,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Enqueue an L_{targetLevel} merge over unmerged L_{targetLevel-1}
-   * summaries whose source ranges fall within [firstMsgId..lastMsgId].
+   * summaries whose source ranges reach into [firstMsgId..lastMsgId]: a
+   * source counts when either of its ends lies in the range. With a range
+   * end neither in the store listing nor owned by a chunk, which has no
+   * position, every source counts.
    * No-op if fewer than 2 viable sources are available (a singleton merge
    * would just rename a summary without consolidating).
    */
@@ -6790,8 +6979,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
     }
 
-    // Position per chunk-owned message id in store order (see
-    // mergePositionIndex), for "within range" and contiguity tests.
+    // Position per listed message in store order (see mergePositionIndex),
+    // for "within range" and contiguity tests.
     const messageOrder = this.mergePositionIndex();
     const firstSeq = messageOrder.get(firstMsgId);
     const lastSeq = messageOrder.get(lastMsgId);
@@ -6913,8 +7102,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (`setTimeout` 0), so one chunk's compression doesn't block the
    * scheduling of the next. No caller awaits that tick, so nothing it throws
    * leaves the timer: a tick that comes due on a closed store doesn't run,
-   * and whatever a tick throws is logged. A tick already running when the
-   * store closes ends in the drain's own `.catch`, which logs it.
+   * and what a tick throws is logged, unless it is a host's withdrawal or
+   * cancellation (compressionFailureKind's 'abort'), which ends the drain
+   * quietly. A tick already running when the store closes ends in the
+   * drain's own `.catch`, which does the same.
    *
    * Stops if a tick fails to make progress (no queue item consumed, by
    * `_drainProgress`) — guards against runaway recursion when tick is a
@@ -6976,7 +7167,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // timer: an uncaught exception ends the host's process. A tick that
           // comes due on a store the host has closed, as its stop() closes
           // one, doesn't run, and the drain ends quietly, as on a withdrawal.
-          // Whatever the tick throws is logged, as below.
+          // What the tick throws is logged, as below, unless it is a host's
+          // withdrawal or cancellation.
           try {
             if (this.store?.isClosed()) return;
             if (this.loadedBranchIdentity !== drainIdentity || !this.isLoadedBranchCurrent()) return;
@@ -6987,8 +7179,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }, 0);
       })
       .catch((err) => {
-        // A host's withdrawal stops the drain quietly: the host asked for it.
-        if (isCompressionWithdrawn(err)) return;
+        // A host's withdrawal, or its cancellation of a call, stops the drain
+        // quietly: the host asked for it.
+        if (compressionFailureKind(err) === 'abort') return;
         this.diag.error(`AutobiographicalStrategy: speculative-drain error: ${describeCompressionFailure(err)}`);
       });
   }
@@ -7326,9 +7519,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.noteCompressionLanded(mergeMembrane, mergeModel);
         }
       } catch (error) {
-        // Withdrawn by the host: no attempt, no streak; the merge stays at the
-        // head of the queue for the next tick.
-        if (isCompressionWithdrawn(error)) throw error;
+        // Withdrawn by the host, or its call cancelled by the host: no
+        // attempt, no streak; the merge stays at the head of the queue for
+        // the next tick.
+        if (compressionFailureKind(error) === 'abort') throw error;
         // Terminal-disposition rejection: the LLM answered, but with a
         // refusal / truncation / tool call / empty — bounded-retry policy,
         // not a crash. Anything else (429, network, timeout) keeps the
@@ -7629,6 +7823,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
   }
 
+  /** The failure getCompressionDebt() last logged on this load, so one that lasts across polls logs once. */
+  private compressionDebtFailureLogged: string | null = null;
+
   /**
    * Compression-debt reduction — the single authority for "is this
    * resident's memory organ keeping up." Consumed by /healthz (fleet-watch
@@ -7644,50 +7841,85 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *                uncompressed chunk has waited > 1h.
    * - `critical` — the oldest pending chunk has waited > 6h AND there is a
    *                quarantine or a 5+ chunk backlog: the organ is not
-   *                recovering on its own; an operator is needed.
+   *                recovering on its own; an operator is needed. Also while
+   *                the load-time audit found crossed ownership, or a merge
+   *                group stands in the merge quarantine because merging it
+   *                would have minted a crossed node (`topologyRefusals`).
+   * - `unknown`  — the report couldn't read what decides its state.
+   *
+   * A report that couldn't read something says in `error` what happened,
+   * what it means and what to do, for the operator who reads it: a line
+   * saying what happened, then `Cause:`, `Effect:` and `Fix:` lines.
+   * `failure` names which read failed, and each count it couldn't compute is
+   * `null`, never 0.
+   *
+   * When only the compression quarantine ledger can't be read (`failure`
+   * `quarantine-ledger`), `compressionQuarantineCount` is `null` and the rest
+   * is reported. The state is then worked out twice, as if the ledger held no
+   * record and as if it held one, since the rules only ask whether there is
+   * any quarantine. Where both give the same state, that is the state, and
+   * where they differ it is `unknown`. So crossed ownership still reads
+   * `critical`, and a chunk that has waited between 1h and 6h still reads
+   * `degraded`. Compression of new conversation stalls then too: each
+   * attempt that would call the model reads the ledger first, and stops
+   * there with the same words.
+   *
+   * When anything else fails (`failure` `report`), the state is `unknown` and
+   * every count is `null`. Outside the ledger the report reads only the
+   * strategy's own state and the options it was given, so that's a fault in
+   * context-manager or in those options, and compression itself may be
+   * running normally.
+   *
+   * `oldestPendingAgeMs` and `lastMintAt` are also `null` when nothing is
+   * pending or nothing has been minted; in a report that failed outright,
+   * `state` is `unknown` and they mean nothing. A failure is logged once
+   * through the strategy's diagnostics, its lines joined into one: when a
+   * report first fails, and again only after a report succeeds or the
+   * failure's text changes. The first report that reads again after a
+   * failure logs that it does. Each load starts afresh, as a restart does:
+   * it logs a failure it meets, and no recovery from a failure that only an
+   * earlier load met.
    *
    * The OPEN frontier chunk (still accumulating messages) is not debt and
    * is excluded. Ages derive from the newest message inside the oldest
    * pending chunk — chunk records carry no timestamps of their own.
-   * Read-only, never throws (health surface contract).
+   * It changes nothing but its note of the failure it last logged and what
+   * its read of the ledger names once per load, with that read's warn line,
+   * and it never throws (health surface contract).
    */
   getCompressionDebt(now: number = Date.now()): {
-    state: 'healthy' | 'degraded' | 'critical';
-    pendingChunks: number;
+    state: 'healthy' | 'degraded' | 'critical' | 'unknown';
+    /**
+     * What happened, what it means and what to do, for an operator: a line saying what
+     * happened, then `Cause:`, `Effect:` and `Fix:` lines. Present whenever a count
+     * below is `null` for that reason.
+     */
+    error?: string;
+    /** Which read failed, whenever `error` is present: the compression quarantine ledger, which compression needs, or the report itself. */
+    failure?: 'quarantine-ledger' | 'report';
+    pendingChunks: number | null;
     oldestPendingAgeMs: number | null;
-    mergeQueueDepth: number;
-    mergeQueueMaxAttempts: number;
-    mergeQuarantineCount: number;
+    mergeQueueDepth: number | null;
+    mergeQueueMaxAttempts: number | null;
+    mergeQuarantineCount: number | null;
     /** Keys of quarantined merges (sha256 of their source ids). */
-    mergeQuarantineKeys: string[];
+    mergeQuarantineKeys: string[] | null;
     /** Operator holds (`mergeHoldSummaryIds`): deliberate, so they don't change `state`,
      *  but they constrain the scheduler and must be visible when the frontier grows. */
-    mergeHeldIds: string[];
-    compressionQuarantineCount: number;
-    unmergedFrontier: { l1: number; l2: number; l3: number };
+    mergeHeldIds: string[] | null;
+    compressionQuarantineCount: number | null;
+    unmergedFrontier: { l1: number; l2: number; l3: number } | null;
     lastMintAt: number | null;
     /** Summaries with crossed ownership found by the load-time audit (topologyPolicy 'report'). */
-    topologyViolations: number;
-    /** Merges refused this process because they would have minted a crossed node. */
-    topologyRefusals: number;
+    topologyViolations: number | null;
+    /** Merge groups standing in the merge quarantine because merging them would have minted
+     *  a crossed node: records whose every source is still present and unparented. Each holds
+     *  `critical` until an operator clears it, its group queues as a valid merge, or a source
+     *  is parented or gone, which the sweep then removes. */
+    topologyRefusals: number | null;
   } {
     const DEGRADED_AFTER_MS = 60 * 60 * 1000;
     const CRITICAL_AFTER_MS = 6 * 60 * 60 * 1000;
-    const empty = {
-      state: 'healthy' as const,
-      pendingChunks: 0,
-      oldestPendingAgeMs: null,
-      mergeQueueDepth: 0,
-      mergeQueueMaxAttempts: 0,
-      mergeQuarantineCount: 0,
-      mergeQuarantineKeys: [] as string[],
-      mergeHeldIds: [] as string[],
-      compressionQuarantineCount: 0,
-      unmergedFrontier: { l1: 0, l2: 0, l3: 0 },
-      lastMintAt: null,
-      topologyViolations: 0,
-      topologyRefusals: 0,
-    };
     try {
       // Exclude the trailing open chunk: it is life, not debt.
       const closed = this.chunks.filter((c, i) => !(i === this.chunks.length - 1 && !c.compressed));
@@ -7709,30 +7941,50 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (oldestPendingAgeMs === null || age > oldestPendingAgeMs) oldestPendingAgeMs = age;
       }
       const mergeQuarantineCount = this.mergeQuarantine.size;
-      const compressionQuarantineCount = this.compressionQuarantineRecordCount();
-      const quarantines = mergeQuarantineCount + compressionQuarantineCount;
+      const ledger = this.compressionQuarantineRecordCount();
+      // A refusal counts while its group stands as it was refused, by the
+      // sweep's own test, so a group paid off since counts no refusal, and
+      // its refusal no longer makes the report critical, before a sweep runs:
+      // in an audit, which never ticks, and between ticks. Its record still counts as a
+      // quarantine until the sweep removes it, as every record does.
+      let topologyRefusals = 0;
+      for (const record of this.mergeQuarantine.values()) {
+        if (record.lastOutcome === 'topology_violation' && mergeRecordStands(record, (id) => this.summaryById(id))) topologyRefusals++;
+      }
       const mints = this.summaries
         .map((s) => s.created)
         .filter((t): t is number => typeof t === 'number');
       // Folded, not spread: Math.max(...array) overflows the call stack past
-      // about 125,000 entries, and the catch below would report it healthy.
+      // about 125,000 entries.
       const lastMintAt = mints.length ? toMs(mints.reduce((max, t) => Math.max(max, t))) : null;
 
-      let state: 'healthy' | 'degraded' | 'critical' = 'healthy';
-      const stale = oldestPendingAgeMs !== null && oldestPendingAgeMs > DEGRADED_AFTER_MS;
-      if (quarantines > 0 || stale) state = 'degraded';
-      if (
-        oldestPendingAgeMs !== null &&
-        oldestPendingAgeMs > CRITICAL_AFTER_MS &&
-        (quarantines > 0 || pending.length >= 5)
-      ) {
-        state = 'critical';
+      const stateWith = (compressionQuarantines: number): 'healthy' | 'degraded' | 'critical' => {
+        // Crossed ownership is never a matter of waiting: it is critical until
+        // an operator repairs the store, or while a refused group's record stands.
+        if (this.topologyViolations.length > 0 || topologyRefusals > 0) return 'critical';
+        const quarantines = mergeQuarantineCount + compressionQuarantines;
+        if (
+          oldestPendingAgeMs !== null &&
+          oldestPendingAgeMs > CRITICAL_AFTER_MS &&
+          (quarantines > 0 || pending.length >= 5)
+        ) {
+          return 'critical';
+        }
+        const stale = oldestPendingAgeMs !== null && oldestPendingAgeMs > DEGRADED_AFTER_MS;
+        return quarantines > 0 || stale ? 'degraded' : 'healthy';
+      };
+      let state: 'healthy' | 'degraded' | 'critical' | 'unknown';
+      let error: string | undefined;
+      if ('count' in ledger) {
+        state = stateWith(ledger.count);
+      } else {
+        error = compressionQuarantineUnreadableMessage(ledger.error);
+        const withNone = stateWith(0);
+        state = withNone === stateWith(1) ? withNone : 'unknown';
       }
-      // Crossed ownership is never a matter of waiting: it is critical until
-      // an operator repairs the store (or the refused merge group).
-      if (this.topologyViolations.length > 0 || this.topologyRefusals > 0) state = 'critical';
-      return {
+      const report = {
         state,
+        ...(error !== undefined ? { error, failure: 'quarantine-ledger' as const } : {}),
         pendingChunks: pending.length,
         oldestPendingAgeMs,
         mergeQueueDepth: this.mergeQueue.length,
@@ -7740,7 +7992,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         mergeQuarantineCount,
         mergeQuarantineKeys: [...this.mergeQuarantine.keys()],
         mergeHeldIds: [...(this.config.mergeHoldSummaryIds ?? [])],
-        compressionQuarantineCount,
+        compressionQuarantineCount: 'count' in ledger ? ledger.count : null,
         unmergedFrontier: {
           l1: this.summaries.filter((s) => s.level === 1 && !s.mergedInto).length,
           l2: this.summaries.filter((s) => s.level === 2 && !s.mergedInto).length,
@@ -7748,10 +8000,58 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         },
         lastMintAt,
         topologyViolations: this.topologyViolations.length,
-        topologyRefusals: this.topologyRefusals,
+        topologyRefusals,
       };
+      // Noted once the report is built, so a failure while building it isn't
+      // taken for a success that re-arms the log.
+      this.noteCompressionDebtFailure(error, 'error' in ledger ? ledger.error : undefined);
+      return report;
+    } catch (thrown) {
+      const error = compressionDebtReportFailedMessage(thrown);
+      this.noteCompressionDebtFailure(error, thrown);
+      return {
+        state: 'unknown',
+        error,
+        failure: 'report',
+        pendingChunks: null,
+        oldestPendingAgeMs: null,
+        mergeQueueDepth: null,
+        mergeQueueMaxAttempts: null,
+        mergeQuarantineCount: null,
+        mergeQuarantineKeys: null,
+        mergeHeldIds: null,
+        compressionQuarantineCount: null,
+        unmergedFrontier: null,
+        lastMintAt: null,
+        topologyViolations: null,
+        topologyRefusals: null,
+      };
+    }
+  }
+
+  /** Logs a debt report that couldn't read something, once: when one first fails,
+   *  and again when the failure's text changes or after a report reads. The
+   *  first report that reads after a failure logs that it does, once. */
+  private noteCompressionDebtFailure(error: string | undefined, thrown: unknown): void {
+    if (error === undefined) {
+      if (this.compressionDebtFailureLogged === null) return;
+      this.compressionDebtFailureLogged = null;
+      try {
+        this.diag.warn('[compression-debt] the report reads again');
+      } catch {
+        // A logger that throws mustn't turn a report that reads into `unknown`.
+      }
+      return;
+    }
+    if (error === this.compressionDebtFailureLogged) return;
+    this.compressionDebtFailureLogged = error;
+    try {
+      // One line, so the namespace the diagnostics add to a message's first
+      // line tags all of it. The message is a format string once the thrown
+      // value follows it, so a '%' in it is doubled.
+      this.diag.error(`[compression-debt] ${oneLine(error).replaceAll('%', '%%')}`, thrown);
     } catch {
-      return empty;
+      // A logger that throws mustn't make the report throw or lose what it read; the report still carries `error`.
     }
   }
 
@@ -9217,7 +9517,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       sourceOnlyFallbackRequestHash,
     );
     const runSubject = chunkRunSubject(quarantineRecord.chunkSourceHash, chunk.messages);
-    const durableQuarantine = this.readCompressionQuarantineProjection();
+    // The attempt's first read of the ledger, before any model call: while
+    // the ledger can't be read, every attempt that would call the model
+    // stops here, so the error says what that means for the agent. A chunk
+    // adopted, covered or stubbed above needs no model and has returned
+    // before this; the attempt's later reads come after this one; and load,
+    // the sweep and an operator's clear meet the failure in their own terms.
+    let durableQuarantine: Map<string, ActiveCompressionQuarantine>;
+    try {
+      durableQuarantine = this.readCompressionQuarantineProjection();
+    } catch (error) {
+      throw new CompressionQuarantineUnreadableError(error);
+    }
     const durableActive = this.durableQuarantineFor(durableQuarantine, quarantineRecord);
     if (durableActive) {
       this.compressionRefusalQuarantine = durableQuarantine;
@@ -9466,6 +9777,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // preimage — keys off this, so a summary's provenance never names a
         // request the model never saw (sol review, 2026-08-24).
         let acceptedRequest = attemptRequest;
+        // A call's error, when its work lost its branch or strategy
+        // generation while the call was out (a detach, a branch move), is
+        // discarded as the call's result would be: no rung counts it, a split
+        // part abandons nothing on it, and no second call follows. A host's
+        // withdrawal (CompressionWithdrawn) keeps its own path on any branch,
+        // as in ladderStep. A cancellation is discarded with the rest, since
+        // the generation's end makes one too.
+        const discardIfStale = (error: unknown): void => {
+          if (isCompressionWithdrawn(error) || this.isCompressionBranchCurrent(sourceBranch)) return;
+          this.logCompressionBranchDiscard(sourceBranch, `${curveLabel}:error`, quarantineRecord);
+          throw Object.assign(new Error('Compression error crossed a branch boundary'), {
+            name: 'CompressionBranchDiscard',
+          });
+        };
         // The transport's rejection of this exact request's reasoning carriers
         // is a deterministic answer like any rung's, kept under its own
         // identity: a resumed ladder goes straight to the stripped request.
@@ -9477,10 +9802,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           if (carrierKnownRejected) {
             throw Object.assign(new Error('carrier rejection known from progress'), { name: 'CompressionKnownCarrierRejection' });
           }
-          response = await ctx.membrane!.complete(
-            attemptRequest,
-            { formatter: this.nativeFormatter },
-          );
+          response = await this.callProvider(ctx.membrane!, attemptRequest);
           // An answer ends its route's pause, on whatever branch.
           this.resumeCompressionLane(ctx.membrane!, this.compressionRequestModel(attemptRequest));
         } catch (error) {
@@ -9489,6 +9811,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             noteDispatchedModel(error, attemptRequest);
             if (error !== null && typeof error === 'object') dispatchedRequestHash.set(error, attemptHash);
           }
+          discardIfStale(error);
           // Degraded mode: the transport rejected the carrier blocks
           // themselves (invalid_request about thinking — never a refusal).
           // Retry this attempt once with text-only recall pairs, loudly. Only a
@@ -9501,14 +9824,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             !requestCarriesReasoning(attemptRequest)
           )) {
             throw error;
-          }
-          // Work that lost its branch or strategy generation while the first
-          // call was out (a detach, a branch move) makes no second one.
-          if (!this.isCompressionBranchCurrent(sourceBranch)) {
-            this.logCompressionBranchDiscard(sourceBranch, `${curveLabel}:before_call`, quarantineRecord);
-            throw Object.assign(new Error('Compression result crossed a branch boundary'), {
-              name: 'CompressionBranchDiscard',
-            });
           }
           if (!known) {
             noteOutcome({
@@ -9535,10 +9850,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // prepared request stays prepared.
           acceptedRequest = stripReasoningFromRequest(attemptRequest);
           try {
-            response = await ctx.membrane!.complete(
-              acceptedRequest,
-              { formatter: this.nativeFormatter },
-            );
+            response = await this.callProvider(ctx.membrane!, acceptedRequest);
           } catch (retryError) {
             noteDispatchedModel(retryError, acceptedRequest);
             if (retryError !== null && typeof retryError === 'object') {
@@ -10394,13 +10706,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             } catch (error) {
               // A deferral by the caller's provider admission made no call:
               // it takes no window slot and counts as no call. Nor does a
-              // host's withdrawal, which is no outcome of this part either:
+              // host's withdrawal, or its cancellation of the call
+              // (compressionFailureKind's 'abort'), which is no outcome of
+              // this part either:
               // its slot goes back once its call returns (until then the slot
               // counts), so withdrawn parts don't accumulate in the window. A
               // part sends one call: its request carries no reasoning
               // (buildSub strips the raw thinking and adds no recall pairs), so
               // the carrier fallback never sends a second.
-              if (isNoCallDeferral(error) || isCompressionWithdrawn(error)) {
+              if (isNoCallDeferral(error) || compressionFailureKind(error) === 'abort') {
                 calls--;
                 attempted.calls--;
                 const at = this.splitCallTimes.lastIndexOf(slot);
@@ -10843,6 +11157,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this.logCompressionBranchDiscard(sourceBranch, logWithdrawn ? 'canonical_withdrawn' : 'canonical_error', quarantineRecord);
         return;
       }
+      // On work still current, a host's cancellation of a call
+      // (compressionFailureKind's 'abort') is a withdrawal too. On a moved
+      // branch it was discarded just above with the rest, as the strategy's
+      // own cancellation is.
+      if (compressionFailureKind(error) === 'abort') logWithdrawn = true;
       if (error instanceof CompressionSplitWindowWait) {
         // Nothing failed: the chunk waits for the split rung's call window.
         this.diag.warn(`[autobiographical] ${error.message}; the chunk from ${chunk.messages[0]?.id ?? '?'} waits ${Math.ceil(error.waitMs / 1000)} s`);
@@ -10850,8 +11169,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         inFlightError = error;
         throw error;
       }
-      // A host's withdrawal is no failure: its receipt says withdrawn, and
-      // the lane doesn't pause.
+      // A host's withdrawal or cancellation is no failure: its receipt says
+      // withdrawn, and the lane doesn't pause.
       if (!logWithdrawn) {
         this.diag.error(`Failed to compress chunk (hierarchical): ${describeCompressionFailure(error)}`);
         // A failure that says nothing about the request pauses the lane; the
@@ -11049,7 +11368,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // This was a silent drop (rev-5 review: "frontier debt, no log").
         this.warnMergeExclusion(
           s.id,
-          `L${s.level} ${s.id}: source position unresolved (pruned source messages?) — permanently unmergeable, frontier debt`,
+          `L${s.level} ${s.id}: source position unresolved (pruned or hidden source messages?) — permanently unmergeable, frontier debt`,
         );
         continue;
       }
@@ -11081,8 +11400,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     withPos.sort((a, b) => a.first - b.first);
 
     // Split into strictly contiguous live runs. Deleted messages do not occupy
-    // positions in `messageOrder`, so this still bridges true tombstones; it
-    // refuses only holes containing another live representation. A hole that
+    // positions in `messageOrder`, so this still bridges true tombstones; a
+    // run splits wherever a listed message stands between two sources, owned
+    // by another summary or by none (mergePositionIndex). A hole that
     // work put back after a failure will fill at this level (pendingRetrySpans)
     // isn't stranded: the run before it waits, as the newest run does. A run
     // can grow only up to the next run or the first held summary after it,
@@ -11323,7 +11643,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Last line of defence: a crossed node is never minted. Whatever enqueued
     // this group (threshold pass, demand path, a persisted queue from an older
     // grammar, an operator), the sources must be one level below the target
-    // and strictly adjacent among chunk-owned messages in store order.
+    // and strictly adjacent in store order, with no listed message between
+    // them (mergePositionIndex).
     const topology = this.mergeTopologyProblem(targetLevel, sources, position);
     if (topology) {
       this.refuseCrossedMerge(targetLevel, sourceIds, topology);
@@ -11818,13 +12139,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // succeeds it is the request the transport accepted, which authored the
     // merge. See the L1 ladder's `acceptedRequest` (sol review, 2026-08-24).
     let acceptedRequest = dispatchRequest;
+    // As in the L1 ladder, a call's error on work that lost its currency is
+    // discarded as its result would be: the merge returns quietly, and makes
+    // no second call. A host's withdrawal (CompressionWithdrawn) keeps its own
+    // path on any branch; a cancellation is discarded with the rest, since
+    // the generation's end makes one too.
+    const stale = (error: unknown): boolean =>
+      !isCompressionWithdrawn(error) && !this.isCompressionBranchCurrent(sourceBranch);
+    // Preparing the request can run a subclass's prepareCompressionRequest(),
+    // so the currency is checked again just before the call, as each L1
+    // attempt checks it: a generation ended there makes no call.
+    if (!this.isCompressionBranchCurrent(sourceBranch)) return false;
 
     try {
       let response: NormalizedResponse;
       try {
-        response = await ctx.membrane.complete(dispatchRequest, { formatter: this.nativeFormatter });
+        response = await this.callProvider(ctx.membrane, dispatchRequest);
       } catch (error) {
         noteDispatchedModel(error, dispatchRequest);
+        // An error on work that lost its currency is discarded as its result
+        // would be, before the carrier fallback: no second call follows.
+        if (stale(error)) return false;
         // Same degraded-mode fallback as the L1 ladder: transport rejected
         // the carrier blocks → retry once text-only, loudly. Only a failure
         // classified as a request-attributable rejection qualifies, which a
@@ -11834,8 +12169,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           !isCarrierTransportRejection(error) ||
           !requestCarriesReasoning(dispatchRequest)
         ) throw error;
-        // As in the L1 ladder: no second call for work that lost its currency.
-        if (!this.isCompressionBranchCurrent(sourceBranch)) return false;
         this.diag.error(
           `[autobiographical] transport rejected reasoning carriers on L${targetLevel} merge ` +
             `(${String(error).slice(0, 200)}) — retrying ONCE with text-only recall pairs (degraded mode)`,
@@ -11849,9 +12182,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // prepared request stays prepared.
         acceptedRequest = stripReasoningFromRequest(dispatchRequest);
         try {
-          response = await ctx.membrane.complete(acceptedRequest, { formatter: this.nativeFormatter });
+          response = await this.callProvider(ctx.membrane, acceptedRequest);
         } catch (retryError) {
           noteDispatchedModel(retryError, acceptedRequest);
+          if (stale(retryError)) return false;
           throw retryError;
         }
       }
@@ -12005,15 +12339,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.checkMergeThreshold();
       return true;
     } catch (error) {
+      // A host's withdrawal, or its cancellation of the call, is no failure:
+      // it logs nothing, and its receipt says withdrawn rather than carrying
+      // an error.
+      const withdrawn = compressionFailureKind(error) === 'abort';
       // Disposition rejections already warned + receipted above — don't
       // double-log them as crashes; tick() consumes them for retry policy.
       if (error instanceof MergeHoldDiscard) {
         this.diag.warn(`[autobiographical] ${error.message}; the merge stays queued until the hold is released`);
-      } else if (!(error instanceof MergeDispositionRejection) && !isCompressionWithdrawn(error)) {
+      } else if (!(error instanceof MergeDispositionRejection) && !withdrawn) {
         this.diag.error(`Failed to merge summaries into L${targetLevel}: ${describeCompressionFailure(error)}`);
       }
-      // A withdrawal's receipt says withdrawn rather than carrying an error.
-      if (isCompressionWithdrawn(error)) logWithdrawn = true;
+      if (withdrawn) logWithdrawn = true;
       else logError = boundFailureLogText(error instanceof Error ? error.message : String(error));
       throw error;
     } finally {
@@ -16152,10 +16489,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       'transition',
     );
     const prepared = preparation.request;
-    const response = await ctx.membrane.complete(prepared, { formatter: this.nativeFormatter });
-    if (!this.isCompressionBranchCurrent(sourceBranch)) {
-      throw new Error('Transition summary crossed a branch generation; reinitialize before retrying');
+    const crossed = (cause?: unknown) => new Error(
+      'Transition summary crossed a branch generation; reinitialize before retrying',
+      cause === undefined ? undefined : { cause },
+    );
+    // Preparing the request can run a subclass's prepareCompressionRequest(),
+    // so the currency is checked again just before the call: a generation
+    // ended there makes no call.
+    if (!this.isCompressionBranchCurrent(sourceBranch)) throw crossed();
+    let response: NormalizedResponse;
+    try {
+      response = await this.callProvider(ctx.membrane, prepared);
+    } catch (error) {
+      // An error on work that lost its currency while the call was out says
+      // so, as its result would below. A host's withdrawal
+      // (CompressionWithdrawn) keeps its own path on any branch; a
+      // cancellation says so with the rest, since the generation's end makes
+      // one too.
+      if (!isCompressionWithdrawn(error) && !this.isCompressionBranchCurrent(sourceBranch)) throw crossed(error);
+      throw error;
     }
+    if (!this.isCompressionBranchCurrent(sourceBranch)) throw crossed();
     // Text-only on purpose: summarizer scratch thinking is not agent history
     return response.content
       .filter((b): b is { type: 'text'; text: string } => b.type === 'text')

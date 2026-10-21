@@ -105,7 +105,14 @@ export interface StrategyContext {
   systemPrompt?: string;
   /** Read-only view of context log */
   contextLog: ContextLogView;
-  /** Membrane instance for LLM calls (compression) */
+  /**
+   * Membrane instance for LLM calls (compression). AutobiographicalStrategy
+   * passes each call a signal of its own (`CompleteOptions.signal`) and
+   * aborts it when it lets go of the call's work, at detach() or when it is
+   * initialized again, so a host that wraps this membrane passes the signal
+   * on, and may combine its own with it to end calls itself (see
+   * CompressionWithdrawn).
+   */
   membrane?: Membrane;
   /** Current sequence number */
   currentSequence: Sequence;
@@ -194,21 +201,23 @@ export interface ContextStrategy {
    * manager closed, or the open() that was initializing it failed. The
    * strategy stops the work it still has running for that manager, so it
    * writes nothing more to the store and starts no further provider call.
-   * It is synchronous and not awaited: a call already waiting on the
-   * provider may finish, with any retries the provider client makes of it,
-   * and its result is thrown away. A promise or other thenable it returns
-   * anyway isn't awaited either; the manager logs its rejection. A later
-   * setStrategy() of the same instance on a manager that isn't closed
-   * initializes it again, so a strategy whose detach() stops it starts again
-   * in initialize(). A setStrategy() of another strategy, or a close(), that
-   * lands while the strategy initializes detaches it at once, and again once
-   * initialize() returns or rejects, unless the manager holds it again by
-   * then: an instance set again fences its earlier initialization's work
-   * itself. So detach() can be called more than once for one instance, and
-   * must be safe to repeat. It is per instance: sharing one instance between
-   * two managers isn't supported, and either letting it go detaches it for
-   * both. A manager whose close() interrupted an initialization of the
-   * instance holds it until that initialization ends.
+   * It is synchronous and not awaited. A strategy can cancel the provider
+   * calls it has out then, as AutobiographicalStrategy does; one that
+   * doesn't lets a call already waiting on the provider finish, with any
+   * retries the provider client makes of it, and throws its result away. A
+   * promise or other thenable it returns anyway isn't awaited either; the
+   * manager logs its rejection. A later setStrategy() of the same instance
+   * on a manager that isn't closed initializes it again, so a strategy whose
+   * detach() stops it starts again in initialize(). A setStrategy() of
+   * another strategy, or a close(), that lands while the strategy
+   * initializes detaches it at once, and again once initialize() returns or
+   * rejects, unless the manager holds it again by then: an instance set
+   * again fences its earlier initialization's work itself. So detach() can
+   * be called more than once for one instance, and must be safe to repeat.
+   * It is per instance: sharing one instance between two managers isn't
+   * supported, and either letting it go detaches it for both. A manager
+   * whose close() interrupted an initialization of the instance holds it
+   * until that initialization ends.
    */
   detach?(): void;
 
@@ -1246,11 +1255,14 @@ export interface AutobiographicalConfig {
   imageStripDepthTokens?: number;
 
   /**
-   * Merge grouping (2026-07-12 contiguity fix): break a merge run when the
-   * positional gap between consecutive unmerged candidates exceeds this many
-   * messages. Small holes (wiped/pruned nodes) bridge fine; cross-era gaps
-   * must not — a merge group spanning already-merged history can straddle
-   * the recent window and block its whole lineage from folding. Default 300.
+   * Not read since canonical merge ownership (2026-08-31). Merge grouping
+   * (2026-07-12 contiguity fix) used to break a merge run when the positional
+   * gap between consecutive unmerged candidates exceeded this many messages,
+   * bridging smaller holes. Every grouping decision now requires exact
+   * adjacency in store order, with no listed message between two sources,
+   * whatever this is set to. Configurations that set it still type-check.
+   *
+   * @deprecated Not read: grouping requires exact adjacency.
    */
   mergeContiguityGapLimit?: number;
 
