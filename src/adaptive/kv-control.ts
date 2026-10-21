@@ -451,9 +451,23 @@ function relevanceCut(
     // remaining member chunk at that level: for a ~1.7k-leaf group the tail
     // boundary cuts through, that is ~1.7k attempts × 2×1.7k ledger moves
     // (try + revert) — the dominant term of the mythos 30s/turn leak.
-    // `attempted` short-circuits repeats and is cleared whenever an accept
-    // changes the ledger.
+    // `attempted` short-circuits repeats. An accept only raises the ledger
+    // toward the target (one that lowers it, or leaves it, isn't closer), so
+    // a group the accept test declined stays declined until a leaf its
+    // verdict read moves: its members, whose levels decide eligibility, and
+    // the members of each summary it would land on, whose levels decide the
+    // landing and the units the ledger counts. Each key is filed under those
+    // leaves, and an accept clears only the keys filed under what it moved.
+    // Clearing every key re-tried each declined group once per accept, and
+    // with the walk's restart that was quadratic again (#156 R5-1).
     const attempted = new Set<string>();
+    const readers = new Map<ChunkId, string[]>();
+    const fileReads = (key: string, leafIds: readonly ChunkId[]): void => {
+      for (const id of leafIds) {
+        const keys = readers.get(id);
+        if (keys) keys.push(key); else readers.set(id, [key]);
+      }
+    };
     // After every accepted un-fold the walk RESTARTS from the youngest
     // position, so the group that just stepped down is the first candidate
     // for its next step (L2→L1→raw) before any older group is tried. Walking
@@ -468,7 +482,10 @@ function relevanceCut(
     // back levels of at least 1), so a chunk that is raw or protected stays
     // out of reach for the rest of the phase. The walk follows a list of the
     // chunks still at a level of at least 1 and unprotected, youngest first,
-    // and an accept unlinks each member it takes raw. Restarting at the
+    // and an accept unlinks each member it takes raw. A group phase C declines
+    // or can't take leaves the list too, until an accept moves a leaf its
+    // verdict read, and a chunk with no summary at its level leaves it on its
+    // first visit. Restarting at the
     // youngest position and skipping raw chunks one by one rescanned every
     // group earlier accepts had taken raw, quadratic in the groups a large
     // raise un-folds (#156 R4-1). Skipping only the raw run at the young end
@@ -476,10 +493,14 @@ function relevanceCut(
     const n = ordered.length;
     const olderListed = new Int32Array(n); // the next older listed position, or -1
     const youngerListed = new Int32Array(n); // the next younger listed position, or n
+    const listed = new Uint8Array(n);
     let youngestListed = -1;
+    let oldestListed = n;
     for (let i = 0; i < n; i++) {
       const id = ordered[i].id;
       if ((F.get(id) ?? 0) < 1 || rawZone.has(id) || immovable.has(id)) continue;
+      listed[i] = 1;
+      if (oldestListed === n) oldestListed = i;
       olderListed[i] = youngestListed;
       if (youngestListed >= 0) youngerListed[youngestListed] = i;
       youngestListed = i;
@@ -487,11 +508,48 @@ function relevanceCut(
     if (youngestListed >= 0) youngerListed[youngestListed] = n;
     const positionOf = new Map(ordered.map((c, i) => [c.id, i] as const));
     const unlist = (i: number): void => {
+      if (!listed[i]) return;
+      listed[i] = 0;
       const older = olderListed[i];
       const younger = youngerListed[i];
       if (older >= 0) youngerListed[older] = younger;
+      else oldestListed = younger;
       if (younger < n) olderListed[younger] = older;
       else youngestListed = older;
+    };
+    const relist = (i: number): void => {
+      if (listed[i]) return;
+      listed[i] = 1;
+      let older = i - 1;
+      while (older >= 0 && !listed[older]) older--;
+      const younger = older >= 0 ? youngerListed[older] : oldestListed;
+      olderListed[i] = older;
+      youngerListed[i] = younger;
+      if (older >= 0) youngerListed[older] = i;
+      else oldestListed = i;
+      if (younger < n) olderListed[younger] = i;
+      else youngestListed = i;
+    };
+    // A declined or ineligible group's members leave the walk until its key
+    // is cleared: they would only be visited to hit `attempted`.
+    const parked = new Map<string, number[]>();
+    const park = (key: string, nodeId: string, leafIds: readonly ChunkId[], level: number): void => {
+      const at: number[] = [];
+      for (const leafId of leafIds) {
+        const i = positionOf.get(leafId);
+        if (i === undefined || !listed[i]) continue;
+        if ((F.get(leafId) ?? 0) !== level || tree.ancestorAt(leafId, level)?.id !== nodeId) continue;
+        unlist(i);
+        at.push(i);
+      }
+      if (at.length) parked.set(key, at);
+    };
+    const clearKey = (key: string): void => {
+      if (!attempted.delete(key)) return;
+      const at = parked.get(key);
+      if (!at) return;
+      parked.delete(key);
+      for (const i of at) if ((F.get(ordered[i].id) ?? 0) >= 1) relist(i);
     };
     const _tc = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
     let passes = 0;
@@ -506,7 +564,7 @@ function relevanceCut(
         const c = ordered[oi]; // youngest-first, among the listed chunks
         const level = F.get(c.id) ?? 0;
         const node = tree.ancestorAt(c.id, level);
-        if (!node) continue;
+        if (!node) { unlist(oi); continue; } // static: no summary at its level
         const attemptKey = `${node.id}:${level}`;
         if (attempted.has(attemptKey)) continue;
         let eligible = true;
@@ -523,7 +581,7 @@ function relevanceCut(
             break;
           }
         }
-        if (!eligible) { attempted.add(attemptKey); continue; }
+        if (!eligible) { attempted.add(attemptKey); fileReads(attemptKey, node.leafChunkIds); park(attemptKey, node.id, node.leafChunkIds, level); continue; }
         const before = ledger.tokens;
         // Record exact prior levels for an honest revert: with boundary-cut
         // tolerance a group may hold members below `level` (protected raw,
@@ -546,12 +604,14 @@ function relevanceCut(
         // change while the un-fold moves its leaves, or when the projection
         // runs after it. Eligibility put every leaf moved here at `level`.
         const vetoMemo = new Map<string, boolean>();
+        const landings: Array<readonly ChunkId[]> = [];
         const landingVetoed = (own: { id: string; leafChunkIds: readonly ChunkId[] }, at: number): boolean => {
           const key = `${own.id}:${at}`;
           let verdict = vetoMemo.get(key);
           if (verdict === undefined) {
             verdict = vetoed(tree, own, at, F, projectionExempt);
             vetoMemo.set(key, verdict);
+            landings.push(own.leafChunkIds);
           }
           return verdict;
         };
@@ -587,11 +647,16 @@ function relevanceCut(
             F.set(leafId, from);
           }
           attempted.add(attemptKey);
+          fileReads(attemptKey, node.leafChunkIds);
+          for (const leafIds of landings) fileReads(attemptKey, leafIds);
+          park(attemptKey, node.id, node.leafChunkIds, level);
         } else {
-          // The ledger moved: previously reverted/ineligible groups may now
-          // verdict differently — exactly when the naive loop would have
-          // re-attempted them.
-          attempted.clear();
+          // The ledger moved: a group whose verdict read a moved leaf may now
+          // verdict differently, so it returns to the walk.
+          for (const [leafId] of moved) {
+            for (const key of readers.get(leafId) ?? []) clearKey(key);
+            readers.delete(leafId);
+          }
           for (const [leafId, , to] of moved) {
             if (to > 0) continue;
             const i = positionOf.get(leafId);
@@ -1001,8 +1066,8 @@ export interface ControlPlan {
    *  pays a re-read and would already pay ≥ 90% of the from-scratch one,
    *  which may be none: keeping the tight-budget allocation buys nothing then
    *  (#156 R2-3, R3-3; #186 R3-2). Past the trust region, a plan that adopts
-   *  the from-scratch cut's newest part (step 5) reports it too, and one that
-   *  adopts none of it, where no part fits, doesn't. */
+   *  the whole cut through an override, or its newest part (step 5), reports
+   *  it too; one that adopts none of it, where no part fits, doesn't. */
   seedingReleased?: boolean;
   /** No realizable progress fits inside a strict trust region. */
   blocked?: 'reach-floor' | 'target-floor';

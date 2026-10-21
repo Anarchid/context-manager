@@ -1126,8 +1126,10 @@ per (node, level, phase) — valid because the verdict is a pure function of
 static caps shared by every member; projection *unanimity* per (node, level)
 per pass — valid because a pass only lowers, which cannot make a group
 unanimous at that level; and phase C's `attempted` set short-circuits
-re-tries but is **cleared on every accepted un-fold**, so the accept sequence
-is exactly the naive one. Breaking any of these validity arguments either
+re-tries, and an accepted un-fold clears only the keys filed under the leaves
+it moved — valid because an accept only raises the ledger toward the target
+and a key's verdict reads only the leaves it is filed under — so the accept
+sequence is exactly the naive one. Breaking any of these validity arguments either
 reintroduces the O(groupSize²) compile leak or silently changes the solve.
 
 ### 13.7 Prepared windows and paced transitions

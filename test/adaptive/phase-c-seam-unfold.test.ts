@@ -382,14 +382,24 @@ test('seeded ideal: a large budget raise takes the from-scratch allocation; a mo
  * un-folded: 139,535 visits here. Skipping only the raw run at the young end
  * fixed that case, but a youngest group that stays declined (its un-fold
  * would pass W) pinned the start, and the walk behind it grew the same way.
+ * R5-1: a group the accept test declines stayed on the walk, and every
+ * accept cleared what had been tried, so each declined group was visited and
+ * re-tried once per accept: with every third group declined, 31,247 visits
+ * over 143 passes here. A declined group now leaves the walk until an accept
+ * moves a leaf its verdict read.
  * Counted rather than timed, so a loaded runner can't flake it: under
  * KV_TIMING the planner logs each phase C's passes and visits.
  */
-function phaseCRuns(bigYoungGroup: boolean) {
+function phaseCRuns(shape: 'plain' | 'bigYoungGroup' | 'shortThirds') {
   const ch = buildChronicleWithChain({ chunkCount: 1296, tokensPerChunk: 50, mergeThreshold: 6, recallPairTokens: 100 });
+  const bigYoungGroup = shape === 'bigYoungGroup';
   // The youngest group before the raw tail: 10,000 tokens a chunk, so its
   // un-fold from L1 would pass W and is declined on every pass.
   if (bigYoungGroup) for (const c of ch.chunks.slice(-12, -6)) c.rawTokens = 10_000;
+  // Every third L1 group of six 10-token chunks: raw, it costs less than its
+  // 100-token recall, so un-folding it lowers the ledger and is declined.
+  const short = shape === 'shortThirds' ? ch.chunks.filter((_, i) => Math.floor(i / 6) % 3 === 1) : [];
+  for (const c of short) c.rawTokens = 10;
   const tail = new Set(ch.chunks.slice(-6).map((c) => c.id));
   const inputs: PickerInputs = {
     chunks: ch.chunks, summaries: ch.summaries, recallPairTokens: ch.recallPairTokens,
@@ -404,9 +414,10 @@ function phaseCRuns(bigYoungGroup: boolean) {
   process.env.KV_TIMING = '1';
   let plan;
   try {
-    // Every other chunk raw is 64,500 tokens, with the big group at L1 64,600:
-    // the target, under W.
-    const target = bigYoungGroup ? 64_600 : 64_800;
+    // Every chunk but the big group's raw is 64,500 tokens, and with the big
+    // group at L1, 64,600: the target, under W. With the short groups at L1
+    // and the rest raw, 144 groups at 300 and 72 at 100: 50,400.
+    const target = bigYoungGroup ? 64_600 : shape === 'shortThirds' ? 50_400 : 64_800;
     plan = planControlledFrontier(inputs, tree, {
       previous, foldAtTokens: 70_000, expandAtTokens: target, targetTokens: target, windowTokens: 70_000,
       rawZone: tail, now, mergeThreshold: 6, diagnostics,
@@ -422,14 +433,83 @@ function phaseCRuns(bigYoungGroup: boolean) {
 }
 
 test('phase C: a large raise walks each chunk a bounded number of times, not once per un-fold (R4-1)', () => {
-  const { runs, chunks } = phaseCRuns(false);
+  const { runs, chunks } = phaseCRuns('plain');
   assert.ok(runs.some((r) => r.passes >= 200), `premise: phase C un-folded about 215 groups, one per pass (${JSON.stringify(runs)})`);
   for (const r of runs) assert.ok(r.visits <= 3 * chunks, `phase C visited ${r.visits} chunks over ${r.passes} passes`);
 });
 
 test('phase C: a youngest group that stays declined doesn\'t make the walk rescan the groups behind it (R4-1)', () => {
-  const { runs, chunks, plan, young } = phaseCRuns(true);
+  const { runs, chunks, plan, young } = phaseCRuns('bigYoungGroup');
   assert.ok(runs.some((r) => r.passes >= 200), `premise: phase C un-folded about 214 groups, one per pass (${JSON.stringify(runs)})`);
   assert.ok(young.every((id) => plan.resolutions.get(id) === 1), 'premise: the big youngest group stays at L1');
   for (const r of runs) assert.ok(r.visits <= 3 * chunks, `phase C visited ${r.visits} chunks over ${r.passes} passes`);
+});
+
+test('phase C: groups it declines leave the walk, so they aren\'t re-tried after every accept (R5-1)', () => {
+  // The plan returned is the release's from-scratch cut. The bound holds for
+  // every phase C the plan runs: the seeded one, and the release's
+  // from-scratch one, which un-folds nothing here.
+  const { runs, chunks, plan } = phaseCRuns('shortThirds');
+  assert.ok(runs.some((r) => r.passes >= 140), `premise: phase C un-folded about 143 groups, one per pass (${JSON.stringify(runs)})`);
+  assert.equal(plan.seedingReleased, true, 'premise: the release took the from-scratch cut');
+  for (const r of runs) assert.ok(r.visits <= 3 * chunks, `phase C visited ${r.visits} chunks over ${r.passes} passes`);
+});
+
+/**
+ * R5-1's other half: a group phase C couldn't take returns to the walk when
+ * an accept moves a leaf its verdict read. A damaged store, as the settle
+ * check's generator makes them (seed 9, tree 1066), where L1-4 also lists
+ * m16, R-1 is a stray L1 over m17 and m18, and L1-5 and L2-3 point at
+ * parents that don't list them. Raised eightfold from its bootstrap, L2-3
+ * (m14, m15, m16, m18) is ineligible while m16, which L1-4 also lists, sits
+ * at L3. L3-0's accept brings m16 to L2, L2-3 goes back on the walk, and its
+ * un-fold is accepted: the seeded phase C accepts 17 un-folds, one per pass.
+ * With L2-3 kept off the walk instead, it accepts 15, the release doesn't fire
+ * and the plan leaves m1, m14, m15 and m18 at L1.
+ */
+test('phase C: a group it couldn\'t take returns to the walk once an accept moves a leaf it read (R5-1)', () => {
+  const chunks = 'm0:45:L1-0 m1:42:L1-1 m2:45 m3:117 m4:137:L1-2 m5:55:L1-2 m6:52:L1-3 m7:100:L1-4 m8:145:L1-5 m9:172:L1-6 m10:91:L1-6 m11:198:L1-6 m12:133:L1-7 m13:90:L1-7 m14:56:L1-8 m15:146:L1-8 m16:106:L1-9 m17:56:R-1 m18:113:L1-10 m19:131:L1-10 m20:73:L1-10'
+    .split(' ').map((spec, sequence) => {
+      const [id, tokens, l1Id] = spec.split(':');
+      return { id, sequence, rawTokens: Number(tokens), currentResolution: 0, lockedByAgent: false, pinned: false, ...(l1Id ? { l1Id } : {}) };
+    });
+  const summaries = new Map('L1-0:22:m0^L2-0 L1-1:43:m1^L2-0 L1-2:33:m4,m5^L2-1 L1-3:27:m6^L2-1 L1-4:14:m7,m16^L2-1 L1-5:18:m8^L2-0 L1-6:18:m9,m10,m11^L2-2 L1-7:32:m12,m13^L2-2 L1-8:16:m14,m15^L2-3 L1-9:21:m16,m17^L2-3 L1-10:40:m18,m19,m20^L2-3 L2-0:30:L1-0,L1-1^L3-0 L2-1:30:L1-2,L1-3,L1-4^L3-0 L2-2:44:L1-5,L1-6,L1-7^L3-1 L2-3:16:L1-8,L1-9,L1-10^L3-0 L3-0:11:L2-0,L2-1 L3-1:38:L2-2,L2-3 R-1:39:m17,m18'
+    .split(' ').map((spec) => {
+      const [head, parentId] = spec.split('^');
+      const [id, tokens, sources] = head.split(':');
+      const level = Number(id.startsWith('R') ? 1 : id[1]);
+      const sourceIds = sources.split(',');
+      return [id, {
+        id, level, sourceLevel: level - 1, sourceIds, tokens: Number(tokens), content: `summary ${id}`, timestamp: 0,
+        sourceRange: { first: sourceIds[0], last: sourceIds[sourceIds.length - 1] }, ...(parentId ? { parentId } : {}),
+      }] as const;
+    }));
+  const inputs = { chunks, summaries, headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set() } as unknown as PickerInputs;
+  const tree = new SummaryTree(inputs);
+  const common = { rawZone: new Set(['m19', 'm20']), now: 26, mergeThreshold: 2, seedFromCarried: true };
+  const levels = (F: ReadonlyMap<ChunkId, number>) => chunks.map((c) => F.get(c.id) ?? 0).join('');
+  const boot = planControlledFrontier(inputs, tree, {
+    ...common, previous: new Map(), targetTokens: 327, foldAtTokens: 577, windowTokens: 4206, reachTokens: 4206,
+  });
+  assert.equal(levels(boot.resolutions), '330033331333332231200', 'premise: the bootstrap holds m16 at L3 and m14, m15 and m18 at L2');
+  // Under KV_TIMING the planner logs each phase C's passes, the seeded one first.
+  const lines: string[] = [];
+  const diagnostics = { error: (m: string) => { lines.push(m); }, warn: (m: string) => { lines.push(m); } };
+  const timing = process.env.KV_TIMING;
+  process.env.KV_TIMING = '1';
+  let raised;
+  try {
+    raised = planControlledFrontier(inputs, tree, {
+      ...common, previous: boot.resolutions, targetTokens: 2616, foldAtTokens: 4616, windowTokens: 33648, reachTokens: 33648, diagnostics,
+    });
+  } finally {
+    if (timing === undefined) delete process.env.KV_TIMING; else process.env.KV_TIMING = timing;
+  }
+  const passes = lines.flatMap((l) => {
+    const m = /\[kv-timing\] phase-c \d+ms passes=(\d+)/.exec(l);
+    return m ? [Number(m[1])] : [];
+  });
+  assert.equal(passes[0], 18, `the seeded phase C accepted 17 un-folds, one per pass (${JSON.stringify(passes)})`);
+  assert.equal(raised.seedingReleased, true, 'the seeded cut re-read enough for the release');
+  assert.equal(levels(raised.resolutions), '0'.repeat(chunks.length), 'every chunk raw, as before R5-1');
 });
