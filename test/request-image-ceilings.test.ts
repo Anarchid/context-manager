@@ -468,7 +468,7 @@ describe('the line when an image first falls past an image ceiling', () => {
         const { lines, byStep, patterns } = await ceilingLines(strategy, [3, 2]);
         assert.deepEqual(patterns, ['.II', '...II'], `the ceiling of 2 strips at each compile for ${JSON.stringify(options)}`);
         assert.deepEqual(byStep.map((step) => step.length), [1, 0], `said once, at the first step, for ${JSON.stringify(options)}`);
-        assert.ok(lines[0]!.startsWith(`[${strategy.name}] an image fell past ${said}, so older images are now shown as placeholders`), lines[0]);
+        assert.ok(lines[0]!.startsWith(`[${strategy.name}] an image fell past ${said}, so some images are now shown as placeholders`), lines[0]);
         assert.match(lines[0]!, / ns=/, 'through the namespaced route the warning takes');
       }
     });
@@ -1139,13 +1139,13 @@ describe('the line when an image first falls past an image ceiling', () => {
     const configured = (o: Record<string, number>) =>
       ({ maxLiveImages: 0, maxLiveImageBytes: 0, imageCeiling: 500, imageByteCeiling: 24 * MiB, ...o });
     assert.equal(ceilingBoundLine('s', 'images', configured({}), new Set(['imageCeiling'])),
-      '[s] an image fell past imageCeiling 500 (default), which holds maxLiveImages 0 (no limit) to it, so older images are now shown as placeholders');
+      '[s] an image fell past imageCeiling 500 (default), which holds maxLiveImages 0 (no limit) to it, so some images are now shown as placeholders');
     assert.equal(ceilingBoundLine('s', 'images', configured({ imageCeiling: Number.NaN, maxLiveImages: 800 }), new Set()),
-      '[s] an image fell past imageCeiling 500 (default), which holds maxLiveImages 800 to it, so older images are now shown as placeholders');
+      '[s] an image fell past imageCeiling 500 (default), which holds maxLiveImages 800 to it, so some images are now shown as placeholders');
     assert.equal(ceilingBoundLine('s', 'bytes', configured({ maxLiveImageBytes: 30 * MiB }), new Set()),
-      '[s] an image fell past imageByteCeiling 24 MiB, which holds maxLiveImageBytes 30 MiB to it, so older images are now shown as placeholders');
+      '[s] an image fell past imageByteCeiling 24 MiB, which holds maxLiveImageBytes 30 MiB to it, so some images are now shown as placeholders');
     assert.equal(ceilingBoundLine('s', 'bytes', configured({ maxLiveImageBytes: 30 * MiB + 1 }), new Set(['imageByteCeiling'])),
-      `[s] an image fell past imageByteCeiling 24 MiB (default), which holds maxLiveImageBytes ${30 * MiB + 1} bytes to it, so older images are now shown as placeholders`);
+      `[s] an image fell past imageByteCeiling 24 MiB (default), which holds maxLiveImageBytes ${30 * MiB + 1} bytes to it, so some images are now shown as placeholders`);
   });
 
   it('the memory strategy says it when its hysteresis watermark trims against the byte ceiling', async () => {

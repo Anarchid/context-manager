@@ -1311,7 +1311,9 @@ export interface AutobiographicalConfig {
    * the first render a select returns where images are shown as
    * placeholders because an image passed this ceiling, rather than because
    * of a limit the host set: the image past it, or those the hysteresis
-   * watermark strips with it.
+   * watermark strips with it that the host's own limits wouldn't strip. A
+   * watermark the strategy loads from the store carries no record of what
+   * moved it, so the instance that loads it says nothing for what it strips.
    */
   imageCeiling?: number;
 
@@ -1327,18 +1329,22 @@ export interface AutobiographicalConfig {
    * injects or appends aren't counted. membrane's byte cap is 28 MiB of
    * serialized messages unless `MEMBRANE_MAX_REQUEST_BYTES` says otherwise,
    * and the default, 24 MiB, leaves 4 MiB of that cap for what this doesn't
-   * count. membrane refuses a request over its cap before sending it. One
-   * that asks it to shed images, as this strategy's compression requests do,
-   * first has its oldest images replaced until it fits or none is left, and
-   * then only the Anthropic adapter's own check refuses it if it's still
-   * over (`src/live-image-limits.ts` says where each check runs). This
+   * count. Where membrane checks a request against its cap, it refuses one
+   * over it before sending it; an XML-mode continuation round isn't checked
+   * there, and of the provider adapters only Anthropic's checks again. A
+   * request that asks membrane to shed images, as this strategy's compression
+   * requests do, first has its oldest images replaced until it fits or none
+   * is left, and then only the Anthropic adapter's own check refuses it if
+   * it's still over (`src/live-image-limits.ts` says where each check runs). This
    * setting isn't read from `MEMBRANE_MAX_REQUEST_BYTES`: a host that changes
    * membrane's cap sets this too, keeping room under the cap for what this
    * doesn't count.
    * `imageCeilings()` reports it, as for `imageCeiling`. 0 = no ceiling. A
    * value that isn't 0 or a finite number above it takes the default, and a
    * fraction is floored, to at least 1. Under a window limit of 0 or above
-   * this ceiling, the strategy says so once, as for `imageCeiling`.
+   * this ceiling, the strategy says so once, as for `imageCeiling`, with the
+   * same exceptions: not for an image the host's own limits would strip, and
+   * not for what a watermark loaded from the store strips.
    */
   imageByteCeiling?: number;
 

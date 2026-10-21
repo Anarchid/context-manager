@@ -196,7 +196,7 @@ export function ceilingBoundLine(
   const limit = asLimit(value) === 0 ? `${value} (no limit)` : show(asLimit(value));
   const mark = (name: string) => defaultMark(name, configured, defaulted);
   return `[${strategy}] an image fell past ${ceilingName} ${show(ceiling[kind])}${mark(ceilingName)}, ` +
-    `which holds ${limitName} ${limit}${mark(limitName)} to it, so older images are now shown as placeholders`;
+    `which holds ${limitName} ${limit}${mark(limitName)} to it, so some images are now shown as placeholders`;
 }
 
 /**
