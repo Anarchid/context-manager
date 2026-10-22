@@ -21,6 +21,7 @@ import type {
 import { BlobManager } from './blob-manager.js';
 import { bodyBoundsIn, bodyEnd, bodyStart, continuesBody } from './body-runs.js';
 import { contentForWrite, wellFormedContent } from './well-formed-content.js';
+import { storedJson } from './stored-json.js';
 
 const DEFAULT_MESSAGE_STATE_ID = 'messages';
 
@@ -821,7 +822,7 @@ export class MessageStore {
     noteRevisionBeforeCountedWrite(this.store, this.stateId);
     bumpWriteVersion(this.store, this.stateId, this.log);
     bumpEditVersion(this.store, this.stateId);
-    this.store.editStateItem(this.stateId, index, Buffer.from(JSON.stringify(updated)));
+    this.store.editStateItem(this.stateId, index, storedJson(updated));
     recordRevisionAfterCountedWrite(this.store, this.stateId);
     this.indexWriteVersion = slotRevision(this.store, this.stateId);
 
@@ -1004,6 +1005,19 @@ export class MessageStore {
     }
 
     return this.internalToStored(internal, messageId, index);
+  }
+
+  /**
+   * A message's sequence, as `get(id)?.sequence` answers it. While the
+   * materialized cache is current (a compile has just listed the slot), it
+   * answers from there instead of reading the item through chronicle, which
+   * get() does even to report one field (#273).
+   */
+  sequenceOf(messageId: MessageId): number | undefined {
+    const index = this.lookupIndex(messageId);
+    if (index === undefined) return undefined;
+    const internal = this.cacheIsCurrent() ? this.allCache!.internals[index] : this.getInternal(index);
+    return internal?.sequence;
   }
 
   /**
@@ -1354,6 +1368,12 @@ export class MessageStore {
         return 0;
       case 'image':
         return block.tokenEstimate ?? 1600; // ~1568px image ≈ 1600 tokens (Anthropic)
+      // A generated image goes to the provider as an image (membrane converts
+      // it), so it is priced as an image without a stamp: membrane's
+      // GeneratedImageContent carries no tokenEstimate. Priced at 0, a layout
+      // holding one ran larger than its estimate.
+      case 'generated_image':
+        return 1600;
       case 'document':
       case 'audio':
       case 'video':
@@ -1370,6 +1390,7 @@ export class MessageStore {
     return {
       getAll: () => this.getAll(),
       get: (id) => this.get(id),
+      sequenceOf: (id) => this.sequenceOf(id),
       getFrom: (index) => this.getFrom(index),
       getTail: (count) => this.getTail(count),
       length: () => this.length(),
