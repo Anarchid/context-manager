@@ -19,6 +19,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 import type { JsStore } from '@animalabs/chronicle';
 import { OverBudgetError } from '../adaptive/picker.js';
 import { observeStoreBranch, type StoreBranchGeneration } from '../branch-generation.js';
+import { hasImage, imagesIn, inlineImageBytes, replaceImages, strippedImageSaving } from '../inline-images.js';
 import { capContent, cappedPriceExtra } from './message-cap.js';
 import {
   DEFAULT_IMAGE_CEILING,
@@ -72,7 +73,8 @@ export interface WindowedPassthroughOptions {
    */
   maxMessageTokens?: number;
   /**
-   * Live-image policy, mirroring `AutobiographicalConfig`: an image is
+   * Live-image policy, mirroring `AutobiographicalConfig`: an image, nested in
+   * a tool result or not (see inline-images.ts), is
    * replaced by the memory strategy's text placeholder once it is beyond the
    * `maxLiveImages` newest images (counted newest-first), deeper than
    * `imageStripDepthTokens` from the newest message, or past
@@ -88,8 +90,8 @@ export interface WindowedPassthroughOptions {
   maxLiveImageBytes?: number;
   /**
    * The image ceilings, mirroring `AutobiographicalConfig.imageCeiling` and
-   * `imageByteCeiling`: the most top-level image blocks, and the most of
-   * their inline image bytes, the window keeps, counted as
+   * `imageByteCeiling`: the most images, and the most of their inline image
+   * bytes, the window keeps, counted as
    * `AutobiographicalConfig.maxLiveImages` says, whatever `maxLiveImages` and
    * `maxLiveImageBytes` say (0 there means up to these). They don't bound a
    * whole request: what the window doesn't count, and what a caller injects
@@ -105,6 +107,14 @@ export interface WindowedPassthroughOptions {
  *  (identical to the autobiographical strategy's placeholder, so a merged
  *  timeline reads the same in both agents' windows). */
 const IMAGE_PLACEHOLDER = '[image not shown: this context keeps only some images]';
+
+/** The live-image policy's verdicts, by message position (see liveImagePolicy). */
+interface ImagePolicy {
+  strips: (boolean[] | undefined)[];
+  saved: number[];
+  ceilings: ({ images: boolean; bytes: boolean } | undefined)[];
+}
+
 /** Mirrors `AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES` (protected there). */
 const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
 
@@ -337,24 +347,29 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     }
 
     // Per-message shaping BEFORE pricing, so the window is sized on what
-    // will actually be sent. A message the cap cuts is priced as it renders,
-    // as the autobiographical strategy prices one: its estimate, plus what
-    // the cut adds to it as the store estimates the content sent
-    // (cappedPriceExtra). The cut changes text and string results alone, and
-    // the store prices the text the cap keeps at its own rates, so the
+    // will actually be sent: the live-image policy's verdicts, decided once
+    // from the newest message down to the anchor (liveImagePolicy), so the
+    // window is priced without the images the strip takes out, and
+    // truncation. A message the cap cuts is priced as it renders, as the
+    // autobiographical strategy prices one: its price after the policy,
+    // plus what the cut adds to it as the store estimates the content sent
+    // (cappedPriceExtra). The cut changes text and string results alone,
+    // and the store prices the text the cap keeps at its own rates, so the
     // difference holds the kept text, the suffix, the omission notices and
-    // the marker, and the message's other blocks keep their price. A message
-    // the truncator leaves whole renders whole and is priced at its
-    // estimate, even past the cap. The two estimates differ: the store's
-    // counts every block, thinking included, and the truncator's counts text
-    // and string results alone, rounding each block up, so either can pass
-    // the cap with nothing cut. The image strip's depth (applyImageStripping)
-    // is still measured by the store's estimate of each stored message,
-    // before the cap, as the autobiographical strategy measures its own.
+    // the marker, and the message's other blocks keep their price, its
+    // images at the policy's. A message the truncator leaves whole renders
+    // whole and is priced at its estimate after the policy, even past the
+    // cap. The two estimates differ: the store's counts every block,
+    // thinking included, and the truncator's counts text and string results
+    // alone, rounding each block up, so either can pass the cap with nothing
+    // cut. The image strip's depth (liveImagePolicy) is still measured by
+    // the store's estimate of each stored message, before the cap, as the
+    // autobiographical strategy measures its own.
+    const policy = this.liveImagePolicy(messages, store, start);
     const shaped = new Map<number, ContentBlock[]>();
     const priced = (i: number): number => {
       const msg = messages[i];
-      const estimate = store.estimateTokens(msg);
+      const estimate = Math.max(0, store.estimateTokens(msg) - (policy.saved[i] ?? 0));
       const content = this.cappedContent(msg);
       if (content === msg.content) return estimate;
       shaped.set(i, content);
@@ -431,7 +446,10 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       });
     }
 
-    this.applyImageStripping(entries, messages, store, !opts?.dryRun);
+    this.stripImages(entries, policy);
+    // Only a render select returns says a ceiling's line, for the images it
+    // holds. A preview's (dryRun) doesn't, nor any other caller's.
+    if (!opts?.dryRun) this.reportCeilings(entries, policy);
     if (!opts?.dryRun) this.placeCacheMarkers(entries);
     return entries;
   }
@@ -447,8 +465,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * See `ContextStrategy.renderAsNewest`. The steps select takes for the
    * messages it sends, over the view's suffix from the batch's oldest
    * message to its newest: each cut as select cuts it (cappedContent), then
-   * applyImageStripping, whose depth is measured from the view's newest
-   * message, as select's is. A message before the anchor, which select
+   * the live-image policy's verdicts applied (liveImagePolicy, stripImages),
+   * each decided from its message and newer ones, with depth from the view's
+   * newest message, so they're select's. A message before the anchor, which select
    * leaves out, comes back as null. Like select, it first reloads the
    * branch the store has moved to. A re-anchor the next compile's budget
    * forces isn't foreseen: it moves the anchor only past a window bigger
@@ -467,7 +486,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       if (i !== undefined && shown(i)) from = Math.min(from, i);
     }
     // Timeline order with each message's position as its index, as select's
-    // entries have, which the image pass reads for depth and newest-first.
+    // entries have, which stripImages reads the verdicts by.
     const entries: ContextEntry[] = [];
     for (let i = from; i < messages.length; i++) {
       const msg = messages[i]!;
@@ -479,7 +498,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         content: this.cappedContent(msg),
       });
     }
-    this.applyImageStripping(entries, messages, store);
+    this.stripImages(entries, this.liveImagePolicy(messages, store, from));
     const rendered = new Map<MessageId, ContentBlock[]>();
     for (const entry of entries) rendered.set(entry.sourceMessageId!, entry.content);
     return ids.map((id) => rendered.get(id) ?? null);
@@ -496,18 +515,42 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
   // Live-image policy (mirrors AutobiographicalStrategy.applyImageStripping)
   // --------------------------------------------------------------------------
 
-  private applyImageStripping(
-    entries: ContextEntry[],
+  /**
+   * The policy's verdict on every image of the messages from `from` to the
+   * newest (`strips`, true where the placeholder replaces it, in the order
+   * `imagesIn` and `replaceImages` visit a message's images), and the tokens
+   * each message's estimate gives back for the images it loses (`saved`).
+   * `select` prices the window by `saved` and applies `strips` to what it
+   * emits (stripImages), so the verdicts it prices are the ones the strip
+   * applies. `ceilings` names, for each message, the image ceilings that
+   * decided one of its images is stripped (ceilingsDeciding), for the line
+   * a returned render says (reportCeilings).
+   *
+   * That holds wherever the window starts, and the re-anchor walk reads them
+   * as they are, as `renderAsNewest` does from the batch's oldest message:
+   * the window is every message from the anchor on, and each
+   * verdict is decided from that message and newer ones only, its depth from
+   * the newest message over the whole view and its count and bytes
+   * newest-first. So a message's verdicts, and its price after them, are the
+   * same whichever message the window starts at. A rule that looked at older
+   * messages, or at where the window starts, would break that, and the
+   * window would again be priced with images the strip takes out.
+   */
+  private liveImagePolicy(
     messages: StoredMessage[],
     store: MessageStoreView,
-    // Whether select returns this render: only such a render says a
-    // ceiling's line. A preview's (dryRun) doesn't, nor any other caller's.
-    returned = false,
-  ): void {
+    from: number,
+  ): ImagePolicy {
+    const strips: (boolean[] | undefined)[] = [];
+    const saved: number[] = [];
+    const ceilings: ({ images: boolean; bytes: boolean } | undefined)[] = [];
     // Count and bytes within the image ceilings; 0 = unlimited.
     const { images: maxLive, bytes: maxLiveBytes } = this.resolvedImageLimits().target;
     const depthTokens = this.imageStripDepthTokens;
-    if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return;
+    if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return { strips, saved, ceilings };
+    const calibration = store.getTokenCalibration?.() ?? 1;
+    // The placeholder as the store prices it, calibrated, by its own text estimator.
+    const placeholderPrice = store.estimateTokens({ content: [{ type: 'text', text: IMAGE_PLACEHOLDER }] } as unknown as StoredMessage);
 
     // Depth boundary: walk newest→oldest over the whole view (the policy is
     // "distance from the newest message", not "distance from the anchor").
@@ -523,28 +566,59 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     const ceilingSet = ceilingSetLimits(this.configuredImageLimits);
     let keptImages = 0;
     let keptImageBytes = 0;
-    // Entries are in timeline order; the policy counts newest-first.
-    for (let e = entries.length - 1; e >= 0; e--) {
-      const entry = entries[e];
-      if (!entry.content.some((b) => b.type === 'image')) continue;
-      const tooDeep = depthTokens > 0 && entry.index < stripStart;
-      entry.content = entry.content.map((block) => {
-        if (block.type !== 'image') return block;
-        const bytes = imageBlockBytes(block);
+    // Newest-first. Every image a message carries, nested in a tool_result
+    // included, is counted as the autobiographical strategy counts it (see
+    // inline-images.ts).
+    for (let i = messages.length - 1; i >= from; i--) {
+      const content = messages[i]!.content;
+      if (!hasImage(content)) continue;
+      const tooDeep = depthTokens > 0 && i < stripStart;
+      const verdicts: boolean[] = [];
+      let tokens = 0;
+      for (const image of imagesIn(content)) {
+        const bytes = inlineImageBytes(image);
         const overCount = maxLive > 0 && keptImages >= maxLive;
         const overBytes = maxLiveBytes > 0 && keptImageBytes + bytes > maxLiveBytes;
-        if (returned) {
-          const deciding = ceilingsDeciding({ images: overCount, bytes: overBytes }, tooDeep, ceilingSet);
-          if (deciding.images) this.reportCeilingBoundOnce('images');
-          if (deciding.bytes) this.reportCeilingBoundOnce('bytes');
+        const strip = tooDeep || overCount || overBytes;
+        const deciding = ceilingsDeciding({ images: overCount, bytes: overBytes }, tooDeep, ceilingSet);
+        if (deciding.images || deciding.bytes) {
+          const decided = (ceilings[i] ??= { images: false, bytes: false });
+          decided.images ||= deciding.images;
+          decided.bytes ||= deciding.bytes;
         }
-        if (tooDeep || overCount || overBytes) {
-          return { type: 'text', text: IMAGE_PLACEHOLDER } as ContentBlock;
+        if (strip) {
+          tokens += strippedImageSaving(image, placeholderPrice, calibration);
+        } else {
+          keptImages++;
+          keptImageBytes += bytes;
         }
-        keptImages++;
-        keptImageBytes += bytes;
-        return block;
-      });
+        verdicts.push(strip);
+      }
+      strips[i] = verdicts;
+      saved[i] = tokens;
+    }
+    return { strips, saved, ceilings };
+  }
+
+  /** The policy's verdicts applied to entries whose `index` is their
+   *  message's position. Truncation passes every block that holds an image
+   *  through, so an entry's images are its message's, in the order the
+   *  verdicts follow. */
+  private stripImages(entries: ContextEntry[], policy: { strips: (boolean[] | undefined)[] }): void {
+    for (const entry of entries) {
+      const strips = policy.strips[entry.index];
+      if (!strips) continue;
+      let k = 0;
+      entry.content = replaceImages(entry.content, () => strips[k++]!, IMAGE_PLACEHOLDER);
+    }
+  }
+
+  /** Says a ceiling's line once, for a ceiling that decided an image of an entry the render holds. */
+  private reportCeilings(entries: ContextEntry[], policy: ImagePolicy): void {
+    for (const entry of entries) {
+      const decided = policy.ceilings[entry.index];
+      if (decided?.images) this.reportCeilingBoundOnce('images');
+      if (decided?.bytes) this.reportCeilingBoundOnce('bytes');
     }
   }
 
@@ -586,11 +660,6 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
 // ----------------------------------------------------------------------------
 // Helpers (ports of the autobiographical strategy's protected utilities)
 // ----------------------------------------------------------------------------
-
-function imageBlockBytes(block: unknown): number {
-  const src = (block as { source?: { data?: string } }).source;
-  return typeof src?.data === 'string' ? src.data.length : 0;
-}
 
 /** Text-only token estimate at the same chars/4 rate the truncation marker reports. */
 function estimateTextOnlyTokens(content: ContentBlock[]): number {

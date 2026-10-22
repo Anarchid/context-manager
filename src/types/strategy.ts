@@ -229,7 +229,13 @@ export interface ContextStrategy {
 
   /**
    * React to new messages.
-   * Called after a message is added to the store.
+   * Called after a message is added to the store, inside the write that
+   * stored it, so its synchronous part runs before addMessage returns; the
+   * manager doesn't wait for the promise. A rejection, or a throw before it
+   * returns, is logged through the manager's diagnostics, naming the message,
+   * and doesn't reach addMessage's caller: the message stays stored, and the
+   * strategy isn't offered it again. A hook that returns no promise, as one
+   * written in JavaScript can, isn't a failure, and nothing is logged.
    */
   onNewMessage?(message: StoredMessage, ctx: StrategyContext): Promise<void>;
 
@@ -311,12 +317,11 @@ export interface ContextStrategy {
    * The image ceilings this strategy keeps its live window within and holds
    * a compression prompt to (`imageCeiling` and `imageByteCeiling`, 0 for
    * none). They're configuration, not usage: they bound the images the
-   * window counts (top-level image blocks; see
-   * `AutobiographicalConfig.maxLiveImages`), not every image a request
-   * carries, and nothing here bounds what a caller injects at compile time
-   * or appends to a compiled request. A caller that wants its request within
-   * them counts that request's images itself, every shape included, and
-   * compares the counts with these. Absent on a strategy with no live-image
+   * window counts (see `AutobiographicalConfig.maxLiveImages`), not every
+   * image a request carries, and nothing here bounds what a caller injects
+   * at compile time or appends to a compiled request. A caller that wants
+   * its request within them counts that request's images itself, every
+   * shape included, and compares the counts with these. Absent on a strategy with no live-image
    * window.
    */
   imageCeilings?(): ImageCeilings;
@@ -720,18 +725,26 @@ export interface RenderStats {
   };
   pending: { chunks: number; merges: number };
   /**
-   * Sum across all buckets — the actual rendered context size. A summary is a
-   * Q/A pair, so it counts as 2 messages here.
+   * Sum across all buckets — the rendered context's size as the selection
+   * priced it: the adaptive selection prices each message after the image
+   * strip, and the hierarchical one counts an image the strip replaces at its
+   * full price. A summary is a Q/A pair, so it counts as 2 messages here.
    */
   total: { messages: number; tokens: number };
 
   /**
    * Estimator calibration in force for this compile: the multiplier applied
-   * to every token estimate and the pricing epoch it was learned under.
-   * `provisional` is true while the multiplier is a guess rather than a value
-   * learned under this epoch's pricing: one kept from a record without a
-   * stamp, or the 1 a discard restarts from. The first provider sample
-   * replaces it outright (see `AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH`).
+   * to every token estimate, and the pricing epoch in force. A multiplier
+   * that isn't provisional was learned under that epoch's pricing, or under
+   * an older epoch's and kept, re-stamped, because nothing this store holds
+   * was repriced since; either way it's reported under the epoch in force.
+   * `provisional` is true while the multiplier is a guess, which the first
+   * provider sample the calibration's band accepts replaces outright, rather
+   * than stepping toward it (see
+   * `AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH`): one kept from a
+   * record without a stamp, or the 1 a discard restarts from. That 1 stays
+   * provisional through a later epoch's load, which re-stamps it whatever
+   * that epoch repriced.
    * `reset` is present once a multiplier from an older or unknown epoch has
    * been discarded, on load or when a provisional one above 1 put the first
    * compile over budget. It is kept
@@ -1239,13 +1252,12 @@ export interface AutobiographicalConfig {
    *  image, the token budget binds first unless the images are small. A
    *  fraction is floored, to at least 1.
    *  A hard limit for dense bursts that pack many images into the live window.
-   *  The window counts top-level `image` blocks, and measures their bytes by
-   *  the length of their base64 `source.data`. So an image nested in a tool
-   *  result and a `generated_image` are neither counted nor replaced, and an
-   *  image with a `data:` URL counts but its bytes don't. In the window,
-   *  every live-image limit and image ceiling below counts the same way; a
-   *  compression prompt counts every image, nested and generated ones
-   *  included (see `imageCeiling`). */
+   *  Every `image` block counts, whatever its source (base64, a `data:` URL
+   *  or a remote URL), and so does every generated image, top-level or
+   *  nested in a tool result (see inline-images.ts). An image inside an
+   *  opaque provider item, such as a Responses `image_generation_call`
+   *  replayed from its raw form, doesn't. Every live-image limit and image
+   *  ceiling below counts the same way. */
   maxLiveImages?: number;
   /** Token depth from the newest message beyond which images are stripped to a
    *  text placeholder, even though the surrounding text stays verbatim. Measured
@@ -1268,13 +1280,15 @@ export interface AutobiographicalConfig {
 
   /**
    * Byte wall for live images (2026-07-12): keep inline images newest-first
-   * only while their cumulative base64 size stays under this budget — on top
-   * of `maxLiveImages` / `imageStripDepthTokens`. Default 20 MiB of base64.
-   * The window keeps at most `imageByteCeiling` whatever this says, and 0
-   * here means up to that ceiling. It counts the bytes of the images the
-   * window counts (see `maxLiveImages`), not the request's other bytes, so on
-   * its own it can't keep a request under membrane's byte cap: see
-   * `imageByteCeiling`.
+   * only while their cumulative inline size (a base64 source, a `data:` URL's
+   * payload, a generated image's `data`; 0 for a remote URL) stays under
+   * this budget — on top of `maxLiveImages` / `imageStripDepthTokens`.
+   * Default 20 MiB of base64. The window keeps at most `imageByteCeiling`
+   * whatever this says, and 0 here means up to that ceiling. It counts the
+   * images the window counts (see `maxLiveImages`), not the request's other
+   * bytes, so on its own it can't keep a request under membrane's byte cap:
+   * see `imageByteCeiling`. An image inside an opaque provider item (see
+   * `maxLiveImages`) isn't counted, so it's outside this budget.
    */
   maxLiveImageBytes?: number;
 
@@ -1303,17 +1317,17 @@ export interface AutobiographicalConfig {
   maxCompressionImageBytes?: number;
 
   /**
-   * The most top-level image blocks a strategy's live window keeps, whatever
-   * `maxLiveImages` says, and the most images a compression prompt carries
-   * (2026-10-19). A `maxLiveImages` of 0 means up to this many. The window
-   * counts top-level `image` blocks (see `maxLiveImages`); a compression
-   * prompt counts every image, nested ones and generated ones included.
+   * The most images a strategy's live window keeps, whatever `maxLiveImages`
+   * says, and the most images a compression prompt carries (2026-10-19). A
+   * `maxLiveImages` of 0 means up to this many. It counts images as
+   * `maxLiveImages` does: every image, nested ones and generated ones
+   * included, but not one inside an opaque provider item.
    *
-   * It doesn't bound a whole request. The window's images nested in tool
-   * results and its generated images aren't counted, and neither is
-   * anything a caller injects at compile time or appends to a compiled
-   * request; `imageCeilings()` reports this ceiling, so such a caller can
-   * count its request's images itself and compare. The provider refuses a
+   * It doesn't bound a whole request. Images inside opaque provider items
+   * aren't counted, and neither is anything a caller injects at compile time
+   * or appends to a compiled request; `imageCeilings()` reports this
+   * ceiling, so such a caller can count its request's images itself and
+   * compare. The provider refuses a
    * request with more than 600 images and documents together (measured
    * 2026-10-13, and again on 2026-10-19), and the default, 500, leaves room
    * for what this doesn't count. 0 = no ceiling. A value that isn't 0 or a
@@ -1330,11 +1344,12 @@ export interface AutobiographicalConfig {
   imageCeiling?: number;
 
   /**
-   * The most inline image bytes (base64) of the top-level image blocks a
-   * strategy's live window keeps, whatever `maxLiveImageBytes` says, and the
-   * most of its images' bytes a compression prompt carries (2026-10-19). A
-   * `maxLiveImageBytes` of 0 means up to this many. The window measures an
-   * image by the length of its base64 `source.data` (see `maxLiveImages`).
+   * The most inline image bytes of the images a strategy's live window
+   * keeps, whatever `maxLiveImageBytes` says, and the most of its images'
+   * bytes a compression prompt carries (2026-10-19). A `maxLiveImageBytes`
+   * of 0 means up to this many. It measures an image as `maxLiveImageBytes`
+   * does: a base64 source's length, a `data:` URL's payload, a generated
+   * image's `data`, and 0 for a remote URL.
    *
    * It doesn't bound a request's bytes: the messages' text and JSON,
    * documents, the images the window doesn't count, and anything a caller
@@ -1456,7 +1471,11 @@ export interface AutobiographicalConfig {
    * summary's parent pointers, and
    * reopens or removes the chunk records and queued merges that name a
    * summary it doesn't keep. It also stores the summary-id counter when the
-   * stored one trails the ids the store holds.
+   * stored one trails the ids the store holds. It leaves out of the merge
+   * quarantine, names and writes it back without every entry that isn't a
+   * record with a string key and a `sourceIds` list whose ids are all
+   * non-empty strings (an empty list is kept), and replaces a stored merge
+   * quarantine that isn't a list with an empty one.
    */
   auditOnly?: boolean;
   /** Legacy first-choice target-only merge request. Default false. */
