@@ -82,6 +82,7 @@ import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 import { holdsSystemChange, isSystemChange, systemChangePositions } from '../system-changes.js';
+import { storedJson } from '../stored-json.js';
 
 /** A persisted reset record is trusted only if it has the expected shape. */
 function isCalibrationReset(v: unknown): v is CalibrationReset {
@@ -2059,7 +2060,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected get resolutionsStateId(): string { return `${this.ns}/autobio:resolutions`; }
   protected get locksStateId(): string { return `${this.ns}/autobio:locks`; }
   protected get calibrationStateId(): string { return `${this.ns}/autobio:calibration`; }
-  protected get imageWatermarkStateId(): string { return `${this.ns}/autobio:imageStripWatermark`; }
   protected get kvUnifiedReceiptStateId(): string { return `${this.ns}/kvunified:presentation-receipt`; }
   private kvUnifiedReceipts = new KvUnifiedReceiptChain();
   /** A persisted kv-unified receipt was found while loading under another
@@ -2856,14 +2856,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._lastRenderStats = null;
     this._lastCompileEstimate = 0;
     this._storeView = null;
+    // Prices memoized over the view just cleared: the next one may estimate otherwise.
+    this._answerCostCache.clear();
     this._calibrationArmed = false;
     this._calibration = 1;
     this._calibrationEma = null;
     this._calibrationLoaded = false;
     this._calibrationReset = null;
     this._calibrationProvisional = null;
-    this._imageWatermark = undefined;
-    this._imageWatermarkLoaded = false;
+    this._imageStripReplayMemo = null;
     this._lastKvStable = null;
     this._storeOrder = new Map();
     this._storeOrderSource = [];
@@ -2952,7 +2953,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (!this.store) return;
     const stored = this.store.getStateJson(this.chunksStateId);
     if (!Array.isArray(stored)) return;
-    const payload = Buffer.from(JSON.stringify(rec));
+    const payload = storedJson(rec);
     let found = false;
     for (let i = 0; i < stored.length; i++) {
       const item = stored[i] as ChunkRecord | null;
@@ -3031,15 +3032,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       id: this.compressionFamilyProgressStateId,
       strategy: 'snapshot',
     });
-    // imageStripHysteresisRatio's watermark, registered only when the option
-    // is on, as the adaptive slots below are, so chronicles without it don't
-    // accumulate an unused slot.
-    if (this.imageHysteresisRatio() !== undefined) {
-      registerState({
-        id: this.imageWatermarkStateId,
-        strategy: 'snapshot',
-      });
-    }
     // Adaptive-resolution state slots — only registered when the flag is on
     // so chronicles without the flag don't accumulate unused slots.
     if (this.config.adaptiveResolution) {
@@ -6150,7 +6142,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const stored = this.store.getStateJson(this.summariesStateId);
     if (!Array.isArray(stored)) return;
     let found = false;
-    const payload = Buffer.from(JSON.stringify(entry));
+    const payload = storedJson(entry);
     for (let i = 0; i < stored.length; i++) {
       const item = stored[i] as SummaryEntry | null;
       if (item && item.id === entry.id) {
@@ -7785,11 +7777,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // a dry run (or a preview's overridden chunk size) cut. So does the
     // queue's generation: a call in flight must not read the dry rebuild as
     // one that re-queued its chunk (requeuePendingChunk).
-    // The image watermark (imageStripHysteresisRatio) goes back too, with the
-    // post-strip estimates priced from it. The dry run advances it for its own
-    // render and writes nothing, so a preview can't strip images from the next
-    // live compile. It's loaded here, before it's saved, so the value put back
-    // is the loaded one.
     const restore = this.saveDryRunState(store);
     const lastRenderStats = this._lastRenderStats;
     this._lastPreviewStats = undefined;
@@ -8621,20 +8608,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   getRenderStats(store: MessageStoreView): RenderStats {
     this.requireLoadedBranch('getRenderStats');
     if (this._lastRenderStats) return this._lastRenderStats;
-    // Reconstructing the recent window prices images and may advance the
-    // watermark. Like a dry select, this observer uses that advance locally
-    // and restores the watermark together with the estimates priced from it.
-    const savedWatermark = this.imageWatermark();
-    const savedMemo = this._postStripMemo;
-    const savedDryRun = this._dryRunSelect;
-    this._dryRunSelect = true;
-    try {
-      return this.withToolPruning(store, () => this.reconstructRenderStats(store));
-    } finally {
-      this._dryRunSelect = savedDryRun;
-      this._imageWatermark = savedWatermark;
-      this._postStripMemo = savedMemo;
-    }
+    return this.withToolPruning(store, () => this.reconstructRenderStats(store));
   }
 
   /**
@@ -8720,7 +8694,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Without estimates (the hierarchical selection), the pruned form's
     // own, with its images whole: that selection's strip counts only the
-    // images it sends.
+    // images it sends, or, with imageStripHysteresisRatio, applies that
+    // option's set, and it prices no image as the placeholder either way.
     const est = (i: number): number => pse?.[i] ?? store.estimateTokens(this.prunedForSend(store, messages[i]!));
     const accepted: number[] = [];
     let acceptedTokens = 0;
@@ -12589,13 +12564,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * checkReadiness waits on more: chunks the cap or a hold keeps, and a merge
    * a hold blocks. Compressing a chunk replaces its raw messages with a
    * summary, and a merge folds summaries into one.
+   *
+   * `within`, when given, narrows what counts to work that folds one of those
+   * messages: a hierarchical refusal in the middle passes the messages its
+   * refused prefix holds, raw or under a summary it sends, since work that
+   * folds none of them can't shrink it. Every rule above reads the narrowed
+   * set as it reads the whole, except a compression in flight with nothing
+   * recorded beside it, which counts whatever the prefix holds, since nothing
+   * says what it folds.
    */
-  protected compressionWorkQueued(store: MessageStoreView, path: 'adaptive' | 'hierarchical'): boolean {
+  protected compressionWorkQueued(
+    store: MessageStoreView,
+    path: 'adaptive' | 'hierarchical',
+    within?: ReadonlySet<MessageId>,
+  ): boolean {
     // Work frees room only where its summary folds a message the selection
     // can fold now: both selectors keep the head and recent windows raw, and
     // a message a pin keeps raw. That's the chunker's own reading of what's
     // compressible (getCompressibleMessages).
-    const foldable = new Set(this.getCompressibleMessages(store).map((m) => m.id));
+    const foldable = new Set(
+      this.getCompressibleMessages(store).map((m) => m.id).filter((id) => within === undefined || within.has(id)),
+    );
     const foldsNothing = (chunk: Chunk): boolean => !chunk.messages.some((m) => foldable.has(m.id));
     // A merge's messages are the leaves of its sources, expanded through the
     // summaries in memory as the selectors expand them; a source not loaded
@@ -14027,7 +14016,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const store = this.store;
     if (!store) return;
     if (typeof (store as { setState?: unknown }).setState === 'function') {
-      store.setState(stateId, Buffer.from(JSON.stringify(value)));
+      store.setState(stateId, storedJson(value));
     } else {
       store.setStateJson(stateId, value);
     }
@@ -15465,23 +15454,26 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return Math.max(0.2, 1 - 0.8 * externalized);
   }
 
-  /** Memoized true render cost of a summary's recall pair (label + answer
-   *  content as the LIVE WINDOW renders it — carriers included under
-   *  `carrierPolicy: 'full'`, omitted under `'live-strip'`, because this
-   *  price feeds the fold planner for that same emission). Keyed by the
-   *  summary identity and every config value that changes these bytes, so a
-   *  scoped preview cannot reuse or poison another policy's price. */
-  private _pairCostCache = new Map<string, number>();
+  /** Memoized price of a summary's recall answer as the LIVE WINDOW renders
+   *  it (carriers included under `carrierPolicy: 'full'`, omitted under
+   *  `'live-strip'`, because this price feeds the fold planner for that same
+   *  emission): `estimate` is the estimate of that content, and `cost` is
+   *  what it's priced at, the estimate floored at the provider's measurement
+   *  where that measurement counts what's sent. Keyed by the summary identity
+   *  and every config value that changes these bytes, so a scoped preview
+   *  cannot reuse or poison another policy's price. The estimator is the
+   *  store's: every caller prices inside a select, with the store's view
+   *  bound, and initialize clears the memo when the strategy takes a store. */
+  private _answerCostCache = new Map<string, { estimate: number; cost: number }>();
 
-  protected recallPairCost(s: SummaryEntry): number {
-    const label = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
+  protected recallAnswerCost(s: SummaryEntry): { estimate: number; cost: number } {
     const recallEnvelope = this.config.recallEnvelope === 'xml' ? 'xml' : 'none';
     const carrierPolicy = this.config.carrierPolicy === 'live-strip' ? 'live-strip' : 'full';
     const calibration = this._storeView?.getTokenCalibration?.() ?? 1;
-    const key = JSON.stringify([s.id, s.tokens, label, recallEnvelope, carrierPolicy, calibration]);
-    const cached = this._pairCostCache.get(key);
+    const key = JSON.stringify([s.id, s.tokens, recallEnvelope, carrierPolicy, calibration]);
+    const cached = this._answerCostCache.get(key);
     if (cached !== undefined) return cached;
-    const estimatedAnswer = this.estimateTokens(this.liveWindowAnswerContent(s));
+    const estimate = this.estimateTokens(this.liveWindowAnswerContent(s));
     // When responseContent exists, `tokens` is normally the provider's exact
     // output-token count for those same replayed blocks (thinking carriers +
     // text). Re-estimating signed-empty thinking at the 600-token legacy
@@ -15496,15 +15488,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // would charge the fold planner for bytes that are not rendered — the
     // Mica-2026-07-26 wedge from the other side — so the stripped render's
     // estimate stands alone.
-    const answer =
-      carrierPolicy === 'full' && s.responseContent && Number.isFinite(s.tokens) && s.tokens > 0
-        ? Math.max(s.tokens, estimatedAnswer)
-        : estimatedAnswer;
     const cost =
-      this.estimateTokens([{ type: 'text', text: label }]) +
-      answer;
-    this._pairCostCache.set(key, cost);
-    return cost;
+      carrierPolicy === 'full' && s.responseContent && Number.isFinite(s.tokens) && s.tokens > 0
+        ? Math.max(s.tokens, estimate)
+        : estimate;
+    const priced = { estimate, cost };
+    this._answerCostCache.set(key, priced);
+    return priced;
+  }
+
+  /** The true render cost of a summary's recall pair: its label, and its
+   *  answer as recallAnswerCost prices it. */
+  protected recallPairCost(s: SummaryEntry): number {
+    const label = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
+    return this.estimateTokens([{ type: 'text', text: label }]) + this.recallAnswerCost(s).cost;
   }
 
   /**
@@ -15697,6 +15694,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Matches moltbot's budget waterfall: L3 → L2 → L1 with unused budget flowing down.
    */
   protected selectHierarchical(store: MessageStoreView, budget: TokenBudget): ContextEntry[] {
+    // Recall pairs are priced with the store's estimator, as raw messages are
+    // (store.estimateTokens), not the fallback rules: the adaptive path binds
+    // the view in loadCalibration. Bound for this select alone, so a mint
+    // request's recall pairs (capRecallPairs) price as they did.
+    const bound = this._storeView;
+    this._storeView = store;
+    try {
+      return this.selectHierarchicalBound(store, budget);
+    } finally {
+      this._storeView = bound;
+    }
+  }
+
+  private selectHierarchicalBound(store: MessageStoreView, budget: TokenBudget): ContextEntry[] {
     phaseChannel.report('context-build'); // liveness-watchdog phase
     this.rsBegin();
     const entries: ContextEntry[] = [];
@@ -15754,7 +15765,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const msg = messages[i];
       const { content, extra } = this.cappedForSend(store, msg, msgCap);
       // The pruned form's price with its images whole: this selection's
-      // strip counts only the images it sends (#219).
+      // strip counts only the images it sends (#219), or, with
+      // imageStripHysteresisRatio, applies that option's set, and it prices
+      // no image as the placeholder either way.
       const tokens = store.estimateTokens(this.prunedForSend(store, msg)) + extra;
       // The head is sent whole by definition: stopping it mid-window drops
       // messages no summary covers. Refuse honestly beyond grace.
@@ -15800,6 +15813,45 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (entries.length > 0) {
       entries[entries.length - 1].cacheMarker = true;
     }
+
+    // What the head took, for a refusal in the middle to report as head.
+    const headTokens = totalTokens;
+    // A refusal in the middle reports the head as head, and the rest of the
+    // running total, the refused item included, as middle. It names
+    // compression only for work that folds a message the refused prefix
+    // holds: the middle's raw messages up to the refused one, and the leaves
+    // of the summaries it sends up to there. Work after the refused item
+    // can't shrink that prefix, nor can a chunk's compression that only moves
+    // raw messages from after a combined pair into it, and the head never
+    // folds.
+    let summariesById: Map<string, SummaryEntry> | undefined;
+    const middleRefusal = (refused: {
+      actual: number;
+      unit: 'selection-items' | 'raw-messages';
+      count: number;
+      deepestLevel: number;
+      summaries: readonly SummaryEntry[];
+      raw: readonly StoredMessage[];
+    }): OverBudgetError => {
+      summariesById ??= new Map(this.summaries.map((s) => [s.id, s]));
+      const prefix = new Set<MessageId>(refused.raw.map((m) => m.id));
+      for (const s of refused.summaries) this.expandSummaryToLeafMessageIds(s, summariesById, prefix);
+      return this.overBudgetError(budget, {
+        stage: 'Hierarchical emission overran the budget',
+        budget: graceLimit,
+        actual: refused.actual,
+        clearedBy: this.compressionWorkQueued(store, 'hierarchical', prefix) ? ['compression'] : [],
+        diagnostics: {
+          middleCountUnit: refused.unit,
+          deepestLevelKind: 'attempted',
+          headTokens,
+          tailTokens: 0,
+          middleTokens: refused.actual - headTokens,
+          middleChunkCount: refused.count,
+          deepestLevel: refused.deepestLevel,
+        },
+      });
+    };
 
     // Compute recent window exclusion set (also exclude head window messages)
     const recentStart = this.getRecentWindowStart(store);
@@ -16080,8 +16132,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           items.push({ kind: 'pin', position: p.position, msg: p.msg });
         }
         items.sort((a, b) => a.position - b.position);
+        // The middle's summaries and raw messages up to and including item k,
+        // less a summary the loop below skips for having no content.
+        const prefixOf = (k: number): { summaries: SummaryEntry[]; raw: StoredMessage[] } => ({
+          summaries: items.slice(0, k + 1).flatMap((it) => (it.kind === 'summary' && it.summary.content?.trim() ? [it.summary] : [])),
+          raw: items.slice(0, k + 1).flatMap((it) => (it.kind === 'pin' ? [it.msg] : [])),
+        });
 
-        for (const item of items) {
+        for (const [k, item] of items.entries()) {
           if (item.kind === 'summary') {
             const summary = item.summary;
             // Defensive: never emit a recall pair for an empty/bugged summary — an
@@ -16110,20 +16168,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // history (pins / uncompressed / frontier raw). Emit within
             // grace; refuse the turn beyond it.
             if (totalTokens + pairTokens > graceLimit) {
-              throw this.overBudgetError(budget, {
-                stage: 'Hierarchical emission overran the budget',
-                budget: graceLimit,
+              throw middleRefusal({
                 actual: totalTokens + pairTokens,
-                clearedBy: this.compressionWorkQueued(store, 'hierarchical') ? ['compression'] : [],
-                diagnostics: {
-                  middleCountUnit: 'selection-items',
-                  deepestLevelKind: 'attempted',
-                  headTokens: 0,
-                  tailTokens: 0,
-                  middleTokens: totalTokens + pairTokens,
-                  middleChunkCount: items.length,
-                  deepestLevel: summary.level,
-                },
+                unit: 'selection-items',
+                count: items.length,
+                deepestLevel: summary.level,
+                ...prefixOf(k),
               });
             }
             entries.push(questionEntry);
@@ -16135,20 +16185,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const { content, extra } = this.cappedForSend(store, msg, msgCap);
             const tokens = store.estimateTokens(this.prunedForSend(store, msg)) + extra;
             if (totalTokens + tokens > graceLimit) {
-              throw this.overBudgetError(budget, {
-                stage: 'Hierarchical emission overran the budget',
-                budget: graceLimit,
+              throw middleRefusal({
                 actual: totalTokens + tokens,
-                clearedBy: this.compressionWorkQueued(store, 'hierarchical') ? ['compression'] : [],
-                diagnostics: {
-                  middleCountUnit: 'selection-items',
-                  deepestLevelKind: 'attempted',
-                  headTokens: 0,
-                  tailTokens: 0,
-                  middleTokens: totalTokens + tokens,
-                  middleChunkCount: items.length,
-                  deepestLevel: 0,
-                },
+                unit: 'selection-items',
+                count: items.length,
+                deepestLevel: 0,
+                ...prefixOf(k),
               });
             }
             entries.push({
@@ -16165,6 +16207,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       } else {
         // Legacy combined-pair mode for summaries; pins still emit raw at
         // their positions after the combined pair.
+        // The summaries the combined pair's answer holds, which a refusal
+        // after it counts in its prefix.
+        let pairSummaries: SummaryEntry[] = [];
         if (selectedSummaries.length > 0) {
           const contextLabel = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
 
@@ -16194,8 +16239,38 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             summaries: combinedRefs,
           };
 
+          // The summaries the answer holds: every one the flat cap left
+          // something of, since it passes every carrier through, cut text or
+          // not (capContent), and under the xml envelope those its cap
+          // admitted, which ends at the first summary it cuts.
+          const admittedIds = new Set(combinedRefs.map((ref) => ref.id));
+          const admitted = selectedSummaries.filter((s) => admittedIds.has(s.id));
+          pairSummaries = admitted;
+          // The pair is priced at what goes out: the label, and the answer as
+          // the cap left it, with each summary it holds floored as
+          // recallAnswerCost floors a positioned pair's answer, so a carrier's
+          // measured tokens count here too.
+          let floorExcess = 0;
+          for (const s of admitted) {
+            const { estimate, cost } = this.recallAnswerCost(s);
+            floorExcess += cost - estimate;
+          }
           const pairTokens = this.estimateTokens(questionEntry.content) +
-                             this.estimateTokens(answerEntry.content);
+                             this.estimateTokens(answerEntry.content) + floorExcess;
+          // The pair covers history (coverage completion force-includes its
+          // claimers whatever the budget), so beyond the grace window the
+          // select refuses the turn here, as it refuses a positioned pair,
+          // rather than send over the budget or refuse at what follows it.
+          if (totalTokens + pairTokens > graceLimit) {
+            throw middleRefusal({
+              actual: totalTokens + pairTokens,
+              unit: 'selection-items',
+              count: selectedSummaries.length,
+              deepestLevel: selectedSummaries.reduce((deepest, s) => Math.max(deepest, s.level), 0),
+              summaries: admitted,
+              raw: [],
+            });
+          }
 
           entries.push(questionEntry);
           entries.push(answerEntry);
@@ -16216,20 +16291,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // removes them from the agent's context with no representation at
             // all, so beyond the grace window the select refuses the turn
             // rather than returning a plausible-looking window.
-            throw this.overBudgetError(budget, {
-              stage: 'Hierarchical emission overran the budget',
-              budget: graceLimit,
+            throw middleRefusal({
               actual: totalTokens + tokens,
-              clearedBy: this.compressionWorkQueued(store, 'hierarchical') ? ['compression'] : [],
-              diagnostics: {
-                middleCountUnit: 'raw-messages',
-                deepestLevelKind: 'attempted',
-                headTokens: 0,
-                tailTokens: 0,
-                middleTokens: totalTokens + tokens,
-                middleChunkCount: middleRawSorted.length,
-                deepestLevel: 0,
-              },
+              unit: 'raw-messages',
+              count: middleRawSorted.length,
+              deepestLevel: 0,
+              summaries: pairSummaries,
+              raw: middleRawSorted.slice(0, mi + 1).map((entry) => entry.msg),
             });
           }
           entries.push({
@@ -16261,8 +16329,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // priced every message at the store's full estimate of the form it sends,
     // plus what a maxMessageTokens cut changes, which leaves its images at
     // full price. So it priced no image as the placeholder, and the strip
-    // counts only the images it sends (see applyImageStripping's
-    // asEstimated). The render stats keep each message at the price emission
+    // counts only the images it sends, or, with imageStripHysteresisRatio,
+    // applies the rule's verdicts (see applyImageStripping's asEstimated).
+    // The render stats keep each message at the price emission
     // gave it, a stripped image included.
     this.applyImageStripping(entries, store);
     this.rsEnd();
@@ -17066,7 +17135,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Message index marking the image-strip depth boundary: walks newest→oldest
    *  summing each stored message's estimate as the store prices it
    *  (store.estimateTokens, calibrated), before tool pruning and image
-   *  strips: the depth rule postStripEstimates and the watermark use too
+   *  strips: the depth rule postStripEstimates and imageStripReplay use too
    *  (the recent window's walk, getUnheldRecentWindowStart, sums them
    *  after both). It returns the index of the first message still within
    *  `depthTokens`. Messages before this index have their images stripped
@@ -17085,7 +17154,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  names no particular limit and no recency, since several rules write it:
    *  the count, byte and depth limits (the byte rule is greedy, so a large
    *  newest image can be replaced while smaller older ones stay), the
-   *  hysteresis watermark, which strips below them, and the compression
+   *  hysteresis rule, which trims to a fraction of them, and the compression
    *  request's own image byte cap. Windowed passthrough uses the same text. */
   private static readonly IMAGE_PLACEHOLDER = '[image not shown: this context keeps only some images]';
 
@@ -17097,7 +17166,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  "[image attachment: <name>]" text added at ingest preserves the filename,
    *  so the placeholder itself stays terse. Reduces tokens, so it never pushes
    *  a compiled context back over budget, apart from an image priced below
-   *  the placeholder (see `strippedImageSaving`).
+   *  the placeholder (see `strippedImageSaving`). With
+   *  `imageStripHysteresisRatio`, the rule's set (imageStripReplay) decides
+   *  in place of the limits: a message's first images go, as many as the
+   *  rule strips of it, applied on every path as `asEstimated` applies them.
    *
    *  Runs INSIDE each select path, *before* `rsEnd()` and `placeCacheMarkers`,
    *  so the cache breakpoints describe the post-strip context. It leaves the
@@ -17139,9 +17211,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  head, middle and tail at the store's full estimate of each message as
    *  it's sent, with what a cut changes added. So it priced no image as the
    *  placeholder, and counting images it doesn't send would only cost it
-   *  live ones. (Its recent window's start and the image watermark count each
+   *  live ones. (Its recent window's start and imageStripReplay count each
    *  stored message's images as it's sent, as the estimates do.) A caller that
-   *  prices by the estimates asks too. */
+   *  prices by the estimates asks too. With `imageStripHysteresisRatio`,
+   *  every caller gets the verdicts: the rule's set is per stored message,
+   *  so counting what the entries send has nothing to add, and a tool result
+   *  pairing repair moved keeps its own message's count. */
   protected applyImageStripping(entries: ContextEntry[], store: MessageStoreView, opts: { asEstimated?: boolean } = {}): void {
     const maxLive = this.config.maxLiveImages ?? 0;             // 0 = unlimited count
     const depthTokens = this.config.imageStripDepthTokens ?? 0; // 0 = no depth strip
@@ -17162,7 +17237,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       .filter(({ idx }) => this.hasImageBlock(entries[idx].content))
       .sort((a, b) => b.pos - a.pos);
 
-    if (opts.asEstimated) {
+    if (opts.asEstimated || this.imageHysteresisRatio() !== undefined) {
       const verdicts = this.postStripVerdicts(store);
       const taken = new Map<number, Map<unknown, number>>();
       /** The verdict of the next image of `group` in the message at `home`,
@@ -17219,11 +17294,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     /** Whether the policy keeps this image, counting it live if so. */
     const keeps = (image: ContentBlock, pos: number): boolean => {
       const tooDeep = depthTokens > 0 && (pos < 0 || pos < stripStart);
-      const belowMark = pos >= 0 && this.belowImageWatermark(messages[pos]!.sequence);
       const blockBytes = inlineImageBytes(image);
       const overCount = maxLive > 0 && keptImages >= maxLive;
       const overBytes = maxLiveBytes > 0 && keptImageBytes + blockBytes > maxLiveBytes;
-      if (belowMark || tooDeep || overCount || overBytes) return false;
+      if (tooDeep || overCount || overBytes) return false;
       keptImages++;
       keptImageBytes += blockBytes;
       return true;
@@ -17232,7 +17306,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const entry = entries[idx];
       const bucket = bucketAt(pos);
       // Every image the entry carries, nested in a tool_result included, in
-      // the order postStripEstimates and the watermark count them. A block
+      // the order postStripEstimates and imageStripReplay count them. A block
       // is copied only when an image in it goes, and the raw forms an edited
       // block carried are released, so a replay can't bring the image back.
       entry.content = replaceImages(entry.content, (image) => {
@@ -17247,24 +17321,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
   }
 
-  /** imageStripHysteresisRatio: images in messages at or before this
-   *  sequence stay stripped (undefined = none). Loaded lazily, persisted. */
-  private _imageWatermark: number | undefined;
-  private _imageWatermarkLoaded = false;
-  /** Whether a failed watermark write has been logged (once per instance). */
-  private _imageWatermarkWriteWarned = false;
-
-  protected imageWatermark(): number | undefined {
-    if (!this._imageWatermarkLoaded) {
-      this._imageWatermarkLoaded = true;
-      try {
-        const saved = this.store?.getStateJson(this.imageWatermarkStateId) as { sequence?: number } | null;
-        if (saved && Number.isFinite(saved.sequence)) this._imageWatermark = saved.sequence;
-      } catch { /* absent slot is fine */ }
-    }
-    return this._imageWatermark;
-  }
-
   /** Hysteresis ratio in (0, 1), or undefined when the option is off. */
   private imageHysteresisRatio(): number | undefined {
     const r = this.config.imageStripHysteresisRatio;
@@ -17272,78 +17328,98 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * imageStripHysteresisRatio: if any image newer than the watermark would be
-   * stripped by the live-image limits, advance the watermark so that what
-   * remains fits within ratio × each limit. Deterministic in the store's
-   * content, and persisted, so a restart renders the same stripped set.
+   * imageStripHysteresisRatio's set, from the stored messages and the limits
+   * alone: replay the messages oldest first, admitting each one's images in
+   * order, and whenever a limit binds (`maxLiveImages`, `maxLiveImageBytes`,
+   * or the oldest live image deeper than `imageStripDepthTokens`), strip the
+   * oldest live images one at a time until every limit fits ratio × itself.
+   * A target that rounds to 0 is 0, but the newest image stays while it fits
+   * the full limits, and so do the other images of its message while only
+   * depth is over its target, since stripping them can't lower the depth
+   * they're at. Depth is counted as getImageStripStart counts it: an
+   * image's own message and every newer one, at the store's estimates.
+   * A message's images are those its cut sends (cappedForSend), nested in a
+   * tool_result included, in imagesIn's order and at inlineImageBytes'
+   * size, as postStripEstimates counts them. Stripping takes the oldest
+   * images first, so a message's stripped images are its first ones: the
+   * answer is how many, by message id (a message with none stripped is
+   * absent). Undefined when the option is off or no limit is set.
+   * postStripEstimates gives those images their verdicts, which
+   * applyImageStripping applies on every path while the option is on. The adaptive middle's and kv-unified's raw body entries
+   * carry their shards' text alone, so the images of those shards aren't
+   * sent, though the rule counts them toward the limits, and the budget
+   * prices them.
    */
-  protected maybeAdvanceImageWatermark(store: MessageStoreView): void {
+  protected imageStripReplay(store: MessageStoreView): ReadonlyMap<MessageId, number> | undefined {
     const ratio = this.imageHysteresisRatio();
-    if (ratio === undefined) return;
-    const stripDepth = this.config.imageStripDepthTokens ?? 0;
-    const maxLive = this.config.maxLiveImages ?? 0;
-    const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
-    if (stripDepth === 0 && maxLive === 0 && maxLiveBytes === 0) return;
-    const messages = store.getAll();
-    const w = this.imageWatermark();
-    // Walk newest-first with the given limits; return the sequence of the
-    // first message holding an image that does not fit (or undefined).
-    const firstMisfit = (depthCap: number, countCap: number, bytesCap: number): number | undefined => {
-      let depth = 0, count = 0, bytes = 0;
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const m = messages[i]!;
-        if (w !== undefined && m.sequence <= w) break;
-        // A message's own tokens count toward its depth, as getImageStripStart
-        // counts them: the message that crosses the cap is beyond it.
-        depth += store.estimateTokens(m);
-        // Its images as it's sent, as the limits count them (cappedForSend).
-        for (const b of imagesIn(this.cappedForSend(store, m, this.config.maxMessageTokens).content)) {
-          const size = inlineImageBytes(b);
-          const misfit = (depthCap > 0 && depth > depthCap) || (countCap > 0 && count >= countCap) ||
-            (bytesCap > 0 && bytes + size > bytesCap);
-          if (misfit) return m.sequence;
-          count++;
-          bytes += size;
+    if (ratio === undefined) return undefined;
+    const depthCap = this.config.imageStripDepthTokens ?? 0;
+    const countCap = this.config.maxLiveImages ?? 0;
+    const bytesCap = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
+    if (!(depthCap > 0) && !(countCap > 0) && !(bytesCap > 0)) return undefined;
+    return this.withToolPruning(store, () => {
+      // Keyed as the post-strip memo is: the store's cached listing, its
+      // calibration (depth is counted at calibrated estimates), the knobs,
+      // and what decides the cut's images: the tool pruning and the cap.
+      const messages = store.getAll();
+      const calibration = store.getTokenCalibration?.() ?? 1;
+      const pruning = this._toolPruningInUse!.pruning;
+      const msgCap = this.config.maxMessageTokens;
+      const memo = this._imageStripReplayMemo;
+      if (
+        memo && memo.messages === messages && memo.calibration === calibration && memo.depthCap === depthCap &&
+        memo.countCap === countCap && memo.bytesCap === bytesCap && memo.ratio === ratio &&
+        memo.pruning === pruning && memo.msgCap === msgCap
+      ) return memo.out;
+      // tokensBefore[i]: the tokens of every message before i, so the depth of
+      // an image in message j, with message i the newest, is
+      // tokensBefore[i + 1] - tokensBefore[j].
+      const tokensBefore = new Array<number>(messages.length + 1);
+      tokensBefore[0] = 0;
+      for (let i = 0; i < messages.length; i++) tokensBefore[i + 1] = tokensBefore[i]! + store.estimateTokens(messages[i]!);
+      const live: Array<{ at: number; bytes: number }> = []; // oldest first; live[first..] are live
+      let first = 0;
+      let liveBytes = 0;
+      const out = new Map<MessageId, number>();
+      for (let i = 0; i < messages.length; i++) {
+        for (const image of imagesIn(this.cappedForSend(store, messages[i]!, msgCap).content)) {
+          const bytes = inlineImageBytes(image);
+          live.push({ at: i, bytes });
+          liveBytes += bytes;
+        }
+        const overCountOrBytes = (count: number, size: number): boolean =>
+          (countCap > 0 && live.length - first > count) || (bytesCap > 0 && liveBytes > size);
+        const over = (depth: number, count: number, size: number): boolean =>
+          overCountOrBytes(count, size) ||
+          (depthCap > 0 && first < live.length && tokensBefore[i + 1]! - tokensBefore[live[first]!.at]! > depth);
+        if (!over(depthCap, countCap, bytesCap)) continue;
+        const depth = Math.floor(depthCap * ratio);
+        const count = Math.floor(countCap * ratio);
+        const size = Math.floor(bytesCap * ratio);
+        while (first < live.length && over(depth, count, size)) {
+          // The images left are one message's and within the full limits: the
+          // newest of them stays, and the rest stay too while only depth is over
+          // its target, since stripping images of one message can't lower the
+          // depth it's at.
+          if (
+            live[first]!.at === live[live.length - 1]!.at && !over(depthCap, countCap, bytesCap) &&
+            (live.length - first === 1 || !overCountOrBytes(count, size))
+          ) break;
+          const oldest = live[first++]!;
+          liveBytes -= oldest.bytes;
+          const id = messages[oldest.at]!.id;
+          out.set(id, (out.get(id) ?? 0) + 1);
         }
       }
-      return undefined;
-    };
-    if (firstMisfit(stripDepth, maxLive, maxLiveBytes) === undefined) return; // no limit binds
-    const next = firstMisfit(
-      stripDepth > 0 ? Math.floor(stripDepth * ratio) : 0,
-      maxLive > 0 ? Math.max(0, Math.floor(maxLive * ratio)) || 1 : 0,
-      maxLiveBytes > 0 ? Math.floor(maxLiveBytes * ratio) : 0,
-    );
-    if (next === undefined || (w !== undefined && next <= w)) return;
-    this._imageWatermark = next;
-    // Dry selections and observer reconstructions advance it locally only;
-    // their finally blocks restore it together with the post-strip memo.
-    if (this._dryRunSelect) return;
-    try {
-      this.store?.setStateJson(this.imageWatermarkStateId, { sequence: next, at: Date.now() });
-    } catch (error) {
-      // The watermark still holds in memory, so trims strip as they should
-      // until the strategy next loads its state from the store (initialize
-      // clears it), as a restart, a branch switch or fork, or setStrategy
-      // does. Its next trim may then strip a different set, which rewrites
-      // the prompt cache from there. Said once per instance, so a store that keeps refusing doesn't
-      // log on every trim.
-      if (!this._imageWatermarkWriteWarned) {
-        this._imageWatermarkWriteWarned = true;
-        this.diag.warn(
-          `[autobiographical] image watermark not persisted to ${this.imageWatermarkStateId} ` +
-            `(${error instanceof Error ? error.message : String(error)}); it holds in memory until the strategy next loads its state`,
-        );
-      }
-    }
+      this._imageStripReplayMemo = { messages, calibration, depthCap, countCap, bytesCap, ratio, pruning, msgCap, out };
+      return out;
+    });
   }
 
-  /** True when an image in the message with this sequence is below the watermark. */
-  protected belowImageWatermark(sequence: number | undefined): boolean {
-    if (this.imageHysteresisRatio() === undefined) return false;
-    const w = this.imageWatermark();
-    return w !== undefined && sequence !== undefined && sequence <= w;
-  }
+  private _imageStripReplayMemo: {
+    messages: readonly StoredMessage[]; calibration: number; depthCap: number; countCap: number; bytesCap: number; ratio: number;
+    pruning: object; msgCap: number | undefined; out: ReadonlyMap<MessageId, number>;
+  } | null = null;
 
   /**
    * Post-strip token estimate per message index (2026-07-12 tail-starvation
@@ -17352,7 +17428,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * newest (counted newest-first) or deeper than `imageStripDepthTokens` of
    * the store's (calibrated) estimate from the live end renders as a placeholder — so every place
    * that BUDGETS messages (recent-window walk-back, head/tail sums, middle
-   * chunk sizes) must cost it as one. Pricing stripped images at their full
+   * chunk sizes) must cost it as one. With `imageStripHysteresisRatio`, the
+   * rule's set (imageStripReplay) decides in place of the limits: a
+   * message's first images are priced as placeholders, as many as the rule
+   * strips of it. Pricing stripped images at their full
    * estimate collapsed an image-dense tail to a fraction of its configured
    * size (42k rendered of a 120k window), and pricing them post-strip in the
    * walk-back alone made the picker's raw-priced tail overflow the budget
@@ -17394,10 +17473,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // A compile asks for this pass more than once (recent-window scan, then
     // the picker inputs). The listing array is the store's own cached view,
     // so its identity, calibration and the knobs key the memo, the
-    // hysteresis ratio among them: it decides whether and how the watermark
-    // strips. The watermark is not in the key: it advances only on a memo
-    // miss, and dry selections and observer reconstructions restore it with
-    // the memo. A branch reload clears both. Callers treat the array as read-only.
+    // hysteresis ratio among them: it decides whether imageStripReplay's set
+    // strips, and that set reads nothing the key leaves out. A branch reload
+    // clears the memo. Callers treat the array as read-only.
     const memoCalibration = store.getTokenCalibration?.() ?? 1;
     const ratio = this.imageHysteresisRatio();
     // The cut decides which images go out, so its cap keys the memo too: a
@@ -17416,7 +17494,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // strip keeps it, in order.
     const verdicts = new Map<number, Map<unknown, Array<{ key: unknown; keep: boolean }>>>();
     const stripActive = stripDepth > 0 || maxLive > 0 || maxLiveBytes > 0;
-    if (stripActive) this.maybeAdvanceImageWatermark(store);
+    // With imageStripHysteresisRatio, the rule's set decides in place of the
+    // limits, which it already fits: a message's first images, as many as
+    // the rule strips of it, in the order the cut sends them.
+    const replay = stripActive ? this.imageStripReplay(store) : undefined;
     // The placeholder as the store prices it, calibrated, by its own text
     // estimator: the price of the block that replaces a stripped image.
     const placeholderPrice = store.estimateTokens(
@@ -17450,6 +17531,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // Block by block, which walks the cut's images in imagesIn's order.
         const cut = this.cappedForSend(store, messages[i]!, msgCap).content;
         const groups = new Map<unknown, Array<{ key: unknown; keep: boolean }>>();
+        let ruleLeft = replay !== undefined ? replay.get(messages[i]!.id) ?? 0 : undefined;
         for (const block of cut) {
           const group = imageGroup(block);
           for (const b of imagesIn([block])) {
@@ -17457,8 +17539,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             const beyondDepth = stripDepth > 0 && rawDepth > stripDepth;
             const beyondCount = maxLive > 0 && liveImagesSeen >= maxLive;
             const beyondBytes = maxLiveBytes > 0 && liveImageBytes + bytes > maxLiveBytes;
-            const belowMark = this.belowImageWatermark(messages[i].sequence);
-            const keep = !(belowMark || beyondDepth || beyondCount || beyondBytes);
+            let keep: boolean;
+            if (ruleLeft !== undefined) {
+              keep = !(ruleLeft > 0);
+              if (!keep) ruleLeft--;
+            } else {
+              keep = !(beyondDepth || beyondCount || beyondBytes);
+            }
             if (keep) {
               liveImagesSeen++;
               liveImageBytes += bytes;
@@ -19140,8 +19227,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   private saveDryRunState(store: MessageStoreView): () => void {
     const saved = {
-      imageWatermark: this.imageWatermark(),
-      postStripMemo: this._postStripMemo,
       chunks: this.chunks,
       compressionQueue: this.compressionQueue,
       compressionQueueGeneration: this.compressionQueueGeneration,
@@ -19174,8 +19259,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       headStartMemo: this._cachedHeadStartIndex,
     };
     return () => {
-      this._imageWatermark = saved.imageWatermark;
-      this._postStripMemo = saved.postStripMemo;
       this.chunks = saved.chunks;
       this.compressionQueue = saved.compressionQueue;
       this.compressionQueueGeneration = saved.compressionQueueGeneration;
