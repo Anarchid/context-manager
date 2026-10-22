@@ -581,11 +581,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         const overBytes = maxLiveBytes > 0 && keptImageBytes + bytes > maxLiveBytes;
         const strip = tooDeep || overCount || overBytes;
         const deciding = ceilingsDeciding({ images: overCount, bytes: overBytes }, tooDeep, ceilingSet);
-        if (deciding.images || deciding.bytes) {
-          const decided = (ceilings[i] ??= { images: false, bytes: false });
-          decided.images ||= deciding.images;
-          decided.bytes ||= deciding.bytes;
-        }
+        const decided = (ceilings[i] ??= { images: false, bytes: false });
+        decided.images ||= deciding.images;
+        decided.bytes ||= deciding.bytes;
         if (strip) {
           tokens += strippedImageSaving(image, placeholderPrice, calibration);
         } else {
