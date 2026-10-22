@@ -1,6 +1,6 @@
 /**
- * The image ceilings (imageCeiling, imageByteCeiling): the most top-level
- * image blocks, and their bytes, a strategy's live window keeps, and the most
+ * The image ceilings (imageCeiling, imageByteCeiling): the most images, and
+ * their bytes, a strategy's live window keeps, and the most
  * images and bytes a compression prompt carries. The live window keeps its
  * own limits within them, compression prompts carry no more than them, and
  * imageCeilings() reports them.
@@ -188,10 +188,9 @@ describe('the live window within the image ceilings', () => {
         maxLiveImages: 0, maxLiveImageBytes: 0, imageCeiling: 0, imageByteCeiling: 0,
       }), 8), 'IIIIIIII');
     });
-    it(`${name}: the window counts top-level image blocks only, so a nested or a generated image passes the count ceiling`, async () => {
-      // What the ceilings bind is what the window counts. An image nested in
-      // a tool result, or a generated image, isn't one of those (a change
-      // that counts them would change this).
+    it(`${name}: the count ceiling binds the images the window counts, nested and generated ones included`, async () => {
+      // What the ceilings bind is what the window counts: every image, an
+      // image nested in a tool result and a generated image among them.
       const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
       const manager = await ContextManager.open({ path: join(dir, 'store'), strategy: make({ maxLiveImages: 0, imageCeiling: 1 }) });
       try {
@@ -211,9 +210,9 @@ describe('the live window within the image ceilings', () => {
           .filter((b) => b.type === 'tool_result')
           .flatMap((b) => (b as { content: ContentBlock[] }).content)
           .filter((b) => b.type === 'image').length;
-        assert.equal(nested, 2, 'both nested images stay, past a count ceiling of 1');
+        assert.equal(nested, 0, 'the nested images are past a count ceiling of 1');
         const kept = blocks.filter((b) => b.type === 'generated_image').length;
-        assert.equal(kept, 2, 'both generated images stay, past a count ceiling of 1');
+        assert.equal(kept, 1, 'the newest image, a generated one, takes the one slot');
       } finally {
         await manager.close();
         rmSync(dir, { recursive: true, force: true });
@@ -861,25 +860,23 @@ describe('the line when an image first falls past an image ceiling', () => {
   });
 
   it("the memory strategy's watermark says it when only the ceiling moves it, and nothing when the depth limit would move it anyway", async () => {
-    // Image messages price at about 1,600 tokens. Under a 4,000-token depth
-    // limit, the oldest of three is past the depth by the strips' measure
-    // (its own message counted) but not by the watermark's (newer messages
-    // only), so without a ceiling the watermark doesn't move. A count ceiling
-    // of 2 moves it, and its trim to half strips the middle image too, which
-    // the depth limit alone keeps: the ceiling decided.
-    const options = { maxLiveImages: 0, imageStripDepthTokens: 4000, imageStripHysteresisRatio: 0.5 };
+    // Image messages price at about 1,600 tokens, so three of them are within
+    // a 6,000-token depth limit: without a ceiling the watermark doesn't move
+    // and nothing is stripped. A count ceiling of 2 moves it, and its trim to
+    // half strips the two older images, which the depth limit alone keeps:
+    // the ceiling decided.
+    const options = { maxLiveImages: 0, imageStripDepthTokens: 6000, imageStripHysteresisRatio: 0.5 };
     const alone = await ceilingLines(memory({ ...options, imageCeiling: 0 }), [3]);
     assert.equal(alone.watermarks[0], null, 'the depth limit alone moves no watermark');
-    assert.equal(alone.last, '.II');
+    assert.equal(alone.last, 'III');
     const ceiling = await ceilingLines(memory({ ...options, imageCeiling: 2 }), [3]);
     assert.notEqual(ceiling.watermarks[0], null);
     assert.equal(ceiling.last, '..I', 'the ceiling strips what the depth limit alone keeps');
     assert.equal(ceiling.lines.length, 1, JSON.stringify(ceiling.lines));
     assert.ok(ceiling.lines[0]!.includes('an image fell past imageCeiling 2'), ceiling.lines[0]);
-    // Under a 3,000-token depth limit, the oldest of the three is past the
-    // depth by the watermark's measure too, from the message that brings the
-    // ceiling's first misfit on, so the depth limit moves the watermark with
-    // or without the ceiling, to the same place.
+    // Under a 3,000-token depth limit, the first image is past the depth once
+    // the second comes, before the count ceiling is passed, so the depth limit
+    // moves the watermark with or without the ceiling, to the same place.
     const deeper = { maxLiveImages: 0, imageStripDepthTokens: 3000, imageStripHysteresisRatio: 0.5 };
     const deepAlone = await ceilingLines(memory({ ...deeper, imageCeiling: 0 }), [3]);
     assert.notEqual(deepAlone.watermarks[0], null, 'the depth limit moves the watermark');
@@ -911,14 +908,15 @@ describe('the line when an image first falls past an image ceiling', () => {
   }
 
   it("the memory strategy's watermark says nothing when the depth limit brings the move on, though the byte ceiling's trim lands it newer", async () => {
-    // A 4-byte image, about 3,100 tokens of text, then a 16-byte image. When
-    // the second image comes, the first is past a 4,000-token depth limit, so
-    // the watermark moves with or without a ceiling. Without one, its trim to
-    // half the depth lands on the first image. The trim to half of a 20-byte
-    // ceiling, 10 bytes, can't keep the 16-byte image either, so it lands
-    // there and strips it. No image passed the ceiling itself (20 bytes in
-    // all), so the line, which says one did, stays quiet.
-    const text = [{ type: 'text', text: 'word '.repeat(1800) }];
+    // A 4-byte image, about 1,500 tokens of text, then a 16-byte image. The
+    // first image is within a 4,000-token depth limit until the second comes
+    // (about 1,600 + 1,500 + 1,600 tokens), so the watermark moves then, with
+    // or without a ceiling. Without one, its trim to half the depth lands on
+    // the first image. The trim to half of a 20-byte ceiling, 10 bytes, can't
+    // keep the 16-byte image either, so it lands there and strips it. No image
+    // passed the ceiling itself (20 bytes in all), so the line, which says one
+    // did, stays quiet.
+    const text = [{ type: 'text', text: 'word '.repeat(870) }];
     const options = { maxLiveImages: 0, maxLiveImageBytes: 0, imageStripDepthTokens: 4000, imageStripHysteresisRatio: 0.5 };
     const alone = await watermarkRun({ ...options, imageByteCeiling: 0 }, [imageMessage('img-1', 4), text, imageMessage('img-2', 16)]);
     assert.notEqual(alone.watermark, null, 'the depth limit alone moves the watermark');
@@ -930,21 +928,23 @@ describe('the line when an image first falls past an image ceiling', () => {
   });
 
   it("the memory strategy's watermark says nothing for an image its move strips that the depth limit strips anyway", async () => {
-    // A 16-byte image, about 1,500 tokens of text, then an 8-byte image. The
-    // first image passes a 20-byte ceiling (24 bytes), so the watermark moves
-    // onto it. By the watermark's measure, the messages newer than it, it's
-    // within a 4,000-token depth limit, so the host's own limits wouldn't
-    // move it. But the strip counts the image's own message too, and by that
-    // measure it's past the depth: the render strips it with or without the
-    // ceiling, so the ceiling decided nothing.
+    // A 16-byte image, an 8-byte image, then about 1,500 tokens of text. The
+    // watermark moves as each message is stored. When the second image comes,
+    // the first passes a 20-byte ceiling (24 bytes), so the watermark moves
+    // onto it, while it's still within a 4,000-token depth limit (about 3,200
+    // tokens deep), where the host's own limits wouldn't move it. The text
+    // then takes it past the depth (about 4,700), so the render that says the
+    // line strips it with or without the ceiling: the ceiling decided nothing
+    // there. Without the ceiling, the depth limit moves the watermark onto it
+    // when the text comes.
     const text = [{ type: 'text', text: 'word '.repeat(870) }];
-    const options = { maxLiveImages: 0, maxLiveImageBytes: 0, imageStripDepthTokens: 4000, imageStripHysteresisRatio: 0.5 };
-    const messages = [imageMessage('img-1', 16), text, imageMessage('img-2', 8)];
+    const options = { maxLiveImages: 0, maxLiveImageBytes: 0, imageStripDepthTokens: 4000, imageStripHysteresisRatio: 0.9 };
+    const messages = [imageMessage('img-1', 16), imageMessage('img-2', 8), text];
     const alone = await watermarkRun({ ...options, imageByteCeiling: 0 }, messages);
-    assert.equal(alone.watermark, null, 'without the ceiling the watermark stays');
+    assert.notEqual(alone.watermark, null, 'without the ceiling, the depth limit moves the watermark');
     assert.equal(alone.kept, '.I', 'the depth limit strips the first image');
     const ceiling = await watermarkRun({ ...options, imageByteCeiling: 20 }, messages);
-    assert.notEqual(ceiling.watermark, null, 'the ceiling moves the watermark');
+    assert.equal(ceiling.watermark, alone.watermark, 'the ceiling moved it to the same place, earlier');
     assert.equal(ceiling.kept, '.I', 'the render is the same');
     assert.deepEqual(ceiling.lines, []);
   });

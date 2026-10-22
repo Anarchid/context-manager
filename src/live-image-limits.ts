@@ -1,26 +1,26 @@
 /**
  * The live-image window's limits, kept within the image ceilings.
  *
- * A strategy's live window keeps the images it counts (top-level image
- * blocks; see `AutobiographicalConfig.maxLiveImages`) newest-first up to a
- * count (`maxLiveImages`) and a byte budget (`maxLiveImageBytes`). The image
- * ceilings (`imageCeiling`, `imageByteCeiling`) bound those limits: an
- * unlimited (0) limit means "up to the ceiling", and a limit above the
- * ceiling keeps the ceiling's worth. They bound what the window counts and
- * what a compression prompt carries, not a whole request. In the window,
- * images nested in tool results and generated images aren't counted, nor is
- * anything a caller injects at compile time or appends to a compiled
- * request; a compression prompt counts every image it carries. A caller
- * that wants a request within the ceilings counts that request's images
- * itself and compares them with the strategy's `imageCeilings()`.
+ * A strategy's live window keeps the images it counts (every image, nested
+ * and generated ones included; see `AutobiographicalConfig.maxLiveImages`)
+ * newest-first up to a count (`maxLiveImages`) and a byte budget
+ * (`maxLiveImageBytes`). The image ceilings (`imageCeiling`,
+ * `imageByteCeiling`) bound those limits: an unlimited (0) limit means "up to
+ * the ceiling", and a limit above the ceiling keeps the ceiling's worth. They
+ * bound what the window counts and what a compression prompt carries, not a
+ * whole request: an image inside an opaque provider item isn't counted, nor
+ * is anything a caller injects at compile time or appends to a compiled
+ * request. A caller that wants a request within the ceilings counts that
+ * request's images itself and compares them with the strategy's
+ * `imageCeilings()`.
  */
 
 /**
  * The provider refuses a request carrying more than 600 images and documents
  * together ("too many images and documents: 601 + 0 > 600", measured
  * 2026-10-13 and again on 2026-10-19). 500 leaves room for what the ceilings
- * don't count: documents, images nested in tool results, generated images,
- * and images a caller injects or appends.
+ * don't count: documents, images inside opaque provider items, and images a
+ * caller injects or appends.
  */
 export const DEFAULT_IMAGE_CEILING = 500;
 
