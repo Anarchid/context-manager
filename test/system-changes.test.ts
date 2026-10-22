@@ -415,8 +415,8 @@ describe('the autobiographical strategy and a system change', () => {
         else ids.push(cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`M-${i} ${'word '.repeat(10)}`)]));
       }
       strategy.resetHeadWindow(ids[20]!);
-      // Before any compile, render stats come from the store alone.
-      const before = cm.getRenderStats()!;
+      // No render stats before a live compile (#311).
+      assert.equal(cm.getRenderStats(), null, 'no render stats before a compile');
       const compiled = await cm.compile(BIG, undefined, opts as never);
       const order = rawIds(compiled);
       const where = (i: number): number => order.indexOf(ids[i]!);
@@ -427,7 +427,6 @@ describe('the autobiographical strategy and a system change', () => {
       // The head costs what it sends: the changes before it and the window, each once.
       const head = order.slice(0, where(0));
       const headTokens = head.reduce((n, id) => n + estimateOf(cm, id), 0);
-      assert.deepEqual(before.head, { messages: head.length, tokens: headTokens }, 'render stats before a compile');
       assert.deepEqual(cm.getRenderStats()!.head, { messages: head.length, tokens: headTokens }, "the compile's render stats");
       // The adaptive paths reserve the head at that price: below it they refuse the head and tail, and say what the head cost.
       if (label !== 'hierarchical') {
@@ -457,17 +456,6 @@ describe('the autobiographical strategy and a system change', () => {
       }
     });
   }
-
-  it('render stats before a first compile count no message in both the head and the tail', async () => {
-    const strategy = new AutobiographicalStrategy({ headWindowTokens: 60, recentWindowTokens: 100_000, autoTickOnNewMessage: false });
-    const cm = await open(strategy);
-    for (let i = 0; i < 12; i++) cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`M-${i} ${'word '.repeat(10)}`)]);
-    const before = cm.getRenderStats()!;
-    assert.ok(before.head.messages > 0 && before.head.messages < 12, `setup: the head holds ${before.head.messages} of 12`);
-    assert.equal(before.head.messages + before.tail.messages, 12);
-    const after = (await cm.compile(BIG), cm.getRenderStats()!);
-    assert.deepEqual([before.head, before.tail], [after.head, after.tail], "the compile's");
-  });
 
   it('adaptive: a change after the newest turn is no turn, so a structural repair that drops that turn still refuses', async () => {
     const strategy = new AutobiographicalStrategy({ adaptiveResolution: true, headWindowTokens: 400, recentWindowTokens: 0, autoTickOnNewMessage: false });

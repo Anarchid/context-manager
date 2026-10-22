@@ -11,9 +11,6 @@
 - A `WindowedPassthroughStrategy` compile that refuses no longer moves the
   window's anchor; only a compile that sends does. So a retry with a larger
   budget still sends the older turns that fit.
-- `getRenderStats()` before the first compile no longer counts a message in
-  both the head and the tail when the recent window starts inside the head
-  window: the tail starts where the head ends, as a compile's does.
 - A `KnowledgeStrategy` chunk no longer runs into or across an L1 summary's
   span once a removal moves where its walk closes, which left the chunk after
   it uncompressed for good and its messages sent raw beside the summary: a
