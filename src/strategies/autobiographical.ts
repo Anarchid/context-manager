@@ -81,6 +81,7 @@ import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMark
 import type { MessageId } from '../types/message.js';
 import type { IngressChunkResult } from '../types/strategy.js';
 import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
+import { holdsSystemChange, isSystemChange, systemChangePositions } from '../system-changes.js';
 
 /** A persisted reset record is trusted only if it has the expected shape. */
 function isCalibrationReset(v: unknown): v is CalibrationReset {
@@ -1653,6 +1654,19 @@ function stripThinkingBlocks(content: ContentBlock[]): ContentBlock[] {
     content,
     content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking'),
   );
+}
+
+/**
+ * A raw message's content as it enters compression input: its thinking
+ * stripped (stripThinkingBlocks), and its system changes left out. A system
+ * change alters the request's tools and system text, not the conversation, and
+ * a summarizer's request would apply it, or be refused for it
+ * (system-changes.ts). A message of system changes alone enters empty, and
+ * every request path drops an empty message before sending.
+ */
+function compressionInputContent(content: ContentBlock[]): ContentBlock[] {
+  const stripped = stripThinkingBlocks(content);
+  return holdsSystemChange(stripped) ? stripped.filter((b) => !isSystemChange(b)) : stripped;
 }
 
 /**
@@ -3787,14 +3801,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected resolvedPinBounds(messages: StoredMessage[]): Map<number, ResolvedPinBound> {
     const out = new Map<number, ResolvedPinBound>();
     const pinned = this.pinnedPositions(messages);
-    if (pinned.size === 0) return out;
-    const bounds = this.readsPinBounds() ? this.pinLevelBounds(messages) : undefined;
-    for (const position of pinned) {
-      const bound = bounds?.get(position);
-      if (bound?.level !== undefined) out.set(position, { level: bound.level });
-      else if (bound?.maxLevel !== undefined) out.set(position, { maxLevel: bound.maxLevel });
-      else out.set(position, 'raw');
+    if (pinned.size > 0) {
+      const bounds = this.readsPinBounds() ? this.pinLevelBounds(messages) : undefined;
+      for (const position of pinned) {
+        const bound = bounds?.get(position);
+        if (bound?.level !== undefined) out.set(position, { level: bound.level });
+        else if (bound?.maxLevel !== undefined) out.set(position, { maxLevel: bound.maxLevel });
+        else out.set(position, 'raw');
+      }
     }
+    // A message of system changes is kept raw, as a pin keeps a message: a
+    // fold would take its change out of what follows it (holdsSystemChange).
+    for (const position of systemChangePositions(messages)) out.set(position, 'raw');
     return out;
   }
 
@@ -8353,9 +8371,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const pos = messages.findIndex(x => x.id === id);
         if (pos < 0) return 'not-in-window';
         // Before the LIVE head start (head-window reset moved the anchor):
-        // this is compressible middle history, not head — a distinct defect
-        // from a verbatim-head message going unrendered.
-        if (pos < regions.headStart) return 'before-head-start-not-rendered';
+        // this is middle history, not head — a distinct defect from a
+        // verbatim-head message going unrendered — compressible but for a
+        // system change, which stays raw there, except while the head window
+        // holds messages, which is where a reset leaves it (headPositions).
+        if (pos < regions.headStart) {
+          return holdsSystemChange(messages[pos].content) && Math.min(regions.headEnd, messages.length) > regions.headStart
+            ? 'in-head-not-rendered'
+            : 'before-head-start-not-rendered';
+        }
         if (pos < regions.headEnd) return 'in-head-not-rendered';
         if (pos >= regions.recentStart) return 'in-tail-not-rendered';
         return 'in-middle-not-rendered';
@@ -8629,8 +8653,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const sumTokens = (slice: StoredMessage[]): number =>
       slice.reduce((acc, m) => acc + store.estimateTokens(this.prunedForSend(store, m)), 0);
 
-    const headMsgs = messages.slice(headStart, headEnd);
-    const tailMsgs = messages.slice(recentStart);
+    // The head as a compile sends it: after a reset, the system changes
+    // stored before the window, then the window (headPositions).
+    const headMsgs = this.headPositions(messages, headStart, headEnd).map((i) => messages[i]!);
+    // The tail starts no earlier than the head ends, as a compile's does, so
+    // no message counts in both.
+    const tailMsgs = messages.slice(Math.max(recentStart, headEnd));
 
     const live = (level: SummaryLevel) =>
       this.summaries.filter(s => s.level === level && !s.mergedInto);
@@ -9225,7 +9253,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           headCoveredSkipped++;
           continue;
         }
-        llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+        llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
       }
 
       // ---- 2. Prior recall pairs (budget-capped, above) and the raw middle ----
@@ -9244,7 +9272,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ].sort((a, b) => a.position - b.position);
       for (const { summary: s, message: m } of middle) {
         if (m) {
-          llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+          llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
           continue;
         }
         llmMessages.push({
@@ -9277,7 +9305,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       // ---- 5. Chunk messages raw ----
       for (const m of chunk.messages) {
-        llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+        llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
       }
 
       // ---- 6. Instruction (reading-mode aware; worked out above) ----
@@ -10643,7 +10671,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const buildSub = (subset: typeof chunk.messages, target: number): NormalizedRequest => {
             const msgs = [
               { participant: 'Context Manager', content: [{ type: 'text', text: COMPRESSION_MARKER }] as ContentBlock[] },
-              ...subset.map((m) => ({ participant: m.participant, content: stripThinkingBlocks(m.content) })),
+              ...subset.map((m) => ({ participant: m.participant, content: compressionInputContent(m.content) })),
               { participant: 'Context Manager', content: [{ type: 'text', text: this.applyIdentityReminder(this.getCompressionInstruction(chunk, target), this.chunkIsWitnessed(chunk)) }] as ContentBlock[] },
             ];
             const cleaned = stripUnpairedToolBlocks(this.collapseConsecutiveMessages(splitMixedToolMessages(msgs)));
@@ -11795,7 +11823,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         headCoveredSkipped++;
         continue;
       }
-      llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+      llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
     }
     if (headCoveredSkipped > 0) {
       this.diag.warn(
@@ -11879,7 +11907,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const m = allMessages[i];
         if (priorSummaryMessageIds.has(m.id)) continue;
         if (sourceLeafIds.has(m.id)) continue;
-        llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+        llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
       }
     }
 
@@ -11935,7 +11963,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         for (const messageId of src.sourceIds) {
           const m = messageById.get(messageId);
           if (m) {
-            llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+            llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
           }
         }
       } else {
@@ -12840,13 +12868,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Compute the fixed raw windows first. They are hard reservations, not
     // best-effort phases: foldable history may use only the space left after
     // every head and tail message has been accounted for.
-    for (let i = headStart; i < headEnd && i < messages.length; i++) {
+    // The head's positions: after a reset, the system changes stored before
+    // the head window, then the window (headPositions).
+    const head = this.headPositions(messages, headStart, headEnd);
+    for (const i of head) {
       const msg = messages[i];
       const tokens = pse[i] + this.cappedForSend(store, msg, msgCap).extra;
       headMessageIds.add(msg.id);
       headTokens += tokens;
     }
     const effectiveRecentStart = Math.max(recentStart, headEnd);
+    // System changes stay raw wherever they are (resolvedPinBounds), and
+    // nothing a refusal can name shrinks them: the ones outside the head and
+    // the tail are sent raw in the middle, beside what compression folds.
+    let middleChangeTokens = 0;
+    for (const i of systemChangePositions(messages)) {
+      if (i >= effectiveRecentStart || headMessageIds.has(messages[i].id)) continue;
+      middleChangeTokens += pse[i] + this.cappedForSend(store, messages[i], msgCap).extra;
+    }
     for (let i = effectiveRecentStart; i < messages.length; i++) {
       const msg = messages[i];
       const tokens = pse[i] + this.cappedForSend(store, msg, msgCap).extra;
@@ -12877,13 +12916,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // does a newest turn that starts inside the head.
       let floorTokens = 0;
       if (messages.length > 0) {
-        const newestBody = bodyStart((k) => messages[k], messages.length - 1);
+        // A system change is no conversation message, so the newest one is
+        // the newest that isn't one, and the changes after it stay raw with
+        // it (counted from floorStart below).
+        let newest = messages.length - 1;
+        while (newest > 0 && holdsSystemChange(messages[newest].content)) newest--;
+        const newestBody = bodyStart((k) => messages[k], newest);
         const newestTurn = newestBody > 0 && this.hasToolResult(messages[newestBody])
           ? bodyStart((k) => messages[k], newestBody - 1)
-          : messages.length - 1;
+          : newest;
         const floorStart = Math.min(newestTurn, this.holdBoundary(store));
         for (let i = floorStart; i < messages.length; i++) {
           floorTokens += pse[i] + this.cappedForSend(store, messages[i], msgCap).extra;
+        }
+        // A system change outside the head stays raw wherever the recent
+        // window starts, so the floor holds every one before it too, and
+        // when the changes alone exceed the budget nothing is named.
+        for (const i of systemChangePositions(messages)) {
+          if (i >= floorStart) break;
+          if (!headMessageIds.has(messages[i].id)) floorTokens += pse[i] + this.cappedForSend(store, messages[i], msgCap).extra;
         }
       }
       throw this.overBudgetError(budget, {
@@ -12909,7 +12960,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Emit the already-reserved head entries raw, each cut at the cap as any
     // raw message is.
-    for (let i = headStart; i < headEnd && i < messages.length; i++) {
+    for (const i of head) {
       const msg = messages[i];
       const { content, extra } = this.cappedForSend(store, msg, msgCap);
       const tokens = pse[i] + extra;
@@ -12978,15 +13029,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Excluding that zone made pre-transition history invisible to the picker
     // (never planned, never rendered): the adaptive variant of the frontier
     // gap the coverage invariant exists to refuse.
-    const middleSegments: ReadonlyArray<readonly [number, number]> = headStart > 0
-      ? [[0, headStart], [headEnd, effectiveRecentStart]]
-      : [[headEnd, effectiveRecentStart]];
+    // A system change before a reset head is in the head (headPositions), so
+    // the middle walks pass over it.
+    const middleSegments = AutobiographicalStrategy.middleRanges(headStart, headEnd, effectiveRecentStart);
 
     const pickerChunks: PickerChunk[] = [];
     const salience = this.salienceByPosition(messages);
     for (const [segStart, segEnd] of middleSegments)
     for (let i = segStart; i < segEnd && i < messages.length; i++) {
       const msg = messages[i];
+      if (headMessageIds.has(msg.id)) continue;
       const ch = chunkAtPosition ? chunkAtPosition[i] : chunksByMessageId.get(msg.id);
       // This is the chunk's raw price. The shard path in step 5 sends a run
       // of a body's raw shards as one entry, their text joined and uncut, so
@@ -13015,7 +13067,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Also include head and tail in PickerChunks (so token accounting matches)
     // — but mark them as in-head/in-tail so the picker won't fold them.
-    for (let i = headStart; i < headEnd && i < messages.length; i++) {
+    for (const i of head) {
       const msg = messages[i];
       const tokens = pse[i] + this.cappedForSend(store, msg, msgCap).extra;
       pickerChunks.push({
@@ -13329,8 +13381,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Taken at a refusal of this select (the plan check's, or a later
     // stage's), or for a dry run's preview of a plan over the budget, since a
     // plan that fits and renders needs no list.
+    // Compression shrinks neither the head and the tail nor a system change
+    // between them: when those alone exceed the budget, nothing the list
+    // names clears it.
     const planClearedBy = (): OverBudgetClearedBy[] =>
-      result.produced.length > 0 && this.compressionWorkQueued(store, 'adaptive') ? ['compression'] : [];
+      headTokens + tailTokens + middleChangeTokens <= rejectionBudget && result.produced.length > 0 && this.compressionWorkQueued(store, 'adaptive') ? ['compression'] : [];
     const planFits = result.finalTokens <= rejectionBudget;
 
     // Record what a dry run needs (select() puts back the transition
@@ -13422,6 +13477,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let i = segStart;
     while (i < segEnd && i < messages.length) {
       const msg = messages[i];
+      if (headMessageIds.has(msg.id)) {
+        i++; // sent in the head (headPositions)
+        continue;
+      }
 
       if (msg.bodyGroupId) {
         // Collect this body's consecutive shards. Another ingestion of the
@@ -13655,9 +13714,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // newest shard alone outgrows the recent window. Only that body's shards
     // count: an earlier ingestion of the same text shares the group id, and its
     // survival proves nothing about the newest turn.
-    const newest = messages[messages.length - 1];
+    // A system change is no turn and always stays raw, so the newest turn is
+    // the newest message that isn't one, as for the floor above.
+    let newestAt = messages.length - 1;
+    while (newestAt > 0 && holdsSystemChange(messages[newestAt].content)) newestAt--;
+    const newest = messages[newestAt];
     if (newest) {
-      const newestBody = bodyBoundsIn(messages, messages.length - 1);
+      const newestBody = bodyBoundsIn(messages, newestAt);
       const newestBodyIds = new Set(messages.slice(newestBody.from, newestBody.to + 1).map(m => m.id));
       const newestRetained = merged.some(
         entry => (entry.sourceMessageId !== undefined && newestBodyIds.has(entry.sourceMessageId)) ||
@@ -13668,10 +13731,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           stage: 'Structural repair did not retain the newest turn',
           budget: rejectionBudget,
           actual: totalTokens + tailTokens,
-          // The newest turn is what's missing, and only room for it brings it
-          // back. A newer message makes a different turn the newest, and this
-          // one then sits in the middle raw until its chunk closes and
-          // compression summarizes it, so the next compile is no smaller.
+          // The newest turn is what's missing: the repair trimmed it as an
+          // unanswered call, which no budget brings back. A newer message
+          // makes a different turn the newest, and this one then sits in the
+          // middle raw until its chunk closes and compression summarizes it,
+          // so the next compile is no smaller.
           clearedBy: [],
           diagnostics: {
             middleCountUnit: 'picker-chunks',
@@ -14955,14 +15019,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       pending = [];
     };
-    for (let i = window.headStart; i < window.headEnd && i < messages.length; i++) pushRaw(messages[i]!);
-    const segments: ReadonlyArray<readonly [number, number]> = window.headStart > 0
-      ? [[0, window.headStart], [window.headEnd, window.recentStart]]
-      : [[window.headEnd, window.recentStart]];
-    for (const [segStart, segEnd] of segments) {
+    const head = this.headPositions(messages, window.headStart, window.headEnd);
+    for (const i of head) pushRaw(messages[i]!);
+    const inHead = new Set(head);
+    for (const [segStart, segEnd] of AutobiographicalStrategy.middleRanges(window.headStart, window.headEnd, window.recentStart)) {
       let i = segStart;
       while (i < segEnd && i < messages.length) {
         const msg = messages[i]!;
+        if (inHead.has(i)) {
+          i++;
+          continue;
+        }
         if (msg.bodyGroupId) {
           const groupStart = i;
           i = bodyEnd(Math.min(segEnd, messages.length), (k) => messages[k]!, groupStart) + 1;
@@ -15652,7 +15719,38 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // any raw message is (from headStart, not necessarily 0)
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
-    for (let i = headStart; i < headEnd && i < messages.length; i++) {
+    // System changes stay raw wherever they are (resolvedPinBounds), and no
+    // newer message or compression shrinks them, so when they alone exceed
+    // the grace limit only the caller, consolidating them, clears it. That
+    // refusal comes first, as every strategy gives it; an eviction from the
+    // recent window while the changes fit stays a loss the coverage
+    // invariant refuses, as any there is.
+    let changeTokens = 0;
+    for (const i of systemChangePositions(messages)) {
+      const msg = messages[i];
+      changeTokens += store.estimateTokens(this.prunedForSend(store, msg)) + this.cappedForSend(store, msg, msgCap).extra;
+    }
+    if (changeTokens > graceLimit) {
+      throw this.overBudgetError(budget, {
+        stage: 'Hierarchical: its system changes alone exceed the budget',
+        budget: graceLimit,
+        actual: changeTokens,
+        clearedBy: [],
+        diagnostics: {
+          middleCountUnit: 'selection-items',
+          deepestLevelKind: 'attempted',
+          headTokens: changeTokens,
+          tailTokens: 0,
+          middleTokens: 0,
+          middleChunkCount: 0,
+          deepestLevel: 0,
+        },
+      });
+    }
+    // After a reset, the system changes stored before the head window go
+    // first, in the head (headPositions).
+    const head = this.headPositions(messages, headStart, headEnd);
+    for (const i of head) {
       const msg = messages[i];
       const { content, extra } = this.cappedForSend(store, msg, msgCap);
       // The pruned form's price with its images whole: this selection's
@@ -15667,8 +15765,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           actual: totalTokens + tokens,
           // The head is sent whole by definition, and its size is cold
           // configuration (headWindowTokens isn't a hot setting). Besides a
-          // larger budget, a head-window reset clears it, which starts a new
-          // topic and isn't a lever the list names (OverBudgetClearedBy).
+          // larger budget, a head-window reset clears the window's share of
+          // it, though not the system changes stored before the new head,
+          // which go in it; a reset starts a new topic and isn't a lever the
+          // list names (OverBudgetClearedBy).
           // Newer messages can shrink a head that holds images, since the
           // image strip takes the oldest images first (maxLiveImages,
           // maxLiveImageBytes, imageStripDepthTokens), but whether they'd
@@ -15844,7 +15944,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // The middle is everything before the recent window that is not the LIVE
     // head window — including [0, headStart) after a head-window reset, which
     // is compressible-but-often-unsummarized history, not head.
-    const inLiveHead = (i: number): boolean => i >= headStart && i < headEnd;
+    // The head, as Phase 0 sent it: the live window, and after a reset the
+    // system changes before it (headPositions).
+    const inHead = new Set(head);
+    const inLiveHead = (i: number): boolean => inHead.has(i);
     for (let i = 0; i < effectiveRecentStart && i < messages.length; i++) {
       if (inLiveHead(i)) continue;
       if (pinnedPositionsSet.has(i)) {
@@ -15936,7 +16039,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const covered = new Set<string>();
       for (const s of selectedSummaries) for (const leaf of leavesOf(s)) covered.add(leaf);
       const rawPlanned = new Set<string>();
-      for (let i = headStart; i < headEnd && i < messages.length; i++) rawPlanned.add(messages[i].id);
+      for (const i of head) rawPlanned.add(messages[i].id);
       for (let i = effectiveRecentStart; i < messages.length; i++) rawPlanned.add(messages[i].id);
       for (const p of middleRaw) rawPlanned.add(p.msg.id);
       const selectedIdSet = new Set(selectedSummaries.map(s => s.id));
@@ -16265,13 +16368,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * A stored message's content priced as a compression request sends it: its
-   * thinking stripped, as a request's messages are built from raw messages,
-   * then priced as prepared (preparedTokensOf). Images count at the store's
+   * thinking stripped and its system changes left out, as a request's messages
+   * are built from raw messages (compressionInputContent), then priced as
+   * prepared (preparedTokensOf). Images count at the store's
    * estimate, though a request's inline image cap can replace some with
    * placeholders.
    */
   protected sentTokensOf(content: ContentBlock[], ctx: StrategyContext): number {
-    return this.preparedTokensOf(stripThinkingBlocks(content), ctx);
+    return this.preparedTokensOf(compressionInputContent(content), ctx);
   }
 
   /**
@@ -16497,6 +16601,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let headContent = '';
     let headReplacements = 0;
     for (const m of headMessages) {
+      // A message of system changes has no text: it adds no entry.
+      if (holdsSystemChange(m.content)) continue;
       // Counted as the request sends it: only the message's text blocks
       // reach it, with their serialized media replaced on a copy, so a
       // payload doesn't spend the cap. The request carries the markers, so
@@ -17965,6 +18071,46 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * The head's positions, in the order they're sent: after a head-window
+   * reset, the system changes stored before the head window, then the window
+   * [headStart, headEnd). Every selector sends the head first and the
+   * history before it later, with the middle, so a change left in that
+   * history would follow the head's own changes and apply after them: a
+   * removal could run before the definition it removes. In the head, every
+   * change keeps its order, and the solved layout, the emission, the cache
+   * check's rebuild and the markers read one head. The history before the
+   * head, which the reset already sends after the head, then reads them too,
+   * which the provider takes: it doesn't check a past tool call against the
+   * tools offered where the call sits. With nothing in the window (the head
+   * window disabled, or a window that ends where it starts), nothing is sent
+   * ahead of that history, and the changes stay where they are.
+   */
+  protected headPositions(messages: readonly StoredMessage[], headStart: number, headEnd: number): number[] {
+    const end = Math.min(headEnd, messages.length);
+    const out: number[] = [];
+    if (headStart > 0 && end > headStart) {
+      for (const i of systemChangePositions(messages)) {
+        if (i >= headStart) break;
+        out.push(i);
+      }
+    }
+    for (let i = headStart; i < end; i++) out.push(i);
+    return out;
+  }
+
+  /**
+   * The middle's position ranges, in order: what comes before the tail
+   * outside the live head window, [0, headStart) after a head-window reset
+   * included. With the head window disabled, headEnd is 0 under a positive
+   * headStart, so the live window ends at the later of the two, and no
+   * position is in two ranges or in a range and the tail. A walk over them
+   * passes over the head's other positions (headPositions).
+   */
+  protected static middleRanges(headStart: number, headEnd: number, tailStart: number): ReadonlyArray<readonly [number, number]> {
+    return [[0, Math.min(headStart, tailStart)], [Math.max(headStart, headEnd), tailStart]];
+  }
+
+  /**
    * Shared structural pass for both selectors: repair tool pairing over the
    * entries as selected. What sending does to a raw message's tool blocks
    * (toolPruning) was already applied as each was emitted (cappedForSend),
@@ -18428,19 +18574,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Collapse consecutive messages from the same participant into single messages.
    * Required because Claude API rejects consecutive same-role messages.
+   * A message left empty, as compression input leaves one of thinking or
+   * system changes alone (compressionInputContent), is passed over, so its
+   * neighbours join as they would without it and no separator marks it.
    */
   protected collapseConsecutiveMessages(
     messages: Array<{ participant: string; content: ContentBlock[] }>
   ): Array<{ participant: string; content: ContentBlock[] }> {
-    if (messages.length === 0) return [];
+    const result: Array<{ participant: string; content: ContentBlock[] }> = [];
 
-    const result: Array<{ participant: string; content: ContentBlock[] }> = [
-      { participant: messages[0].participant, content: [...messages[0].content] },
-    ];
-
-    for (let i = 1; i < messages.length; i++) {
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].content.length === 0) continue;
       const last = result[result.length - 1];
-      if (messages[i].participant === last.participant) {
+      if (!last) {
+        result.push({ participant: messages[i].participant, content: [...messages[i].content] });
+      } else if (messages[i].participant === last.participant) {
         // Merge: add separator then content
         last.content.push({ type: 'text', text: '\n\n---\n\n' } as ContentBlock);
         last.content.push(...messages[i].content);

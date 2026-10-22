@@ -72,6 +72,21 @@ import type {
 type InitializationStamp = StoreBranchGeneration & { id: string; attempt: number };
 
 /**
+ * A compiled message as `firstChanged` compares it. An injection's content
+ * is the caller's, which may change in place, so its bytes are taken when
+ * it's compiled. Other content is the store's or the strategy's, which
+ * nothing changes in place (as the store's own per-message caches assume),
+ * so the same array is the same content, and its bytes are taken only when a
+ * comparison with another array needs them.
+ */
+interface CompiledMessageKey {
+  readonly participant: string;
+  readonly content: readonly ContentBlock[];
+  readonly injected: boolean;
+  bytes?: string;
+}
+
+/**
  * Base configuration for ContextManager.
  */
 interface ContextManagerBaseConfig {
@@ -254,6 +269,12 @@ export class ContextManager {
   private compressionHolds = new Set<MessageId>();
   /** Summaries the strategy rendered but couldn't describe, already reported. */
   private undescribedSummariesReported = new Set<string>();
+  /**
+   * The last committing compile's messages, for the next one's
+   * `firstChanged`, whatever branch or strategy it read; null before this
+   * manager's first committing compile.
+   */
+  private lastCompiled: CompiledMessageKey[] | null = null;
   /** Sharded adds held on ingress: first-shard id -> every shard id. */
   private compressionHoldGroups = new Map<MessageId, MessageId[]>();
   /** heldAt / expiresAt per held id (expiresAt absent = no timeout). */
@@ -1245,6 +1266,9 @@ export class ContextManager {
         ...(layout ? { journalMark: this.foldJournal.mark() } : {}),
       };
       if (this.debugLogContext) this.logCompiledContext(result);
+      // Last, so a compile that throws before returning, which no caller
+      // sends, is never the one the next is compared with.
+      if (!opts?.dryRun) result.firstChanged = this.measureFirstChanged(result.messages, injected);
       return result;
     };
 
@@ -1315,6 +1339,46 @@ export class ContextManager {
     }
 
     return finish({ messages, systemInjections }, injectedContent);
+  }
+
+  /**
+   * The index of the first compiled message whose participant or content
+   * bytes differ from the last committing compile's message at that index, or
+   * that has none there (so the first appended index after appends alone, and
+   * the message count when these messages are that compile's or a prefix of
+   * them); null before this manager's first committing compile. The
+   * comparison is by bytes, so it holds across a branch or strategy switch,
+   * which the manager can't always see (a direct switch of the store's
+   * branch away and back). Cache markers are message flags, not content, so
+   * they don't count. Records these messages for the next
+   * (CompiledMessageKey).
+   */
+  private measureFirstChanged(
+    messages: readonly NormalizedMessage[],
+    injected: readonly (readonly ContentBlock[])[],
+  ): number | null {
+    const fromInjection = new Set(injected);
+    const keys: CompiledMessageKey[] = messages.map((message) => fromInjection.has(message.content)
+      ? { participant: message.participant, content: message.content, injected: true, bytes: JSON.stringify(message.content) }
+      : { participant: message.participant, content: message.content, injected: false });
+    const before = this.lastCompiled;
+    if (!before) {
+      this.lastCompiled = keys;
+      return null;
+    }
+    const bytesOf = (key: CompiledMessageKey): string => (key.bytes ??= JSON.stringify(key.content));
+    let i = 0;
+    for (; i < keys.length && i < before.length; i++) {
+      const now = keys[i]!;
+      const then = before[i]!;
+      if (now.participant !== then.participant) break;
+      if (now.content === then.content && !now.injected && !then.injected) continue;
+      if (bytesOf(now) !== bytesOf(then)) break;
+    }
+    // Recorded once the comparison has returned: one that throws leaves the
+    // last compile that returned as the next one's comparison.
+    this.lastCompiled = keys;
+    return i;
   }
 
   /**

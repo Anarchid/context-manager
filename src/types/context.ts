@@ -171,6 +171,32 @@ export interface CompileResult {
    * read-only. It's transient and isn't part of the persisted provenance.
    */
   rawBodies?: ReadonlyMap<MessageId, readonly StoredMessage[]>;
+
+  /**
+   * Where this compile's messages first differ from the last committing
+   * compile's, for every strategy: the index of the first message, injections
+   * included, whose participant or content bytes differ from that compile's
+   * message at the same index, or that has none there. So when this compile
+   * only appended to that one's messages it is the first appended index, and
+   * it equals `messages.length` when these messages are that compile's or a
+   * prefix of them. An injection placed beside the newest user message moves
+   * with each new user message, so after one it's that injection's old index
+   * rather than the first appended one. Null only for the manager's first
+   * committing compile, since the comparison is with what this manager last
+   * compiled, held in memory: a manager opened again, as after a restart,
+   * starts with none. The comparison is by bytes, so it holds across a
+   * branch switch or a new strategy, whichever way the switch was made. The
+   * store's content is taken as the same bytes where it's the same array, so
+   * a block a caller changed in place after storing it, which the store's
+   * contract rules out, isn't seen.
+   * Cache markers don't count, and neither do `systemInjections`, which the
+   * caller adds to the system prompt itself. A dry compile leaves it out and
+   * doesn't move the comparison; a committing compile that returns moves it
+   * whether or not its request is sent, and one that throws doesn't. A
+   * caller can tell from it whether a compile rewrote what the last
+   * committing compile gave, such as a system change it wrote.
+   */
+  firstChanged?: number | null;
 }
 
 /** A branch as a compile or receipt saw it: native id, name, creation time. */

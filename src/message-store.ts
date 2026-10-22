@@ -1157,6 +1157,10 @@ export class MessageStore {
       case 'audio':
       case 'video':
         return 1000; // Default estimate for media
+      case 'system_change':
+        // Its tool definitions and system text go out whole, so it's priced
+        // from its JSON, as a tool call's input is.
+        return jsonTokenEstimator(JSON.stringify(block));
       default:
         return MessageStore.xmlHistoryCarrierTokens(block);
     }
