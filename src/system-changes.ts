@@ -4,7 +4,11 @@
  * the conversation on. One stands alone in its message
  * (well-formed-content.ts), and membrane sends such a message as a system
  * message of its own, at the first point at or after its place that follows
- * a user turn, so always before the reply the request asks for.
+ * a user turn, so always before the reply the request asks for. So one
+ * stored between a tool call and its result would go out after the result,
+ * and the store refuses that write where a write can see it
+ * (MessageStore.refuseToolPairSplit): kept raw there, it would part the call
+ * from its result.
  *
  * Every strategy compiles such a message unaltered, in its place among the
  * raw messages. A fold or a window that left one out would take its change
@@ -47,9 +51,19 @@ export function holdsSystemChange(content: readonly ContentBlock[]): boolean {
   return false;
 }
 
-/** The positions in a listing of the messages that hold a system change, in order. */
+const positionsOf = new WeakMap<object, readonly number[]>();
+
+/**
+ * The positions in a listing of the messages that hold a system change, in
+ * order. A select reads them several times, so they're found once per
+ * listing: a listing is the store's, which callers never change
+ * (MessageStore.getAll), and a write makes a new one.
+ */
 export function systemChangePositions(messages: readonly { content: readonly ContentBlock[] }[]): readonly number[] {
+  const known = positionsOf.get(messages);
+  if (known) return known;
   const positions: number[] = [];
   for (let i = 0; i < messages.length; i++) if (holdsSystemChange(messages[i]!.content)) positions.push(i);
+  positionsOf.set(messages, positions);
   return positions;
 }

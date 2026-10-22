@@ -423,10 +423,10 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * the live-image policy's verdicts applied (liveImagePolicy, stripImages),
    * each decided from its message and newer ones, with depth from the view's
    * newest message, so they're select's. A message before the anchor comes
-   * back as null: select leaves it out, but for a system change, which it
-   * sends ahead of the window. A change there isn't a just-stored message,
-   * which is what this is for, since the anchor only moves to a message a
-   * compile sent, and a message stored later comes after it. Like select, it
+   * back as null, since select leaves it out, but for a system change, which
+   * comes back as select sends it ahead of the window, cut as any message
+   * is: a compile moves the anchor only to a message it sent, but a
+   * caller's setAnchor can move it past one just stored. Like select, it
    * first reloads the branch the store has moved to. A re-anchor the next
    * compile's budget forces isn't foreseen: it moves the anchor only past a
    * window bigger than the budget allows. A body sharded under the
@@ -459,7 +459,11 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     this.stripImages(entries, this.liveImagePolicy(messages, store, from));
     const rendered = new Map<MessageId, ContentBlock[]>();
     for (const entry of entries) rendered.set(entry.sourceMessageId!, entry.content);
-    return ids.map((id) => rendered.get(id) ?? null);
+    return ids.map((id) => {
+      const i = at.get(id);
+      if (i !== undefined && !shown(i) && holdsSystemChange(messages[i]!.content)) return this.cappedContent(messages[i]!);
+      return rendered.get(id) ?? null;
+    });
   }
 
   /** 'window' when the last committed select moved the window's start. */

@@ -16907,6 +16907,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // distant chronological regions and poisoned every ancestor merge.
         // Close even a thin run at the ownership seam. A short summary (or
         // raw fallback while it is pending) is cheaper than a non-tree span.
+        // A system change, which stays raw, is such a seam. The store refuses
+        // a change between a call and its result where a write can see it
+        // (MessageStore.refuseToolPairSplit), so this close parts a pair only
+        // in a shape that refusal leaves alone.
         closeCurrent(i);
       }
       let msgTokens = store.estimateTokens(msg);

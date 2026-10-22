@@ -33,6 +33,7 @@ import {
 } from '../src/index.js';
 import { jsonTokenEstimator } from '../src/message-store.js';
 import { wellFormedContent } from '../src/well-formed-content.js';
+import { systemChangePositions } from '../src/system-changes.js';
 import type { CompileResult, ContextStrategy, StoredMessage, TokenBudget } from '../src/types/index.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'cm-system-changes-'));
@@ -43,6 +44,8 @@ const tool = { name: 'get_weather', description: 'Weather.', inputSchema: { type
 const change = (extra: Record<string, unknown> = {}): ContentBlock =>
   ({ type: 'system_change', defineTools: [tool], addSystem: ['Use metric units.'], ...extra }) as unknown as ContentBlock;
 const text = (t: string): ContentBlock => ({ type: 'text', text: t });
+const toolUse = (id: string): ContentBlock => ({ type: 'tool_use', id, name: 'get_weather', input: { city: 'Oslo' } }) as ContentBlock;
+const toolResult = (id: string, t = 'Sunny.'): ContentBlock => ({ type: 'tool_result', toolUseId: id, content: t }) as ContentBlock;
 const BIG = { maxTokens: 1_000_000, reserveForResponse: 0 };
 
 async function open(strategy: ContextStrategy, membrane?: unknown): Promise<ContextManager> {
@@ -123,6 +126,161 @@ describe('a system change, written and priced', () => {
     assert.ok(malformedContentPlaces(sparse).includes('content[0] is a system_change beside other blocks; a system change goes in a message of its own'), JSON.stringify(malformedContentPlaces(sparse)));
     assert.throws(() => cm.addMessage('Harness', sparse as ContentBlock[]), MalformedContentError);
     assert.equal(cm.getAllMessages().length, 0);
+  });
+
+  it('is refused while the nearest call before it has no result between them, by the manager before an expired hold is released and by the store, and taken after the result', async () => {
+    const clock = { t: 0 };
+    let released = 0;
+    const strategy = new (class extends PassthroughStrategy {
+      onCompressionHoldsReleased(): void { released++; }
+    })();
+    const cm = await ContextManager.open({ path: join(dir, `store-${opened++}`), strategy, now: () => clock.t });
+    cm.addMessage('User', [text('Weather in Oslo?')], undefined, undefined, { holdCompression: { timeoutMs: 100 } });
+    const call = cm.addMessage('Claude', [toolUse('t1')]);
+    clock.t = 150;
+    assert.throws(() => cm.addMessage('Harness', [change()]), (e: Error) => e.message ===
+      `Message refused: a system change can't go between a tool call and its result, and message ${call} holds a tool_use (t1) with no result between it and this change. ` +
+      'Write it after the result, where membrane sends it anyway; for a call that will get none, store a result for it first or remove the call.');
+    assert.equal(released, 0, 'refused before the expired hold was released');
+    const store = (cm as unknown as { messageStore: { append(participant: string, content: ContentBlock[]): unknown } }).messageStore;
+    assert.throws(() => store.append('Harness', [change()]), /a system change can't go between a tool call and its result/);
+    assert.equal(cm.getAllMessages().length, 2);
+    cm.addMessage('User', [toolResult('t1')]);
+    assert.equal(released, 1);
+    // After the result, and after another change there.
+    cm.addMessage('Harness', [change()]);
+    cm.addMessage('Harness', [change({ addSystem: ['Be brief.'] })]);
+    assert.equal(cm.getAllMessages().length, 5);
+  });
+
+  it('is refused while any of parallel calls is unanswered, their results in messages of their own, and taken once the last lands', async () => {
+    const cm = await open(new PassthroughStrategy());
+    cm.addMessage('User', [text('Weather in Oslo and Bergen?')]);
+    const call = cm.addMessage('Claude', [toolUse('a'), toolUse('b')]);
+    cm.addMessage('User', [toolResult('a')]);
+    assert.throws(() => cm.addMessage('Harness', [change()]), (e: Error) => e.message ===
+      `Message refused: a system change can't go between a tool call and its result, and message ${call} holds a tool_use (b) with no result between it and this change. ` +
+      'Write it after the result, where membrane sends it anyway; for a call that will get none, store a result for it first or remove the call.');
+    cm.addMessage('User', [toolResult('b')]);
+    cm.addMessage('Harness', [change()]);
+    assert.equal(cm.getAllMessages().length, 5);
+  });
+
+  it("is refused after a call on a sharded body's first shard, whichever shard is last, and the refusal names the shard holding the call", async () => {
+    const cm = await open(new PassthroughStrategy());
+    const store = (cm as unknown as { messageStore: { append(participant: string, content: ContentBlock[], metadata?: unknown, causedBy?: unknown, extra?: unknown): StoredMessage } }).messageStore;
+    cm.addMessage('User', [text('Summarize this and look it up.')]);
+    // Ingress sharding puts a message's non-text blocks on its body's first shard.
+    const first = store.append('Claude', [text('part one '), toolUse('t1')], undefined, undefined, { bodyGroupId: 'g', shardIndex: 0, shardCount: 2 });
+    store.append('Claude', [text('part two')], undefined, undefined, { bodyGroupId: 'g', shardIndex: 1, shardCount: 2 });
+    assert.throws(() => cm.addMessage('Harness', [change()]), new RegExp(`message ${first.id} holds a tool_use \\(t1\\) with no result between it and this change`));
+    cm.addMessage('User', [toolResult('t1')]);
+    cm.addMessage('Harness', [change()]);
+  });
+
+  it("reads a sharded results message whole, from its first shard, walking back from a change and forward from an edited call", async () => {
+    const cm = await open(new PassthroughStrategy());
+    const store = (cm as unknown as { messageStore: { append(participant: string, content: ContentBlock[], metadata?: unknown, causedBy?: unknown, extra?: unknown): StoredMessage } }).messageStore;
+    cm.addMessage('User', [text('Weather in Oslo and Bergen?')]);
+    const call = cm.addMessage('Claude', [toolUse('a'), toolUse('b')]);
+    // Ingress sharding puts a message's results on its first shard, its long text after.
+    store.append('User', [toolResult('a')], undefined, undefined, { bodyGroupId: 'r', shardIndex: 0, shardCount: 2 });
+    store.append('User', [text('a long note beside the result')], undefined, undefined, { bodyGroupId: 'r', shardIndex: 1, shardCount: 2 });
+    assert.throws(() => cm.addMessage('Harness', [change()]), new RegExp(`message ${call} holds a tool_use \\(b\\) with no result between it and this change`));
+    cm.addMessage('User', [toolResult('b')]);
+    const later = cm.addMessage('Harness', [change()]);
+    // Forward: an edit giving a message calls that the sharded results answer only in part, before the change.
+    cm.editMessage(call, [text('Checking.')]);
+    assert.throws(() => cm.editMessage(call, [toolUse('a'), toolUse('c')]), (e: Error) => e.message ===
+      `Edit of ${call} refused: a tool_use (c) can't go before a system change (message ${later}) that comes before its result; a change goes after the call's result.`);
+    cm.editMessage(call, [toolUse('a'), toolUse('b')]);
+    assert.equal(cm.getAllMessages().length, 6);
+  });
+
+  it('takes a change after a bundled cycle, whose own later blocks answer its calls, an edit giving one to a message right before a change, and an edit giving a call to a message a plain one follows', async () => {
+    const cm = await open(new PassthroughStrategy());
+    cm.addMessage('User', [text('Weather?')]);
+    // A bundled cycle, as claude.ai exports store one: the compile splits it (splitMixedToolMessages).
+    cm.addMessage('Claude', [text('Checking.'), toolUse('t1'), toolResult('t1'), text('Sunny.')]);
+    cm.addMessage('Harness', [change()]);
+    const reply = cm.addMessage('Claude', [text('Anything else?')]);
+    cm.addMessage('Harness', [change({ addSystem: ['Be brief.'] })]);
+    cm.editMessage(reply, [toolUse('t2'), toolResult('t2')]);
+    // A plain message between a call and the next change ends the forward walk, as it ends the back walk.
+    const asked = cm.addMessage('Claude', [text('Let me see.')]);
+    cm.addMessage('User', [text('ok')]);
+    cm.addMessage('Harness', [change({ addSystem: ['Be kind.'] })]);
+    cm.editMessage(asked, [toolUse('t3')]);
+    // A call given to the last message: the forward walk ends with the store.
+    const last = cm.addMessage('Claude', [text('Bye.')]);
+    cm.editMessage(last, [toolUse('t4')]);
+    assert.deepEqual(cm.getAllMessages().map((m) => m.content.map((b) => b.type).join('+')),
+      ['text', 'text+tool_use+tool_result+text', 'system_change', 'tool_use+tool_result', 'system_change', 'tool_use', 'text', 'system_change', 'tool_use']);
+  });
+
+  it("leaves open a bundled message's call that none of its later blocks answers: a parallel call beside an answered one, and a call after its result", async () => {
+    const cm = await open(new PassthroughStrategy());
+    cm.addMessage('User', [text('Weather?')]);
+    const parallel = cm.addMessage('Claude', [toolUse('a'), toolUse('b'), toolResult('a')]);
+    assert.throws(() => cm.addMessage('Harness', [change()]), new RegExp(`message ${parallel} holds a tool_use \\(b\\) with no result`));
+    cm.addMessage('User', [toolResult('b')]);
+    cm.addMessage('Harness', [change()]);
+    // A result before its call in the same message answers nothing: the compile splits it ahead of the call.
+    const reversed = cm.addMessage('Claude', [toolResult('c'), toolUse('c')]);
+    assert.throws(() => cm.addMessage('Harness', [change()]), new RegExp(`message ${reversed} holds a tool_use \\(c\\) with no result`));
+    // And an edit giving a message right before a change such a call is refused.
+    assert.throws(() => cm.editMessage(cm.getAllMessages()[2]!.id, [toolUse('d'), toolUse('e'), toolResult('d')]), /a tool_use \(e\) can't go before a system change/);
+  });
+
+  it('refuses nothing for a call further back than a message of another kind, whose result never came', async () => {
+    const cm = await open(new PassthroughStrategy());
+    cm.addMessage('User', [text('Weather?')]);
+    cm.addMessage('Claude', [toolUse('t1')]);
+    // An interrupted round: the call's result never came, and the conversation went on.
+    cm.addMessage('User', [text('Never mind.')]);
+    cm.addMessage('Harness', [change()]);
+    assert.equal(cm.getAllMessages().length, 4);
+  });
+
+  it('refuses a tool result answering a call that a change follows, as a removal can leave them, and another change there', async () => {
+    const cm = await open(new PassthroughStrategy());
+    cm.addMessage('User', [text('Weather?')]);
+    const call = cm.addMessage('Claude', [toolUse('t1'), toolUse('t2')]);
+    const result = cm.addMessage('User', [toolResult('t1')]);
+    cm.addMessage('User', [toolResult('t2')]);
+    const first = cm.addMessage('Harness', [change()]);
+    // Removing a result leaves its call unanswered before the change.
+    cm.removeMessage(result);
+    assert.throws(() => cm.addMessage('User', [toolResult('t1')]), (e: Error) => e.message ===
+      `Message refused: a tool_result can't follow a system change (message ${first}) that follows its tool call (t1, message ${call}). ` +
+      'Remove the change and write it after the result.');
+    assert.throws(() => cm.addMessage('Harness', [change({ addSystem: ['Be brief.'] })]), new RegExp(`message ${call} holds a tool_use \\(t1\\)`));
+    // A result answering no call there isn't refused.
+    cm.addMessage('User', [toolResult('other')]);
+    cm.addMessage('User', [text('Never mind.')]);
+    assert.equal(cm.getAllMessages().length, 6);
+  });
+
+  it('refuses an edit that puts a change between a call and its result, from either side, through the manager and the store, and takes one that keeps them together', async () => {
+    const cm = await open(new PassthroughStrategy());
+    const store = (cm as unknown as { messageStore: { edit(id: string, content: ContentBlock[]): void } }).messageStore;
+    cm.addMessage('User', [text('Weather?')]);
+    const call = cm.addMessage('Claude', [toolUse('t1')]);
+    const result = cm.addMessage('User', [toolResult('t1')]);
+    const reply = cm.addMessage('Claude', [text('Sunny.')]);
+    const partial = cm.addMessage('User', [toolResult('t2')]);
+    const later = cm.addMessage('Harness', [change()]);
+    assert.throws(() => cm.editMessage(result, [change()]), (e: Error) => e.message ===
+      `Edit of ${result} refused: a system change can't go between a tool call and its result, and message ${call} holds a tool_use (t1) with no result between it and this change. ` +
+      'Write it after the result, where membrane sends it anyway; for a call that will get none, store a result for it first or remove the call.');
+    assert.throws(() => store.edit(result, [change()]), /a system change can't go between a tool call and its result/);
+    // A call whose results, in the messages after it, run into a change first.
+    assert.throws(() => cm.editMessage(reply, [toolUse('t2'), toolUse('t3')]), (e: Error) => e.message ===
+      `Edit of ${reply} refused: a tool_use (t3) can't go before a system change (message ${later}) that comes before its result; a change goes after the call's result.`);
+    cm.editMessage(reply, [toolUse('t2')]);
+    cm.editMessage(result, [toolResult('t1', 'Rainy.')]);
+    assert.deepEqual(cm.getAllMessages().map((m) => m.content[0]!.type), ['text', 'tool_use', 'tool_result', 'tool_use', 'tool_result', 'system_change']);
+    assert.equal(cm.getAllMessages()[4]!.id, partial);
   });
 
   it('is refused when a field that carries its content has the wrong type, each field and element by name, and taken with several changes alone', () => {
@@ -315,11 +473,15 @@ describe('the autobiographical strategy and a system change', () => {
     const strategy = new AutobiographicalStrategy({ adaptiveResolution: true, headWindowTokens: 400, recentWindowTokens: 0, autoTickOnNewMessage: false });
     const cm = await open(strategy);
     cm.addMessage('User', [text('message ' + 'word '.repeat(10))]);
-    // An unanswered call is the newest turn.
     cm.addMessage('Claude', [text('calling'), { type: 'tool_use', id: 't1', name: 'read', input: {} } as ContentBlock]);
-    // A reset at a change after it puts the change in the head, so the call is
-    // the last compiled message, and the structural repair trims it.
-    strategy.resetHeadWindow(cm.addMessage('Harness', [change()]));
+    const result = cm.addMessage('User', [{ type: 'tool_result', toolUseId: 't1', content: 'read.' } as ContentBlock]);
+    const trailing = cm.addMessage('Harness', [change()]);
+    // Removing the result leaves an unanswered call as the newest turn, right
+    // before the change (a write can't put one there). A reset at the change
+    // puts it in the head, so the call is the last compiled message, and the
+    // structural repair trims it.
+    cm.removeMessage(result);
+    strategy.resetHeadWindow(trailing);
     await assert.rejects(cm.compile(BIG), (err: unknown) => {
       assert.ok(err instanceof OverBudgetError, String(err));
       assert.match(err.message, /^Structural repair did not retain the newest turn/);
@@ -466,8 +628,12 @@ describe('the autobiographical strategy and a system change', () => {
     assert.ok(chunks().some((c) => c.messages.some((m) => m.id === use) && c.messages.some((m) => m.id === result)), 'the call and its result share a chunk');
     // As on main, that chunk overlaps the summary, which refuses it, so both go out raw, the result with its call.
     await settle(cm, requests);
-    const sent = rawIds(await cm.compile(BIG));
+    const compiled = await cm.compile(BIG);
+    const sent = rawIds(compiled);
     assert.ok(sent.includes(use) && sent.includes(result), 'the call and its result are sent raw');
+    const blocks = compiled.messages.flatMap((m) => m.content as Array<{ type: string; id?: string; toolUseId?: string; content?: unknown }>);
+    assert.ok(blocks.some((b) => b.type === 'tool_use' && b.id === 't1'), "the call's tool_use is sent");
+    assert.ok(blocks.some((b) => b.type === 'tool_result' && b.toolUseId === 't1' && b.content === 'read it'), 'the result is sent with its content');
   });
 
   it('KnowledgeStrategy: a summary ending at a call that a plain message follows still closes there', async () => {
@@ -515,7 +681,8 @@ describe('the autobiographical strategy and a system change', () => {
     for (let i = 30; i < 45; i++) cm.addMessage(i % 2 ? 'Claude' : 'User', [text(`M-${i} ${'word '.repeat(30)}`)]);
     await settle(cm, requests);
     const beforeLast = covered.messages.at(-2)!.id;
-    assert.ok(!chunkOf(beforeLast)?.some((m) => m.id === next), 'no chunk runs on past a summary whose last message is pinned');
+    assert.ok(chunkOf(beforeLast), 'setup: the message before the pinned one is in a chunk');
+    assert.ok(!chunkOf(beforeLast)!.some((m) => m.id === next), 'no chunk runs on past a summary whose last message is pinned');
     // Summaries made before it was unpinned, which don't cover it.
     const others = new Set((strategy as unknown as { summaries: Array<{ level: number; sourceIds: string[] }> }).summaries
       .filter((x) => x.level === 1 && !x.sourceIds.includes(ids[12]!)).flatMap((x) => x.sourceIds));
@@ -583,6 +750,14 @@ describe('the autobiographical strategy and a system change', () => {
     assert.deepEqual(collapse([{ participant: 'Harness', content: [] }, { participant: 'User', content: [text('a')] }]),
       [{ participant: 'User', content: [text('a')] }]);
     assert.deepEqual(collapse([{ participant: 'User', content: [] }, { participant: 'Claude', content: [] }]), []);
+  });
+
+  it("finds a listing's changes once, and a new listing's afresh", () => {
+    const m = (...content: ContentBlock[]): { content: ContentBlock[] } => ({ content });
+    const listing = [m(text('a')), m(change()), m(text('b'))];
+    assert.deepEqual(systemChangePositions(listing), [1]);
+    assert.equal(systemChangePositions(listing), systemChangePositions(listing), 'the same listing: the same answer');
+    assert.notEqual(systemChangePositions([...listing]), systemChangePositions(listing), 'a new listing: found again');
   });
 
   it('a large change is never sharded at ingress', async () => {
@@ -890,6 +1065,18 @@ describe('the passthrough strategies and a system change before their window', (
     });
   });
 
+  it('windowed-passthrough: renderAsNewest gives a change before the anchor as select sends it, ahead of the window', async () => {
+    const strategy = new WindowedPassthroughStrategy();
+    const cm = await open(strategy);
+    cm.addMessage('User', [text('a')]);
+    const id = cm.addMessage('Harness', [change()]);
+    const after = cm.addMessage('User', [text('b')]);
+    strategy.setAnchor(cm.getMessage(after)!.sequence);
+    const compiled = await cm.compile(BIG);
+    assert.deepEqual(changesSent(compiled), [[change()]], 'setup: select sends the change ahead of the window');
+    assert.deepEqual(cm.renderAsNewest([id]), changesSent(compiled));
+  });
+
   it('windowed-passthrough: a refused compile leaves the anchor where the last sent window started', async () => {
     const strategy = new WindowedPassthroughStrategy({ reAnchorFraction: 0.5 });
     const cm = await open(strategy);
@@ -968,6 +1155,75 @@ describe('firstChanged', () => {
     await assert.rejects(cm.compile(BIG), /layout failed/);
     // The same three messages again: the last compile that returned sent two.
     assert.equal((await cm.compile(BIG)).firstChanged, 2);
+  });
+
+  it('is compared when read, serializing nothing again on a second read, and read after a later compile still compares with the compile before it', async () => {
+    // A strategy sending new arrays each compile, as caps and recall pairs
+    // do, whose blocks count each serialization.
+    let serialized = 0;
+    const counted = (block: ContentBlock): ContentBlock => ({ ...block, toJSON: () => { serialized++; return block; } }) as unknown as ContentBlock;
+    const strategy = new (class extends PassthroughStrategy {
+      select(...args: Parameters<PassthroughStrategy['select']>): ReturnType<PassthroughStrategy['select']> {
+        return super.select(...args).map((entry) => ({ ...entry, content: entry.content.map(counted) }));
+      }
+    })();
+    const cm = await open(strategy);
+    cm.addMessage('User', [text('a')]);
+    cm.addMessage('Claude', [text('b')]);
+    const first = await cm.compile(BIG);
+    const second = await cm.compile(BIG);
+    const before = serialized;
+    assert.equal(second.firstChanged, 2, 'the same bytes in new arrays');
+    assert.ok(serialized > before, 'the comparison serialized them when read');
+    const once = serialized;
+    assert.equal(second.firstChanged, 2);
+    assert.equal(serialized, once, 'and not again');
+    cm.editMessage(cm.getAllMessages()[1]!.id, [text('b, edited')]);
+    const third = await cm.compile(BIG);
+    cm.addMessage('User', [text('c')]);
+    await cm.compile(BIG);
+    assert.equal(first.firstChanged, null);
+    assert.equal(third.firstChanged, 1, 'read first after a later compile, the third against the second');
+    assert.equal(second.firstChanged, 2, 'still the second compile against the first');
+  });
+
+  it('serializes nothing on a read where the compiled arrays are the last compile\'s', async () => {
+    let serialized = 0;
+    const counted = (block: ContentBlock): ContentBlock => ({ ...block, toJSON: () => { serialized++; return block; } }) as unknown as ContentBlock;
+    const sent = new Map<string, ContentBlock[]>();
+    const strategy = new (class extends PassthroughStrategy {
+      select(...args: Parameters<PassthroughStrategy['select']>): ReturnType<PassthroughStrategy['select']> {
+        return super.select(...args).map((entry) => {
+          const id = entry.sourceMessageId!;
+          if (!sent.has(id)) sent.set(id, entry.content.map(counted));
+          return { ...entry, content: sent.get(id)! };
+        });
+      }
+    })();
+    const cm = await open(strategy);
+    cm.addMessage('User', [text('a')]);
+    cm.addMessage('Claude', [text('b')]);
+    await cm.compile(BIG);
+    const second = await cm.compile(BIG);
+    const before = serialized;
+    assert.equal(second.firstChanged, 2);
+    assert.equal(serialized, before, 'the same arrays are compared by identity');
+  });
+
+  it('is carried by a copy and JSON, read on a frozen result, takes an assignment, and leaves out system injections', async () => {
+    const cm = await open(new PassthroughStrategy());
+    cm.addMessage('User', [text('a')]);
+    await cm.compile(BIG);
+    const copied = await cm.compile(BIG);
+    assert.equal({ ...copied }.firstChanged, 1);
+    assert.equal(JSON.parse(JSON.stringify(copied)).firstChanged, 1);
+    const frozen = Object.freeze(await cm.compile(BIG));
+    assert.equal(frozen.firstChanged, 1, 'a frozen result reads it');
+    const assigned = await cm.compile(BIG);
+    assigned.firstChanged = 7;
+    assert.equal(assigned.firstChanged, 7);
+    const withSystem = await cm.compile(BIG, [{ namespace: 'n', position: 'system', content: [text('system note')] }]);
+    assert.equal(withSystem.firstChanged, withSystem.messages.length, 'a system injection goes in the system prompt, not the messages');
   });
 
   it('does not count cache markers', async () => {

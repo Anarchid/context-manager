@@ -86,6 +86,20 @@ interface CompiledMessageKey {
   bytes?: string;
 }
 
+/** The index of the first of `keys` that differs from `before`'s at its index, or has none there (ContextManager.recordFirstChanged). */
+function firstDifference(keys: readonly CompiledMessageKey[], before: readonly CompiledMessageKey[]): number {
+  const bytesOf = (key: CompiledMessageKey): string => (key.bytes ??= JSON.stringify(key.content));
+  let i = 0;
+  for (; i < keys.length && i < before.length; i++) {
+    const now = keys[i]!;
+    const then = before[i]!;
+    if (now.participant !== then.participant) break;
+    if (now.content === then.content && !now.injected && !then.injected) continue;
+    if (bytesOf(now) !== bytesOf(then)) break;
+  }
+  return i;
+}
+
 /**
  * Base configuration for ContextManager.
  */
@@ -551,6 +565,9 @@ export class ContextManager {
     // later (appendMessage), once expired holds have been released, as at
     // any add.
     content = contentForWrite(content, 'Message refused');
+    // So is a system change between a tool call and its result
+    // (MessageStore.refuseToolPairSplit).
+    this.messageStore.refuseToolPairSplit(content, 'Message refused');
     return this.write(() => {
       this.expireCompressionHolds();
       if (!options?.holdCompression) {
@@ -1268,7 +1285,7 @@ export class ContextManager {
       if (this.debugLogContext) this.logCompiledContext(result);
       // Last, so a compile that throws before returning, which no caller
       // sends, is never the one the next is compared with.
-      if (!opts?.dryRun) result.firstChanged = this.measureFirstChanged(result.messages, injected);
+      if (!opts?.dryRun) this.recordFirstChanged(result, injected);
       return result;
     };
 
@@ -1342,43 +1359,48 @@ export class ContextManager {
   }
 
   /**
-   * The index of the first compiled message whose participant or content
-   * bytes differ from the last committing compile's message at that index, or
-   * that has none there (so the first appended index after appends alone, and
-   * the message count when these messages are that compile's or a prefix of
-   * them); null before this manager's first committing compile. The
-   * comparison is by bytes, so it holds across a branch or strategy switch,
-   * which the manager can't always see (a direct switch of the store's
-   * branch away and back). Cache markers are message flags, not content, so
-   * they don't count. Records these messages for the next
-   * (CompiledMessageKey).
+   * Records a committing compile's messages for the next one's comparison
+   * (CompiledMessageKey), and gives `result` its `firstChanged`, compared
+   * when it's read: a caller that never reads it pays for no comparison.
+   * That is the index of the first compiled message whose
+   * participant or content bytes differ from the last committing compile's
+   * message at that index, or that has none there (so the first appended
+   * index after appends alone, and the message count when these messages are
+   * that compile's or a prefix of them); null before this manager's first
+   * committing compile. The comparison is by bytes, so it holds across a
+   * branch or strategy switch, which the manager can't always see (a direct
+   * switch of the store's branch away and back). Cache markers are message
+   * flags, not content, so they don't count. Read after later compiles, it
+   * still compares this compile with the one before it. Until it's read, a
+   * result keeps this compile's keys and the last one's.
    */
-  private measureFirstChanged(
-    messages: readonly NormalizedMessage[],
-    injected: readonly (readonly ContentBlock[])[],
-  ): number | null {
+  private recordFirstChanged(result: CompileResult, injected: readonly (readonly ContentBlock[])[]): void {
     const fromInjection = new Set(injected);
-    const keys: CompiledMessageKey[] = messages.map((message) => fromInjection.has(message.content)
+    const keys: CompiledMessageKey[] = result.messages.map((message) => fromInjection.has(message.content)
       ? { participant: message.participant, content: message.content, injected: true, bytes: JSON.stringify(message.content) }
       : { participant: message.participant, content: message.content, injected: false });
     const before = this.lastCompiled;
-    if (!before) {
-      this.lastCompiled = keys;
-      return null;
-    }
-    const bytesOf = (key: CompiledMessageKey): string => (key.bytes ??= JSON.stringify(key.content));
-    let i = 0;
-    for (; i < keys.length && i < before.length; i++) {
-      const now = keys[i]!;
-      const then = before[i]!;
-      if (now.participant !== then.participant) break;
-      if (now.content === then.content && !now.injected && !then.injected) continue;
-      if (bytesOf(now) !== bytesOf(then)) break;
-    }
-    // Recorded once the comparison has returned: one that throws leaves the
-    // last compile that returned as the next one's comparison.
     this.lastCompiled = keys;
-    return i;
+    // The first read, or a write, settles the value and lets go of both
+    // compiles' keys, so the result then holds a number. It stays an
+    // accessor, so a frozen or sealed result reads it too.
+    let pending: { keys: CompiledMessageKey[]; before: typeof before } | null = { keys, before };
+    let value: number | null | undefined;
+    Object.defineProperty(result, 'firstChanged', {
+      enumerable: true,
+      configurable: true,
+      get: () => {
+        if (pending) {
+          value = pending.before ? firstDifference(pending.keys, pending.before) : null;
+          pending = null;
+        }
+        return value;
+      },
+      set: (next: number | null | undefined) => {
+        value = next;
+        pending = null;
+      },
+    });
   }
 
   /**

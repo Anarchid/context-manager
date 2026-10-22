@@ -144,6 +144,9 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
         // first message, ahead of the change, so what came after the change
         // would be read before it. Close even a thin run there. A store
         // without changes whose chunks match its summaries chunks as before.
+        // The store refuses a change between a call and its result where a
+        // write can see it (MessageStore.refuseToolPairSplit), so this close
+        // parts a pair only in a shape that refusal leaves alone.
         closeAt(i);
       }
       const phase = this.classifyMessage(msg, lastToolPhase);

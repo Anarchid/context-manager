@@ -14,3 +14,8 @@
 - `getRenderStats()` before the first compile no longer counts a message in
   both the head and the tail when the recent window starts inside the head
   window: the tail starts where the head ends, as a compile's does.
+- A `KnowledgeStrategy` chunk no longer runs into or across an L1 summary's
+  span once a removal moves where its walk closes, which left the chunk after
+  it uncompressed for good and its messages sent raw beside the summary: a
+  chunk now closes where the L1 summary covering its messages changes, except
+  between a call and the result right after it.

@@ -25,8 +25,15 @@
   `addSystem` isn't an array of strings, or whose `defineTools` isn't an array
   of tool definitions, each with a non-empty string `name`, a string
   `description` and an object `inputSchema` whose `type` is `'object'`; a read
-  leaves such a change out. Ingress sharding never splits a message of them,
-  since it holds no text block.
+  leaves such a change out. A write also refuses a change while one of the
+  nearest calls before it has no result between it and the change (counting
+  back over other changes and over results, by id, to the nearest message
+  holding a call, every shard of it),
+  a tool result answering a call that a change already follows, and an edit
+  giving a message a `tool_use` that a change follows before its results:
+  membrane sends a change there after the result anyway, so write it after
+  the result. Ingress sharding never splits a message of them, since it holds
+  no text block.
   Only membrane's `NativeFormatter`, on an adapter that sends system changes,
   sends one; elsewhere membrane refuses the request. Rolling back to a
   release without them isn't supported once a store holds one.
@@ -38,4 +45,5 @@
   with each new user message, so after one it's that injection's old index.
   It compares bytes, so it holds across a branch switch or a new strategy,
   and it's `null` only for the manager's first committing compile. A dry
-  compile leaves it out and doesn't move it.
+  compile leaves it out and doesn't move it. It's compared when read,
+  so a compile whose caller never reads it serializes only its injections.

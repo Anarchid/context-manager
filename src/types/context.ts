@@ -194,7 +194,14 @@ export interface CompileResult {
    * doesn't move the comparison; a committing compile that returns moves it
    * whether or not its request is sent, and one that throws doesn't. A
    * caller can tell from it whether a compile rewrote what the last
-   * committing compile gave, such as a system change it wrote.
+   * committing compile gave, such as a system change it wrote. It's compared
+   * when read, so a compile whose caller never reads it serializes only its
+   * injections, whose bytes a committing compile takes since a caller may
+   * change its own array: read it only where it's used.
+   * Read after later compiles, it still compares this compile with the one
+   * before it. Until it's read, the result keeps this compile's compiled
+   * messages and the last committing compile's, by reference; once read, it
+   * holds the number.
    */
   firstChanged?: number | null;
 }

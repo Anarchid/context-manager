@@ -1,0 +1,3 @@
+- **Host operators:** take `@animalabs/membrane` 0.7.0 or later in your own range with this release. context-manager now requires `^0.7.0`, where it required `^0.6.0`, since what it stores and compiles is typed with 0.7.0's `ContentBlock`, which adds `system_change`, and npm installs context-manager's own 0.7.0 nested beside a host's older membrane without complaint. A host whose own membrane is older doesn't send a stored system change: 0.6.0's `NativeFormatter` leaves out a block type it doesn't convert.
+  - **Migration:** raise the host's own `@animalabs/membrane` range to `^0.7.0`.
+  - **Unchanged:** what context-manager stores, and how it calls membrane, for a host that writes no system change.
