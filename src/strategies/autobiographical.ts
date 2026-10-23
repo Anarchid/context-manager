@@ -19105,22 +19105,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * See `ContextStrategy.renderAsNewest`. The steps a compile takes for the
-   * messages it sends last and as they stand, over the view's suffix from the
-   * batch's oldest message to its newest: each stored copy cut as
-   * `cappedForSend` cuts it, a body's shards joined by
-   * `mergeAdjacentBodyGroupRaw` under adaptive resolution (the hierarchical
-   * select sends each shard as its own message), then `applyImageStripping`,
-   * so a message stored after the batch counts toward the images as in a
-   * compile. The tool pass that comes between them (postProcessToolEntries)
-   * is left out: it pairs and prunes by the window around these messages.
+   * See `ContextStrategy.renderAsNewest`. The steps a compile takes for a
+   * message it sends raw, over the view's suffix from the batch's oldest
+   * message to its newest: each stored copy cut as `cappedForSend` cuts it, a
+   * body's shards joined by `mergeAdjacentBodyGroupRaw` under adaptive
+   * resolution (the hierarchical select sends each shard as its own message),
+   * then `applyImageStripping`, so a message stored after the batch counts
+   * toward the images as in a compile. The tool pass that comes between them
+   * (postProcessToolEntries) is left out: it pairs and prunes by the window
+   * around these messages.
    *
-   * Those messages are the recent window's, and the head window's too when
-   * no message comes between the two: a compile places the middle's
-   * messages, and the history before a head window that was reset, after
-   * the head. The hierarchical select can also place summaries there, which
-   * are text and change no image decision. A message before them comes back
-   * as null.
+   * Both selects send raw every message the view holds that no summary
+   * covers, whichever region holds it: the head window, the middle (the
+   * history before a head window that was reset included) or the recent
+   * window, each through `cappedForSend`. The image pass decides by stored
+   * position, newest first, not by where a region puts an entry. So these
+   * steps give a message's form wherever the compile places it, and no id
+   * the view holds comes back as null. Two places differ. A message a summary
+   * covers comes back raw, while the compile sends its summary where its plan
+   * folds it. And the adaptive middle sends a raw run of a body's shards as
+   * their text alone, uncut, so a body it sends from there, or across it and
+   * the recent window, goes out otherwise than the windows' join given here.
    *
    * It takes a compile's steps before its windows as a dry select takes
    * them: it rebuilds the chunks, then, under adaptive resolution, loads the
@@ -19137,23 +19142,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (this.config.adaptiveResolution) this.loadCalibration(store, { dryRun: true });
       const messages = store.getAll();
       const posById = this.positionIndex(messages);
-      const headStart = this.getHeadWindowStartIndex(store);
-      const headEnd = this.getHeadWindowEnd(store);
-      const tailStart = Math.max(this.getRecentWindowStart(store), headEnd);
-      const start = headStart === 0 && headEnd === tailStart ? 0 : tailStart;
       const msgCap = this.config.maxMessageTokens;
       // As selectPath chooses: only the adaptive select joins a body's
       // shards, so only there does an id stand for its whole body.
       const joins = this.config.adaptiveResolution;
       // Each id's whole body, read back by its first shard's id, which the
-      // merge keeps; one that starts before the suffix has none.
+      // merge keeps. An id the view leaves out has none.
       const firstOf = new Map<MessageId, MessageId>();
       let from = messages.length;
       for (const id of ids) {
         const at = posById.get(id);
         if (at === undefined) continue;
         const body = joins ? bodyBoundsIn(messages, at) : { from: at, to: at };
-        if (body.from < start) continue;
         firstOf.set(id, messages[body.from]!.id);
         from = Math.min(from, body.from);
       }

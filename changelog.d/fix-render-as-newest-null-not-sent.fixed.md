@@ -1,0 +1,25 @@
+- `renderAsNewest` gives `null` only for a message the next compile doesn't
+  send: one the view leaves out, or one before windowed passthrough's
+  anchor. Under the memory strategy it gave `null` for any message before
+  the recent window or in a head window followed by other messages, though
+  the compile sends those raw. So a batch bigger than the recent window
+  came back partly `null` while the next compile sent all of it, in order,
+  as its last messages (context-manager#275's review, R1-1). Each such
+  message now comes back in the form the compile sends it, cut by the
+  per-message cap and with the image limits counted over the batch as a
+  compile counts them. Two places still differ, and the doc names both: a
+  message a summary covers comes back raw where the compile's plan sends the
+  summary, and a sharded body the compile sends from the adaptive middle
+  comes back whole, as the windows join it, where the middle sends its
+  shards' text alone, uncut. After a head-window reset the head is sent
+  before the history from before the reset, so its messages render in the
+  head's form but aren't sent last. A render no longer releases a
+  compression hold that has timed out, since where a window starts no
+  longer changes what it gives; the next add, compile, tick or hold query
+  releases it, as each did before.
+- The doc says what else a render can't foresee. A batch's images can strip
+  older images a request already carries. Tool blocks come back as the cap
+  leaves them, while a compile leaves out a newest message that holds a
+  `tool_use` with no result after it, drops a `tool_result` whose call isn't
+  sent before it, and splits a message other than a user's that holds a
+  `tool_result` into several turns.
