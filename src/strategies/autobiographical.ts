@@ -19127,18 +19127,20 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * their text alone, uncut, so a body it sends from there, or across it and
    * the recent window, goes out otherwise than the windows' join given here.
    *
-   * It takes a compile's steps before its windows as a dry select takes
-   * them: it rebuilds the chunks, then, under adaptive resolution, loads the
-   * calibration, and it puts back what a dry select puts back, so it prices
-   * as the next compile will and leaves what that compile reads as it found
-   * it.
+   * Under adaptive resolution it loads the calibration as a dry select
+   * does, so the store's estimates, by which the image depth is measured,
+   * are the ones the next compile measures with. It doesn't rebuild the
+   * chunks, as a compile does before placing its windows, since nothing
+   * that decides what it gives reads them. (The image pass computes the
+   * window bounds they move, but decides nothing by them.) It puts back
+   * what a dry select puts back, so it leaves what the next compile reads
+   * as it found it.
    */
   renderAsNewest(store: MessageStoreView, ids: readonly MessageId[]): Array<ContentBlock[] | null> {
     this.requireLoadedBranch('renderAsNewest');
     const restore = this.saveDryRunState(store);
     this._dryRunSelect = true;
     try {
-      this.rebuildChunks(store);
       if (this.config.adaptiveResolution) this.loadCalibration(store, { dryRun: true });
       const messages = store.getAll();
       const posById = this.positionIndex(messages);
