@@ -19113,7 +19113,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * then `applyImageStripping`, so a message stored after the batch counts
    * toward the images as in a compile. The tool pass that comes between them
    * (postProcessToolEntries) is left out: it pairs and prunes by the window
-   * around these messages.
+   * around these messages. So the hierarchical select leaves out a newest
+   * message that holds a `tool_use` with no result after it, and the
+   * adaptive select refuses that compile, where the render gives the message
+   * as the cap leaves it; and both drop a `tool_result` whose call isn't
+   * sent before it.
    *
    * Both selects send raw every message the view holds that no summary
    * covers, whichever region holds it: the head window, the middle (the
