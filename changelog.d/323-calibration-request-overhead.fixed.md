@@ -30,9 +30,9 @@
   samples step by the EMA. (Out of the band, the three-sample run above
   applies.) The first of the two is held in memory, so a restart between
   them costs one more sample. An undeclared sample that moves the multiplier
-  writes the record without the flag. A store whose multiplier puts every
-  compile over budget gets no sample to move it, as before: to unwedge it,
-  seed the record as provisional on the stopped store, and the refused
-  compile drops it to 1: `setStateJson('<ns>/autobio:calibration',
+  writes the record without the flag. A store whose multiplier, above 1,
+  puts every compile over budget gets no sample to move it, as before: to
+  unwedge it, seed the record as provisional on the stopped store, and the
+  refused compile drops it to 1: `setStateJson('<ns>/autobio:calibration',
   { multiplier, at, pricing: <current epoch>, provisional: true })`.
   `RequestOverhead` is exported from the package.

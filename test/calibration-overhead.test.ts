@@ -508,6 +508,18 @@ describe('estimator calibration: a store that learned the overhead as a rate', (
     cm.close();
   });
 
+  it('an undeclared sample between the two leaves the held sample, and the pair still replaces', async () => {
+    const { cm, strategy, internals } = await seeded('held-undeclared', { multiplier: 1.8, at: 1, pricing: epoch });
+    await sampleAt(cm, strategy, internals, 1, true);
+    assert.equal(internals._calibration, 1.8, 'the first is held');
+    await sampleAt(cm, strategy, internals, 1, false);
+    assert.ok(Math.abs(internals._calibration - 1.64) <= 0.01, `the undeclared sample steps, got ${internals._calibration}`);
+    await sampleAt(cm, strategy, internals, 1, true);
+    assert.ok(Math.abs(internals._calibration - 1) <= 0.01, `paired with the held sample and replaced, got ${internals._calibration}`);
+    assert.equal(declaredOf(internals), true);
+    cm.close();
+  });
+
   it('a consistent run between the two ends the held sample', async () => {
     const { cm, strategy, internals } = await seeded('held-run', { multiplier: 1, at: 1, pricing: epoch });
     await sampleAt(cm, strategy, internals, 1, true);
@@ -592,9 +604,10 @@ describe('estimator calibration: a store that learned the overhead as a rate', (
 
   it('a provisional multiplier is replaced by one declared sample, and marked declared', async () => {
     const { cm, strategy, internals } = await seeded('provisional-declared', { multiplier: 1, at: 1, pricing: epoch, provisional: true });
-    await sampleAt(cm, strategy, internals, 1, true);
-    const saved = internals.store!.getStateJson(internals.calibrationStateId) as { provisional?: boolean; declaredOverhead?: boolean };
-    assert.deepEqual([saved.provisional, saved.declaredOverhead], [undefined, true]);
+    await sampleAt(cm, strategy, internals, 1.4, true);
+    assert.ok(Math.abs(internals._calibration - 1.4) <= 0.01, `replaced, not stepped, got ${internals._calibration}`);
+    assert.equal(internals._calibrationProvisional, null);
+    assert.equal(declaredOf(internals), true);
     cm.close();
   });
 
@@ -610,13 +623,27 @@ describe('estimator calibration: a store that learned the overhead as a rate', (
   it('an undeclared sample inside the dead band leaves a record marked, and a rejected declared one leaves it unmarked', async () => {
     const marked = await seeded('deadband-undeclared', { multiplier: 1, at: 1, pricing: epoch, declaredOverhead: true });
     await sampleAt(marked.cm, marked.strategy, marked.internals, 1.01, false);
-    assert.deepEqual([marked.internals._calibration, marked.internals._calibrationDeclared, declaredOf(marked.internals)], [1, true, true]);
+    const ema = (marked.internals as unknown as { _calibrationEma: number | null })._calibrationEma;
+    assert.ok(ema !== null && Math.abs(ema - 1.002) < 0.001, `premise: the sample reached the EMA, got ${ema}`);
+    assert.deepStrictEqual([marked.internals._calibration, marked.internals._calibrationDeclared, declaredOf(marked.internals)], [1, true, true]);
     marked.cm.close();
     const unmarked = await seeded('rejected-declared', { multiplier: 1, at: 1, pricing: epoch });
     await unmarked.cm.compile(BUDGET);
     unmarked.strategy.reportRealInputTokens(unmarked.internals._lastCompileEstimate * 2.1, {});
-    assert.deepEqual([unmarked.internals._calibration, unmarked.internals._calibrationDeclared, declaredOf(unmarked.internals)], [1, false, undefined]);
+    assert.equal((unmarked.internals as unknown as { _outOfBandRun: { count: number } | null })._outOfBandRun?.count, 1, 'premise: the sample was rejected as the start of a run');
+    assert.deepStrictEqual([unmarked.internals._calibration, unmarked.internals._calibrationDeclared, declaredOf(unmarked.internals)], [1, false, undefined]);
     unmarked.cm.close();
+  });
+
+  it('any overhead a JS caller passes but null or undefined counts as declared, in the run as in the mark', async () => {
+    const { cm, strategy, internals } = await seeded('falsy-overhead', { multiplier: 1, at: 1, pricing: epoch });
+    for (let i = 0; i < 3; i++) {
+      await cm.compile(BUDGET);
+      strategy.reportRealInputTokens(internals._lastCompileEstimate * 2.1, 0 as unknown as RequestOverhead);
+    }
+    assert.equal(internals._calibration, 1.8, 'learned as a declared run');
+    assert.equal(declaredOf(internals), true);
+    cm.close();
   });
 
   it('a null overhead from a JS caller counts as undeclared', async () => {

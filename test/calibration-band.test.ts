@@ -216,6 +216,21 @@ describe('estimator calibration band', () => {
     assert.deepEqual(warned.filter((l) => l.includes('[estimator-calibration]')), []);
   });
 
+  it('a record from a newer pricing epoch with no multiplier this binary can read is left alone too', async () => {
+    const first = await openManager('newer-epoch-unreadable');
+    await first.cm.compile(BUDGET);
+    const future = { multipliers: { default: 1.4 }, at: 123, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH + 1 };
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, future);
+    first.cm.close();
+    const { cm, strategy, internals } = await openManager('newer-epoch-unreadable');
+    await cm.compile(BUDGET);
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1, null]);
+    // A first sample that only confirms the 1 writes nothing over it.
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.01);
+    assert.deepStrictEqual(internals.store!.getStateJson(internals.calibrationStateId), future);
+    cm.close();
+  });
+
   it('a multiplier learned under the current pricing epoch survives reopen', async () => {
     const first = await openManager('current-epoch');
     await first.cm.compile(BUDGET);
@@ -729,6 +744,28 @@ describe('estimator calibration band', () => {
       { multiplier?: number; pricing?: number; reset?: unknown };
     assert.deepEqual([untouched.multiplier, untouched.pricing, untouched.reset], [0.94, undefined, undefined], 'the record is untouched');
     belowReopened.cm.close();
+  });
+
+  it('dropping a provisional multiplier to 1 drops its declared mark in memory as on disk', async () => {
+    // An operator following the unwedge advice may seed provisional over a
+    // record a declared caller had marked.
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const tight = await tightBudget('drop-declared-probe', 1.2); // fits at 1.0, not at 1.45
+    const first = await openManager('drop-declared');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId,
+      { multiplier: 1.45, at: 1, pricing: epoch, provisional: true, declaredOverhead: true });
+    first.cm.close();
+    const { cm, strategy, internals } = await openManager('drop-declared');
+    const declared = () => (internals as unknown as { _calibrationDeclared: boolean })._calibrationDeclared;
+    await calibrationWarnings(() => cm.compile(tight));
+    assert.equal(internals._calibration, 1, 'premise: the refused compile dropped it');
+    assert.equal(declared(), false);
+    // An undeclared sample confirming the 1 writes no mark either.
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.01);
+    const saved = internals.store!.getStateJson(internals.calibrationStateId) as { multiplier?: number; declaredOverhead?: boolean };
+    assert.deepStrictEqual([saved.multiplier, saved.declaredOverhead], [1, undefined]);
+    cm.close();
   });
 
   it('a discard\'s provisional 1 survives a restart until a sample confirms it', async () => {
@@ -1260,9 +1297,15 @@ describe('estimator calibration band', () => {
   });
 
   it('a drift inside 2% is not applied; once the EMA passes 2% it is', async () => {
+    // A learned 1: a store with no record would be set by its first sample (#328).
+    const first = await openManager('deadband');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId,
+      { multiplier: 1, at: 1, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
+    first.cm.close();
     const { cm, strategy, internals } = await openManager('deadband');
     await cm.compile(BUDGET);
-    assert.equal(internals._calibration, 1);
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1, null], 'learned');
     // real/est = 1.01 every compile: the EMA creeps toward 1.01 and never
     // leaves the band, so nothing is repriced between compiles.
     for (let i = 0; i < 12; i++) {
