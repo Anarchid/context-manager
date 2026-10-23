@@ -14261,7 +14261,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** Set while the multiplier is provisional (see CALIBRATION_PRICING_EPOCH):
    *  the first sample the band accepts replaces it outright, and one above 1
    *  that puts a compile over budget is dropped to 1. `fromEpoch` is the
-   *  record's it came from, null for one without a stamp. */
+   *  record's it came from, null for one without a stamp or for no record. */
   private _calibrationProvisional: { fromEpoch: number | null } | null = null;
 
   protected applyCalibration(): void {
@@ -14320,7 +14320,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * is persisted as such (`provisional: true`), so a restart before that
    * sample doesn't turn the guess into a learned value, and a later epoch's
    * load re-stamps it, still provisional, rather than discarding it again
-   * over the reset it carries. A dry run under a
+   * over the reset it carries. A store with no record starts from a
+   * provisional 1 too, and writes nothing until its first sample, since no
+   * record already loads that way (#328). A dry run under a
    * provisional multiplier above 1 takes the same fallback at the picker's
    * refusal, which it otherwise only reports.
    *
@@ -14574,6 +14576,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // re-stamping it as the discard warning advises would destroy it.
           // This binary's learner still writes its own record over it on its
           // first applied sample (see CALIBRATION_PRICING_EPOCH).
+        } else {
+          // No record, or none with a multiplier to use: no sample has ever
+          // set this store's 1, so it's a guess, as a discard's restart is,
+          // and the first sample the band accepts sets it (#328). Learned, it
+          // would take the slowest path for the store with the least
+          // evidence, nine applied EMA steps to reach a true 1.4, each a
+          // reprice of every message and summary. Nothing is written: with no
+          // record, the next load decides the same, and the first sample's
+          // write gives the stamp. A record from a newer epoch (above) and a
+          // read that throws (below) aren't this case: each may hold a
+          // multiplier worth keeping, which a provisional 1's first sample
+          // would write over even when it only confirms the 1.
+          this._calibrationProvisional = { fromEpoch: null };
         }
       } catch { /* absent slot is fine */ }
     }

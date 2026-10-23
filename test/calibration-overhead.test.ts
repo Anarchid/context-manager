@@ -84,8 +84,8 @@ describe('estimator calibration and request overhead (#323)', () => {
     const overhead = overheadPrice(cm, SYSTEM, tools);
     assert.ok(overhead > window * 0.4 && overhead < window * 0.7, `overhead ${overhead} vs window ${window}`);
     // Undeclared, this sample reads real/est ≈ 1.5: in band, so it would be
-    // learned as a per-token rate 50% above the truth. Two samples, since a
-    // store's first declared sample is held until a second agrees.
+    // learned as a per-token rate 50% above the truth. The first sample sets
+    // a store with no record; the second steps it.
     strategy.reportRealInputTokens(window + overhead, { system: SYSTEM, tools });
     await cm.compile(BUDGET);
     strategy.reportRealInputTokens(internals._lastCompileEstimate + overhead, { system: SYSTEM, tools });
@@ -257,7 +257,7 @@ describe('estimator calibration: what the compile adds among the messages', () =
     // Premise: priced as the window and the declared head alone, these samples read about 1.33.
     assert.ok(priceOf(cm, inj.content) > window * 0.4, `injection ${priceOf(cm, inj.content)} vs window ${window}`);
     assert.equal(internals._calibration, 1);
-    assert.equal(declaredOf(internals), true, 'both samples were taken, and agreed');
+    assert.equal(declaredOf(internals), true, 'the samples were taken');
     cm.close();
   });
 
@@ -288,7 +288,7 @@ describe('estimator calibration: what the compile adds among the messages', () =
       strategy.reportRealInputTokens(window + overheadPrice(cm, SYSTEM, tools) + priceOf(cm, injection.content), { system: SYSTEM, tools });
     }
     assert.equal(internals._calibration, 1);
-    assert.equal(declaredOf(internals), true, 'both samples were taken, and agreed');
+    assert.equal(declaredOf(internals), true, 'the samples were taken');
     cm.close();
   });
 
@@ -303,7 +303,7 @@ describe('estimator calibration: what the compile adds among the messages', () =
     await cm.compile(BUDGET);
     strategy.reportRealInputTokens(internals._lastCompileEstimate + overheadPrice(cm, SYSTEM, tools), { system: SYSTEM, tools });
     assert.equal(internals._calibration, 1);
-    assert.equal(declaredOf(internals), true, 'both samples were taken, and agreed');
+    assert.equal(declaredOf(internals), true, 'the samples were taken');
     cm.close();
   });
 
@@ -320,7 +320,7 @@ describe('estimator calibration: what the compile adds among the messages', () =
       strategy.reportRealInputTokens(internals._lastCompileEstimate + overheadPrice(cm, system, tools), { system, tools });
     }
     assert.equal(internals._calibration, 1);
-    assert.equal(declaredOf(internals), true, 'both samples were taken, and agreed');
+    assert.equal(declaredOf(internals), true, 'the samples were taken');
     cm.close();
   });
 
@@ -335,7 +335,7 @@ describe('estimator calibration: what the compile adds among the messages', () =
       strategy.reportRealInputTokens(internals._lastCompileEstimate + overheadPrice(cm, SYSTEM, tools), { system: SYSTEM, tools });
     }
     assert.equal(internals._calibration, 1);
-    assert.equal(declaredOf(internals), true, 'both samples were taken, and agreed');
+    assert.equal(declaredOf(internals), true, 'the samples were taken');
     cm.close();
   });
 
@@ -351,7 +351,7 @@ describe('estimator calibration: what the compile adds among the messages', () =
       strategy.reportRealInputTokens(internals._lastCompileEstimate + overheadPrice(cm, SYSTEM, tools) + injected, { system: SYSTEM, tools });
     }
     assert.equal(internals._calibration, 1);
-    assert.equal(declaredOf(internals), true, 'both samples were taken, and agreed');
+    assert.equal(declaredOf(internals), true, 'the samples were taken');
     cm.close();
   });
 
@@ -393,7 +393,7 @@ describe('estimator calibration: what the compile adds among the messages', () =
       strategy.reportRealInputTokens(internals._lastCompileEstimate + overheadPrice(cm, system, []), { system });
     }
     assert.equal(internals._calibration, 1);
-    assert.equal(declaredOf(internals), true, 'both samples were taken, and agreed');
+    assert.equal(declaredOf(internals), true, 'the samples were taken');
     cm.close();
   });
 });
@@ -405,6 +405,17 @@ describe('estimator calibration: consistent out-of-band runs', () => {
     const nothingBesides: RequestOverhead = {}; // the package's type, from its root
     strategy.reportRealInputTokens(internals._lastCompileEstimate * ratio, declared ? nothingBesides : undefined);
   }
+
+  it('a consistent run on a learned record without the flag is learned at the clamp, not held', async () => {
+    // The upgrade case: a learned multiplier no declared sample has confirmed.
+    // A store with no record is provisional, which skips the hold anyway.
+    const { cm, strategy, internals } = await seeded('run-on-learned', { multiplier: 1, at: 1, pricing: epoch });
+    assert.equal(internals._calibrationProvisional, null, 'learned');
+    for (let i = 0; i < 3; i++) await oob(cm, strategy, internals, 2.1);
+    assert.equal(internals._calibration, 1.8);
+    assert.equal(declaredOf(internals), true);
+    cm.close();
+  });
 
   it('an undeclared out-of-band sample ends a declared run', async () => {
     const { cm, strategy, internals } = await openManager('undeclared-ends-run');
@@ -565,6 +576,17 @@ describe('estimator calibration: a store that learned the overhead as a rate', (
     assert.equal(declaredOf(internals), true);
     await sampleAt(cm, strategy, internals, 1.5, true);
     assert.ok(Math.abs(internals._calibration - 1.1) <= 0.01, `stepped, got ${internals._calibration}`);
+    cm.close();
+  });
+
+  it('a store with no record is set by its first declared sample, with nothing held, and marked declared', async () => {
+    const { cm, strategy, internals } = await openManager('fresh-declared');
+    await cm.compile(BUDGET);
+    assert.deepEqual(internals._calibrationProvisional, { fromEpoch: null });
+    await sampleAt(cm, strategy, internals as DeclaredInternals, 1.4, true);
+    assert.ok(Math.abs(internals._calibration - 1.4) <= 0.01, `set by one sample, got ${internals._calibration}`);
+    assert.equal((internals as unknown as { _declaredCandidate: number | null })._declaredCandidate, null, 'nothing held');
+    assert.equal(declaredOf(internals), true);
     cm.close();
   });
 
