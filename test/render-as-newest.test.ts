@@ -597,6 +597,38 @@ describe('renderAsNewest', () => {
     });
   });
 
+  it('autobiographical: a message a summary covers comes back raw, and its images count toward older messages, where the compile sends its summary', async () => {
+    // The head's 2,500 tokens hold the first message alone, since the image
+    // message after it carries about 3,000 tokens of text; the recent
+    // window's 300 holds the last three; compression folds the middle's
+    // oldest chunks, the image message first.
+    const membrane = {
+      complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: '[mock summary] ' + 'x '.repeat(20) }], usage: { input_tokens: 100, output_tokens: 25 } }),
+    } as never;
+    const strategy = memory({ headWindowTokens: 2500, recentWindowTokens: 300, maxLiveImages: 1, compressionModel: 'mock', targetChunkTokens: 100 });
+    const dir = mkdtempSync(join(tmpdir(), 'cm-render-as-newest-'));
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy, membrane });
+    try {
+      const head = manager.addMessage('user', imageMessage('HEADIMG', 1));
+      const covered = manager.addMessage('user', [...imageMessage('MIDIMG', 1), ...longText('MIDTEXT', 2000)]);
+      for (let i = 0; i < 6; i++) manager.addMessage('user', longText(`MID${i}`, 60));
+      for (let i = 0; i < 3; i++) manager.addMessage('user', longText(`TAIL${i}`, 60));
+      await manager.compile(BUDGET);
+      for (let k = 0; k < 200 && !manager.isReady(); k++) await manager.tick();
+      const compiled = await manager.compile(BUDGET);
+      const texts = compiled.messages.map((m) => textOf(m.content));
+      assert.ok(!texts.some((t) => t.includes('MIDIMG')) && texts.some((t) => t.includes('[mock summary]')), `the premise: the compile sends a summary for the image message: ${JSON.stringify(texts.map((t) => t.slice(0, 16)))}`);
+      assert.equal(textOf(compiled.messages[0]!.content), 'HEADIMG', 'the premise: the head window sends the first message raw');
+      const [forHead, forCovered] = manager.renderAsNewest([head, covered])!;
+      assert.equal(textOf(forCovered).slice(0, 6), 'MIDIMG', 'the covered message comes back raw');
+      assert.equal(imagesIn(forHead), 0, "rendered, the covered message's image takes the one slot");
+      assert.equal(imagesIn(sentHolding(compiled, 'HEADIMG')[0]), 1, 'the compile, sending its summary, keeps the head image');
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('a render releases no compression hold that has timed out, and the next compile does', async () => {
     class Counting extends AutobiographicalStrategy {
       released = 0;
