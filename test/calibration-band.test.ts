@@ -95,11 +95,16 @@ async function openManager(name: string, opts: { signedThinking?: boolean; stamp
 
 describe('estimator calibration band', () => {
   it('a multiplier pinned at the ceiling comes back down once the raw estimate is honest', async () => {
+    // A learned 1.8: a store with no record would be provisional, and set
+    // outright by the first sample (#328).
+    const first = await openManager('pinned');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId,
+      { multiplier: 1.8, at: 1, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
+    first.cm.close();
     const { cm, strategy, internals } = await openManager('pinned');
-    await cm.compile(BUDGET);
-    internals._calibration = 1.8;
-    internals.applyCalibration();
     await cm.compile(BUDGET); // arms one sample; estimate is in calibrated units (raw × 1.8)
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1.8, null], 'learned');
     const est = internals._lastCompileEstimate;
     assert.ok(est > 0);
     // The provider bills exactly the raw estimate: real/est = 1/1.8 ≈ 0.56.
@@ -120,8 +125,15 @@ describe('estimator calibration band', () => {
   });
 
   it('an in-band ratio is learned from as before', async () => {
+    // A learned 1: a store with no record would be set outright (#328).
+    const first = await openManager('inband');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId,
+      { multiplier: 1, at: 1, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
+    first.cm.close();
     const { cm, strategy, internals } = await openManager('inband');
     await cm.compile(BUDGET);
+    assert.equal(internals._calibrationProvisional, null, 'learned');
     const est = internals._lastCompileEstimate;
     strategy.reportRealInputTokens(est * 1.5);
     assert.ok(internals._calibration > 1.0 && internals._calibration < 1.5, `got ${internals._calibration}`);
@@ -202,6 +214,23 @@ describe('estimator calibration band', () => {
       console.warn = warn;
     }
     assert.deepEqual(warned.filter((l) => l.includes('[estimator-calibration]')), []);
+  });
+
+  it('a record from a newer pricing epoch with no multiplier this binary can read is left alone too', async () => {
+    const first = await openManager('newer-epoch-unreadable');
+    await first.cm.compile(BUDGET);
+    const future = { multipliers: { default: 1.4 }, at: 123, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH + 1 };
+    first.internals.store!.setStateJson(first.internals.calibrationStateId, future);
+    first.cm.close();
+    const { cm, strategy, internals } = await openManager('newer-epoch-unreadable');
+    await cm.compile(BUDGET);
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1, null]);
+    // A first sample that only confirms the 1 writes nothing over it.
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.01);
+    const ema = (internals as unknown as { _calibrationEma: number | null })._calibrationEma;
+    assert.ok(ema !== null && Math.abs(ema - 1.002) < 0.001, `premise: the sample reached the EMA, got ${ema}`);
+    assert.deepStrictEqual(internals.store!.getStateJson(internals.calibrationStateId), future);
+    cm.close();
   });
 
   it('a multiplier learned under the current pricing epoch survives reopen', async () => {
@@ -401,10 +430,93 @@ describe('estimator calibration band', () => {
     reopened.cm.close();
   });
 
-  it('a store with no calibration history reports its multiplier and no reset', async () => {
+  it('a store with no calibration history reports a provisional 1 and no reset', async () => {
     const { cm } = await openManager('no-history');
     await cm.compile(BUDGET);
-    assert.deepEqual(cm.getRenderStats()!.calibration, { multiplier: 1, pricingEpoch: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
+    assert.deepStrictEqual(cm.getRenderStats()!.calibration,
+      { multiplier: 1, pricingEpoch: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH, provisional: true });
+    cm.close();
+  });
+
+  it('a store with no calibration record loads a provisional 1: the first sample the band accepts sets it, and stamps the record', async () => {
+    // The store with the least evidence: learned, its 1 would step a fifth of
+    // the way per sample, nine applied changes to reach a true 1.4 (#328).
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const { cm, strategy, internals } = await openManager('fresh-provisional');
+    await cm.compile(BUDGET);
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1, { fromEpoch: null }]);
+    assert.equal(internals.store!.getStateJson(internals.calibrationStateId), null, 'the load writes nothing');
+    // A sample the band rejects is no evidence: the 1 stays provisional.
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 3);
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1, { fromEpoch: null }]);
+    await cm.compile(BUDGET);
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.4);
+    assert.ok(Math.abs(internals._calibration - 1.4) < 1e-9, `set by the sample, got ${internals._calibration}`);
+    assert.equal(internals._calibrationProvisional, null);
+    const saved = internals.store!.getStateJson(internals.calibrationStateId) as
+      { multiplier?: number; pricing?: number; provisional?: boolean; reset?: unknown };
+    assert.deepStrictEqual([saved.multiplier, saved.pricing, saved.provisional, saved.reset], [1.4, epoch, undefined, undefined]);
+    // From here the EMA steps as it always did.
+    await cm.compile(BUDGET);
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.2); // implies 1.68
+    assert.ok(internals._calibration > 1.4 && internals._calibration < 1.6, `stepped, not replaced: ${internals._calibration}`);
+    cm.close();
+  });
+
+  it("a store with no calibration record whose first sample falls inside the dead band confirms its 1, and stamps the record", async () => {
+    const { cm, strategy, internals } = await openManager('fresh-confirm');
+    await cm.compile(BUDGET);
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.01);
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1, null]);
+    const saved = internals.store!.getStateJson(internals.calibrationStateId) as { multiplier?: number; pricing?: number; provisional?: boolean };
+    assert.deepStrictEqual([saved.multiplier, saved.pricing, saved.provisional], [1, AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH, undefined]);
+    cm.close();
+  });
+
+  it('a store with no calibration record is still provisional after a restart before its first sample', async () => {
+    const first = await openManager('fresh-restart');
+    await first.cm.compile(BUDGET);
+    first.cm.close();
+    const { cm, strategy, internals } = await openManager('fresh-restart');
+    await cm.compile(BUDGET);
+    assert.deepStrictEqual(internals._calibrationProvisional, { fromEpoch: null });
+    assert.equal(internals.store!.getStateJson(internals.calibrationStateId), null);
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 0.8);
+    assert.ok(Math.abs(internals._calibration - 0.8) < 1e-9, `set by the sample, got ${internals._calibration}`);
+    cm.close();
+  });
+
+  it('a record with no multiplier to use loads as no record: a provisional 1', async () => {
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    for (const [i, record] of ([{ at: 1, pricing: epoch }, { multiplier: '1.4', at: 1, pricing: epoch }, { multiplier: null, at: 1, pricing: epoch }, 7] as unknown[]).entries()) {
+      const name = `fresh-unusable-${i}`;
+      const first = await openManager(name);
+      await first.cm.compile(BUDGET);
+      first.internals.store!.setStateJson(first.internals.calibrationStateId, record);
+      first.cm.close();
+      const { cm, internals } = await openManager(name);
+      await cm.compile(BUDGET);
+      assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1, { fromEpoch: null }], JSON.stringify(record));
+      cm.close();
+    }
+  });
+
+  it('a calibration read that throws loads a learned 1, as before: the record it could not read may hold one worth keeping', async () => {
+    const { cm, internals } = await openManager('fresh-unreadable');
+    const store = internals.store as unknown as { getStateJson(id: string): unknown };
+    const read = store.getStateJson;
+    let refused = 0;
+    store.getStateJson = (id: string) => {
+      if (id === internals.calibrationStateId) { refused++; throw new Error('unreadable'); }
+      return read.call(store, id);
+    };
+    try {
+      await cm.compile(BUDGET);
+    } finally {
+      store.getStateJson = read;
+    }
+    assert.ok(refused > 0, 'premise: the load read the record, and the read threw');
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1, null]);
     cm.close();
   });
 
@@ -634,6 +746,37 @@ describe('estimator calibration band', () => {
       { multiplier?: number; pricing?: number; reset?: unknown };
     assert.deepEqual([untouched.multiplier, untouched.pricing, untouched.reset], [0.94, undefined, undefined], 'the record is untouched');
     belowReopened.cm.close();
+  });
+
+  it('dropping a provisional multiplier to 1 drops its declared mark in memory as on disk', async () => {
+    // An operator following the unwedge advice may seed provisional over a
+    // record a declared caller had marked.
+    const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+    const tight = await tightBudget('drop-declared-probe', 1.2); // fits at 1.0, not at 1.45
+    const first = await openManager('drop-declared');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId,
+      { multiplier: 1.45, at: 1, pricing: epoch, provisional: true, declaredOverhead: true });
+    first.cm.close();
+    const { cm, strategy, internals } = await openManager('drop-declared');
+    const declared = () => (internals as unknown as { _calibrationDeclared: boolean })._calibrationDeclared;
+    await cm.compile(BUDGET); // loads the seed, which fits this budget
+    assert.deepStrictEqual([internals._calibration, declared()], [1.45, true], 'premise: loaded, marked');
+    // A dry compile drops it too, in the dry compile only: select() puts the mark back.
+    const dry = await calibrationWarnings(() => cm.compile(tight, undefined, { dryRun: true }));
+    assert.equal(dry.result.renderStats!.calibration!.multiplier, 1, 'premise: the dry compile dropped it');
+    assert.deepStrictEqual([internals._calibration, declared()], [1.45, true], 'put back after the dry compile that dropped it');
+    await calibrationWarnings(() => cm.compile(tight));
+    assert.equal(internals._calibration, 1);
+    assert.equal(cm.getRenderStats()!.calibration!.reset?.discardedMultiplier, 1.45, 'premise: the seeded 1.45 was loaded and dropped');
+    assert.equal(declared(), false);
+    const dropped = internals.store!.getStateJson(internals.calibrationStateId) as { multiplier?: number; provisional?: boolean; declaredOverhead?: boolean };
+    assert.deepStrictEqual([dropped.multiplier, dropped.provisional, dropped.declaredOverhead], [1, true, undefined], 'the record the drop writes');
+    // An undeclared sample confirming the 1 writes no mark either.
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.01);
+    const saved = internals.store!.getStateJson(internals.calibrationStateId) as { multiplier?: number; declaredOverhead?: boolean };
+    assert.deepStrictEqual([saved.multiplier, saved.declaredOverhead], [1, undefined]);
+    cm.close();
   });
 
   it('a discard\'s provisional 1 survives a restart until a sample confirms it', async () => {
@@ -1165,9 +1308,15 @@ describe('estimator calibration band', () => {
   });
 
   it('a drift inside 2% is not applied; once the EMA passes 2% it is', async () => {
+    // A learned 1: a store with no record would be set by its first sample (#328).
+    const first = await openManager('deadband');
+    await first.cm.compile(BUDGET);
+    first.internals.store!.setStateJson(first.internals.calibrationStateId,
+      { multiplier: 1, at: 1, pricing: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH });
+    first.cm.close();
     const { cm, strategy, internals } = await openManager('deadband');
     await cm.compile(BUDGET);
-    assert.equal(internals._calibration, 1);
+    assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1, null], 'learned');
     // real/est = 1.01 every compile: the EMA creeps toward 1.01 and never
     // leaves the band, so nothing is repriced between compiles.
     for (let i = 0; i < 12; i++) {

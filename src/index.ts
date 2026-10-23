@@ -81,6 +81,7 @@ export type {
   RenderedLayout,
   LayoutUnit,
   // Strategy types
+  RequestOverhead,
   MessageStoreView,
   ContextLogView,
   StrategyContext,

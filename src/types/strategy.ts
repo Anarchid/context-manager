@@ -370,6 +370,14 @@ export interface SelectOptions {
     multiplier: number;
     expiresAt: number;
   };
+  /** The content of each injection the compile inserts among the selected
+   * entries after the select (`beforeUser` and `afterUser`), which the
+   * request carries and the select's window doesn't. A strategy whose
+   * calibration compares the provider's input total with the compile prices
+   * it there (AutobiographicalStrategy.reportRealInputTokens).
+   * ContextManager.compile fills it from its injections; `system` ones go
+   * into the caller's system prompt instead. */
+  messageInjections?: ReadonlyArray<ContentBlock[]>;
 }
 
 /**
@@ -667,10 +675,13 @@ export function isSummaryOverviewStrategy(s: ContextStrategy): s is SummaryOverv
 }
 
 /**
- * What a request carried besides the compiled window, as the caller sent it
- * (see `AutobiographicalStrategy.reportRealInputTokens`). The provider counts
- * it in the input total and the compile estimate doesn't, so a calibration
- * sample that leaves it out learns it as a per-token rate.
+ * What a request carried besides the compiled window and the compile's
+ * message-position injections (which the compile prices itself), as the
+ * caller sent it (see `AutobiographicalStrategy.reportRealInputTokens`). The
+ * provider counts it in the input total and the compile estimate doesn't, so
+ * a calibration sample that leaves it out learns it as a per-token rate.
+ * Passing it says this is everything the request sent besides those; a
+ * caller that can't see the request's head passes nothing.
  */
 export interface RequestOverhead {
   /** The system prompt the request sent. */
@@ -735,7 +746,9 @@ export interface RenderStats {
    * provider sample the calibration's band accepts replaces outright, rather
    * than stepping toward it (see
    * `AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH`): one kept from a
-   * record without a stamp, or the 1 a discard restarts from. That 1 stays
+   * record without a stamp, the 1 a discard restarts from, or the 1 a store
+   * with no calibration record, or none with a multiplier to use, starts
+   * from. A discard's 1 stays
    * provisional through a later epoch's load, which re-stamps it whatever
    * that epoch repriced.
    * `reset` is present once a multiplier from an older or unknown epoch has
