@@ -612,10 +612,15 @@ describe('the line when an image ceiling first strips', () => {
   });
 
   it("the memory strategy's strip leaves the line only from a render select returns, not a layout rendered to compare against", async () => {
-    for (const options of [
-      { maxLiveImages: 0, imageCeiling: 1 },
-      { maxLiveImages: 0, maxLiveImageBytes: 0, imageByteCeiling: 4 },
-    ]) {
+    // Both ways the strip decides: counting what the entries send, and the
+    // verdicts of the post-strip estimates (asEstimated), as the adaptive
+    // selection and the kv-unified cache check ask for them.
+    for (const [options, asEstimated] of [
+      [{ maxLiveImages: 0, imageCeiling: 1 }, false],
+      [{ maxLiveImages: 0, maxLiveImageBytes: 0, imageByteCeiling: 4 }, false],
+      [{ maxLiveImages: 0, imageCeiling: 1 }, true],
+      [{ maxLiveImages: 0, maxLiveImageBytes: 0, imageByteCeiling: 4 }, true],
+    ] as const) {
     const strategy = memory(options);
     const said: string[] = [];
     const original = console.warn;
@@ -632,15 +637,15 @@ describe('the line when an image ceiling first strips', () => {
         index, sourceMessageId: m.id, sourceRelation: 'copy', participant: m.participant, content: m.content,
       }));
       const strip = strategy as unknown as {
-        applyImageStripping(entries: unknown[], store: unknown, opts?: { returned?: boolean }): void;
+        applyImageStripping(entries: unknown[], store: unknown, opts?: { returned?: boolean; asEstimated?: boolean }): void;
         reportCeilingHits(store: unknown): void;
       };
       const kept = entries();
-      strip.applyImageStripping(kept, view);
+      strip.applyImageStripping(kept, view, { asEstimated });
       assert.equal(kept.filter((e) => e.content.some((b) => b.type === 'image')).length, 1, 'the strip ran: the ceiling replaced one');
       strip.reportCeilingHits(view);
-      assert.deepEqual(ours(), [], `a layout rendered to compare against leaves nothing for ${JSON.stringify(options)}`);
-      strip.applyImageStripping(entries(), view, { returned: true });
+      assert.deepEqual(ours(), [], `a layout rendered to compare against leaves nothing for ${JSON.stringify(options)}, asEstimated ${asEstimated}`);
+      strip.applyImageStripping(entries(), view, { returned: true, asEstimated });
       assert.deepEqual(ours(), [], 'the strip itself says nothing: select reports once it returns the render');
       strip.reportCeilingHits(view);
       assert.equal(ours().length, 1, JSON.stringify(said));
@@ -679,6 +684,22 @@ describe('the line when an image ceiling first strips', () => {
       await manager.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("the memory strategy's adaptive selection says nothing when the depth limit strips the image the ceiling would, and says it when only the ceiling does", async () => {
+    // The adaptive selection's strip applies the post-strip estimates'
+    // verdicts, which carry the depth limit's own: two 8-byte images under a
+    // 12-byte ceiling, the older one also past a 2,500-token depth limit.
+    const adaptive = (options: Record<string, unknown>) => memory({
+      hierarchical: false, adaptiveResolution: true, compressionModel: 'mock', targetChunkTokens: 100,
+      autoTickOnNewMessage: false, maxLiveImages: 0, maxLiveImageBytes: 0, imageByteCeiling: 12, ...options,
+    });
+    const depth = await ceilingLines(adaptive({ imageStripDepthTokens: 2500 }), [{ add: 2, bytes: 8 }]);
+    assert.equal(depth.last, '.I', 'the depth limit strips the older image');
+    assert.deepEqual(depth.lines, [], JSON.stringify(depth.lines));
+    const ceilingOnly = await ceilingLines(adaptive({}), [{ add: 2, bytes: 8 }]);
+    assert.equal(ceilingOnly.last, '.I', 'without the depth limit, the ceiling strips the older image');
+    assert.equal(ceilingOnly.lines.length, 1, JSON.stringify(ceilingOnly.lines));
   });
 
   it("the memory strategy says nothing for the rule's set under a preview's own ceiling", async () => {
@@ -1095,6 +1116,37 @@ describe('the line when an image ceiling first strips', () => {
     assert.equal(last.slice(0, 6), '......', 'the count ceiling strips the oldest images');
     assert.equal(lines.length, 1, JSON.stringify(lines));
     assert.ok(lines[0]!.includes('imageCeiling 2 holds'), lines[0]);
+  });
+
+  it("the memory strategy's rule names only the ceiling whose limit alone strips, though the other took part", async () => {
+    // Both window limits are set by their ceilings: 2 images and 16 bytes.
+    // The third 4-byte image passes the count ceiling, and the trim, to 1
+    // image and 8 bytes, strips the two older ones. The byte limit takes part
+    // in that trim (12 bytes are over 8), but the set under the byte ceiling
+    // alone, with no count, strips nothing, so only the count ceiling decided.
+    const { lines, last } = await ceilingLines(
+      memory({ maxLiveImages: 0, maxLiveImageBytes: 0, imageCeiling: 2, imageByteCeiling: 16, imageStripHysteresisRatio: 0.5 }),
+      [3],
+    );
+    assert.equal(last, '..I');
+    assert.equal(lines.length, 1, JSON.stringify(lines));
+    assert.ok(lines[0]!.includes('imageCeiling 2 holds'), lines[0]);
+  });
+
+  it("the memory strategy's rule credits only its set, not the limits' account of the images it strips", async () => {
+    // A host byte limit of 40, in force, and a count ceiling of 4. Four 8-byte
+    // images, then a 12-byte one, which passes both (5 images, 44 bytes): the
+    // trim, to 2 images and 20 bytes, strips the three oldest, and the host's
+    // byte limit alone strips the same three. Two 4-byte images then make four
+    // live, 28 bytes. By the limits' own account, newest first, the third
+    // oldest is now past the count ceiling and within the host's bytes, but
+    // the set decides it, and the set without the ceiling strips it too.
+    const { lines, patterns } = await ceilingLines(
+      memory({ maxLiveImages: 0, imageCeiling: 4, maxLiveImageBytes: 40, imageStripHysteresisRatio: 0.5 }),
+      [{ add: 4, bytes: 8 }, { add: 1, bytes: 12 }, { add: 2, bytes: 4 }],
+    );
+    assert.deepEqual(patterns, ['IIII', '...II', '...IIII']);
+    assert.deepEqual(lines, [], JSON.stringify(lines));
   });
 
   it("the memory strategy replays the rule for the credit only for a ceiling whose limit took part and is still to be said", async () => {
