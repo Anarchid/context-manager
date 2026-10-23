@@ -1433,11 +1433,12 @@ export interface AutobiographicalConfig {
    * initialize names it. A fraction is floored, to at least 1. Under a
    * window limit of 0 or above this ceiling, the strategy says so once, at
    * the first render a select returns where images are shown as
-   * placeholders because an image passed this ceiling, rather than because
-   * of a limit the host set: the image past it, or those the hysteresis
-   * watermark strips with it that the host's own limits wouldn't strip. A
-   * watermark the strategy loads from the store carries no record of what
-   * moved it, so the instance that loads it says nothing for what it strips.
+   * placeholders because of this ceiling, rather than because of a limit
+   * the host set: an image past it that the host's own limits, the depth
+   * limit included, don't strip anyway, or, with
+   * `imageStripHysteresisRatio`, an image the rule's set strips that the
+   * set without the ceilings keeps and the set with this ceiling alone
+   * strips.
    */
   imageCeiling?: number;
 
@@ -1467,9 +1468,7 @@ export interface AutobiographicalConfig {
    * `imageCeilings()` reports it, as for `imageCeiling`. 0 = no ceiling. A
    * value that isn't 0 or a finite number above it takes the default, and a
    * fraction is floored, to at least 1. Under a window limit of 0 or above
-   * this ceiling, the strategy says so once, as for `imageCeiling`, with the
-   * same exceptions: not for an image the host's own limits would strip, and
-   * not for what a watermark loaded from the store strips.
+   * this ceiling, the strategy says so once, as for `imageCeiling`.
    */
   imageByteCeiling?: number;
 
