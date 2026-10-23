@@ -17440,8 +17440,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     // A render select returns (`returned`) leaves what its ceilings decided
     // for select to report once it has returned it; the last such strip is
-    // the render it returns. A layout rendered only to compare against, such
-    // as kv-unified's kept one, leaves nothing.
+    // the render it returns. Any other strip, such as renderAsNewest's,
+    // leaves nothing.
     if (opts.returned) this._ceilingNotes = notes;
   }
 
@@ -17512,8 +17512,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  the tool pruning in use (withToolPruning). 0 is no limit; with none, it
    *  strips nothing. `involved` says whether the count limit, and the byte
    *  limit, was ever over its full or trimmed value where the replay asked:
-   *  one that never was decided nothing, so the set with it lifted is this
-   *  same set (ruleCeilingHits). */
+   *  one that never was decided nothing, so lifting only such limits gives
+   *  this same set (ruleCeilingHits). */
   private stripReplayHeld(
     store: MessageStoreView,
     messages: readonly StoredMessage[],
@@ -17744,8 +17744,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _ceilingNotes: CeilingNotes = { images: false, bytes: false, ruleStripped: [] };
 
   /** Say once for each ceiling, when a select returns a render in which
-   *  images are shown as placeholders because an image passed that ceiling,
-   *  rather than because of a limit the host set. Under the limits, that's
+   *  images are shown as placeholders because of that ceiling, rather than
+   *  because of a limit the host set. Under the limits, that's
    *  an image past the ceiling that nothing else strips (see
    *  ceilingsDeciding). With imageStripHysteresisRatio, the rule's set
    *  decides in place of the limits, so an image it replaces is credited

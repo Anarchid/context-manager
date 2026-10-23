@@ -26,7 +26,8 @@ export const DEFAULT_IMAGE_CEILING = 500;
 
 /**
  * membrane's byte cap is 28 MiB of serialized messages unless
- * `MEMBRANE_MAX_REQUEST_BYTES` says otherwise (membrane 0.5.87 and 0.6.0).
+ * `MEMBRANE_MAX_REQUEST_BYTES` says otherwise (membrane 0.5.87, 0.6.0 and 0.7.1,
+ * the version this package's lockfile installs).
  * It checks a request when it builds it through `transformRequest`, which a
  * call's first request and each native tool-loop round go through; an
  * XML-mode continuation round doesn't, and of the provider adapters only the
@@ -165,8 +166,10 @@ export function ceilingSetLimits(configured: ConfiguredImageLimits): { images: b
  * the window keeps, so only that one says its line. With the memory
  * strategy's `imageStripHysteresisRatio`, whose set decides in place of the
  * limits, the strategy credits the set's images itself, not here: a ceiling
- * decides an image the set strips when the set without the ceilings keeps
- * it and the set with that ceiling alone strips it (ruleCeilingHits).
+ * decides an image the set strips when its limit took part in that set, the
+ * set without the ceilings keeps the image, and the set with that ceiling
+ * alone over the host's own limits strips it (the memory strategy's
+ * ruleCeilingHits).
  */
 export function ceilingsDeciding(
   over: { images: boolean; bytes: boolean },
