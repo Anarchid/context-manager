@@ -14031,8 +14031,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // A provisional multiplier is a guess (see CALIBRATION_PRICING_EPOCH). This
     // sample is the first evidence under this release's pricing, so it replaces
     // the guess outright; the EMA steps from here on. A consistent run replaces
-    // it outright too: an EMA step from 1.00 toward a ratio past the band
-    // would leave the next sample just as far out of band.
+    // it outright too: its samples agree on the multiplier, and stepping toward
+    // it would take several more applied changes, each a reprice of every
+    // message and summary.
     const provisional = this._calibrationProvisional;
     this._calibrationProvisional = null;
     const next = replacement ?? (provisional || fromRun ? observed : ema + alpha * (observed - ema));
