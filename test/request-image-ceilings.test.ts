@@ -491,6 +491,35 @@ describe('the line when an image ceiling first strips', () => {
       assert.ok(byStep[1]![0]!.includes('imageByteCeiling 16 bytes holds'), byStep[1]![0]);
     });
 
+    it(`${name}: says it when a message's first image passes the byte ceiling and its second fits`, async () => {
+      // One message: a 12-byte image, then a 4-byte one, under a byte
+      // ceiling of 8. The first is past it on its own and the second fits,
+      // so the message holds one image the ceiling decided and one it kept.
+      const said: string[] = [];
+      const original = console.warn;
+      console.warn = (...parts: unknown[]) => { said.push(parts.map(String).join(' ')); };
+      const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
+      const manager = await ContextManager.open({ path: join(dir, 'store'), strategy: make({ maxLiveImageBytes: 0, imageByteCeiling: 8 }) });
+      try {
+        manager.addMessage('user', [
+          { type: 'image', source: { type: 'base64', data: 'A'.repeat(12), mediaType: 'image/png' } },
+          { type: 'image', source: { type: 'base64', data: 'B'.repeat(4), mediaType: 'image/png' } },
+          { type: 'text', text: 'pair' },
+        ] as ContentBlock[]);
+        const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+        const pair = compiled.messages.find((m) => m.content.some((b) => b.type === 'text' && b.text === 'pair'))!;
+        assert.deepEqual(pair.content.filter((b) => b.type === 'image').map((b) => (b as { source: { data: string } }).source.data), ['B'.repeat(4)],
+          'the first image is replaced, the second kept');
+        const ours = said.filter((line) => line.includes(CEILING_LINE));
+        assert.equal(ours.length, 1, JSON.stringify(said));
+        assert.ok(ours[0]!.includes('imageByteCeiling 8 bytes holds'), ours[0]);
+      } finally {
+        console.warn = original;
+        await manager.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     it(`${name}: says it for a single image bigger than the byte ceiling`, async () => {
       const { byStep, patterns } = await ceilingLines(make({ maxLiveImageBytes: 0, imageByteCeiling: 8 }), [{ add: 1, bytes: 12 }]);
       assert.deepEqual(patterns, ['.'], 'the one image is past the ceiling on its own');
@@ -1193,6 +1222,105 @@ describe('the line when an image ceiling first strips', () => {
         await manager.close();
         rmSync(dir, { recursive: true, force: true });
       }
+    }
+  });
+
+  it("windowed passthrough says nothing for a ceiling's verdict on a message its window drops", async () => {
+    // Two image messages under a count ceiling of 1, about 2,000 tokens of
+    // text between them, past a 3,000-token budget: the window re-anchors to
+    // the newest message, whose image the ceiling keeps. The verdicts are
+    // decided from the old anchor, where the ceiling strips the older image,
+    // which the render no longer holds. With room for both, the same images
+    // say the line.
+    const said: string[] = [];
+    const original = console.warn;
+    console.warn = (...parts: unknown[]) => { said.push(parts.map(String).join(' ')); };
+    const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy: windowed({ maxLiveImages: 0, imageCeiling: 1 }) });
+    try {
+      manager.addMessage('user', imageMessage('img-1'));
+      manager.addMessage('user', [{ type: 'text', text: 'word '.repeat(1200) }]);
+      manager.addMessage('user', imageMessage('img-2'));
+      const compiled = await manager.compile({ maxTokens: 3000, reserveForResponse: 0 });
+      assert.equal(pattern(compiled.messages, 2), '-I', 'the window holds the newest message alone');
+      assert.equal(compiled.messages.length, 1, 'premise: the text went with the older image');
+      assert.deepEqual(said.filter((line) => line.includes(CEILING_LINE)), [], JSON.stringify(said));
+    } finally {
+      console.warn = original;
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const both = await ceilingLines(windowed({ maxLiveImages: 0, imageCeiling: 1 }), [2]);
+    assert.equal(both.last, '.I');
+    assert.equal(both.lines.length, 1, JSON.stringify(both.lines));
+  });
+
+  for (const hierarchical of [true, false]) {
+    it(`the memory strategy's rule credits a moved tool result's image to its own message (${hierarchical ? 'hierarchical' : 'adaptive'})`, async () => {
+      // Result a holds image A, ahead of image B in its message. Under a count
+      // ceiling of 1 the rule strips that message's first image, A, and keeps
+      // B. Pairing repair moves result a up beside result b, into another
+      // message's entry; A is still its own message's first image, which the
+      // set without the ceiling keeps.
+      const image = (data: string): ContentBlock => ({ type: 'image', source: { type: 'base64', data, mediaType: 'image/png' } }) as ContentBlock;
+      const said: string[] = [];
+      const original = console.warn;
+      console.warn = (...parts: unknown[]) => { said.push(parts.map(String).join(' ')); };
+      const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
+      const manager = await ContextManager.open({
+        path: join(dir, 'store'),
+        strategy: memory({ hierarchical, adaptiveResolution: !hierarchical, maxLiveImages: 0, imageCeiling: 1, imageStripHysteresisRatio: 0.5 }),
+      });
+      try {
+        manager.addMessage('Claude', [{ type: 'tool_use', id: 'a', name: 'shot', input: {} }, { type: 'tool_use', id: 'b', name: 'shot', input: {} }] as ContentBlock[]);
+        manager.addMessage('User', [{ type: 'tool_result', toolUseId: 'b', content: [{ type: 'text', text: 'result b' }] }] as unknown as ContentBlock[]);
+        manager.addMessage('User', [{ type: 'tool_result', toolUseId: 'a', content: [image('AAAA'), { type: 'text', text: 'result a' }] }, image('BBBB')] as unknown as ContentBlock[]);
+        manager.addMessage('Claude', [{ type: 'text', text: 'done' }]);
+        const compiled = await manager.compile({ maxTokens: 1_000_000, reserveForResponse: 0 });
+        const results = (content: ContentBlock[]) => content.filter((b) => b.type === 'tool_result').map((b) => (b as unknown as { toolUseId: string }).toolUseId).sort().join(',');
+        assert.ok(compiled.messages.some((x) => results(x.content) === 'a,b'), 'premise: result a moved beside result b');
+        const data = (content: ContentBlock[]): string[] => content.flatMap((b) =>
+          b.type === 'image' ? [(b as { source: { data: string } }).source.data]
+            : b.type === 'tool_result' && Array.isArray((b as { content?: unknown }).content) ? data((b as unknown as { content: ContentBlock[] }).content) : []);
+        assert.deepEqual(compiled.messages.flatMap((x) => data(x.content)), ['BBBB'], 'A stripped, B live');
+        const ours = said.filter((line) => line.includes(CEILING_LINE));
+        assert.equal(ours.length, 1, JSON.stringify(said));
+        assert.ok(ours[0]!.includes('imageCeiling 1 holds'), ours[0]);
+      } finally {
+        console.warn = original;
+        await manager.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("the memory strategy's credit replays nothing for a render that replaced none of the set's images", async () => {
+    // A count ceiling of 4 takes part in the set of five images, so a render
+    // that replaced some would be credited by replay; asked for a render that
+    // replaced none, the credit replays nothing and names nothing.
+    const original = console.warn;
+    console.warn = () => {};
+    const dir = mkdtempSync(join(tmpdir(), 'cm-request-ceilings-'));
+    const strategy = memory({ maxLiveImages: 0, imageCeiling: 4, imageStripHysteresisRatio: 0.5 });
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy });
+    const s = strategy as unknown as {
+      stripReplayHeld: (...args: unknown[]) => unknown;
+      ruleCeilingHits: (store: unknown, stripped: unknown[], wanted: { images: boolean; bytes: boolean }) => { images: boolean; bytes: boolean };
+      stripReplayAtLimits: (store: unknown) => { involved: { images: boolean; bytes: boolean } } | undefined;
+    };
+    try {
+      for (let i = 1; i <= 5; i++) manager.addMessage('user', imageMessage(`img-${i}`));
+      const view = (manager as unknown as { messageStore: { createView(): unknown } }).messageStore.createView();
+      assert.equal(s.stripReplayAtLimits(view)?.involved.images, true, 'premise: the count limit took part');
+      let replays = 0;
+      const held = s.stripReplayHeld.bind(strategy);
+      s.stripReplayHeld = (...args: unknown[]) => { replays++; return held(...args); };
+      assert.deepEqual(s.ruleCeilingHits(view, [], { images: true, bytes: true }), { images: false, bytes: false });
+      assert.equal(replays, 0);
+    } finally {
+      console.warn = original;
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
