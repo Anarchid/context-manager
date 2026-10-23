@@ -1563,14 +1563,19 @@ export class ContextManager {
    * its own shard.
    * Undefined when the strategy has no such hook, so a caller appends the
    * content as stored. An id comes back as null only when the next compile
-   * doesn't send that message, such as one the view filter leaves out.
+   * doesn't send that message, such as one the view filter leaves out. A
+   * strategy's own doc names where its compile still sends a message
+   * otherwise than its render, as the memory strategy's does for a message
+   * a summary covers and a body whose shards it doesn't send together.
    * Tool blocks come back as the per-message cap leaves them, so for a
-   * message that holds them the compile can send something else. It leaves
-   * out a newest message that holds a `tool_use` with no result after it,
-   * drops a `tool_result` whose call isn't sent before it, and sends a
-   * message other than a user's that holds a `tool_result` as several turns
-   * (`splitMixedToolMessages`), where the render gives one array. It throws
-   * for an id no stored message has, before
+   * message that holds them the compile can send something else. The
+   * memory strategy's hierarchical select leaves out a newest message that
+   * holds a `tool_use` with no result after it, and its adaptive select
+   * refuses that compile; both drop a `tool_result` whose call isn't sent
+   * before it. And the manager sends a message other than a user's that
+   * holds a `tool_result` as several turns (`splitMixedToolMessages`), where
+   * the render gives one array. It throws for an id no stored message has,
+   * before
    * the strategy has initialized, and where the strategy's select would
    * throw first, as the autobiographical strategy does on a branch it
    * hasn't loaded. It releases no compression hold: where a message's

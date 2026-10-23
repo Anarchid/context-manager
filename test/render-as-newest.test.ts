@@ -537,6 +537,37 @@ describe('renderAsNewest', () => {
     });
   });
 
+  it('autobiographical, adaptive select: a trailing tool_use comes back as the cap leaves it, though the compile refuses (R1-3)', async () => {
+    await withManager(sharding({}), async (manager) => {
+      manager.addMessage('user', [{ type: 'text', text: 'hi' }]);
+      const call: ContentBlock[] = [{ type: 'text', text: 'calling' }, { type: 'tool_use', id: 't-1', name: 'look', input: {} } as ContentBlock];
+      const id = manager.addMessage('assistant', call);
+      const [rendered] = manager.renderAsNewest([id])!;
+      assert.deepEqual(sent(rendered!), sent(call));
+      await assert.rejects(manager.compile(BUDGET), /did not retain the newest turn/);
+    });
+  });
+
+  it("autobiographical: after a head-window reset, a body across the head's end comes back whole, where the compile sends it in pieces with the history between", async () => {
+    // Shards of about 100 tokens: the head's 150 holds the first, the
+    // recent window's 300 the last few, and the history from before the
+    // reset comes between them.
+    const strategy = sharding({ headWindowTokens: 150, recentWindowTokens: 300 });
+    await withManager(strategy, async (manager) => {
+      manager.addMessage('user', [{ type: 'text', text: 'before the reset' }]);
+      const body = manager.addMessage('user', longText('BODY', 600));
+      strategy.resetHeadWindow(body);
+      const [forBody] = manager.renderAsNewest([body])!;
+      assert.equal(textOf(forBody), textOf(longText('BODY', 600)), 'whole');
+      const compiled = await manager.compile(BUDGET);
+      const texts = compiled.messages.map((m) => textOf(m.content));
+      const first = texts.findIndex((t) => t.includes('word'));
+      const history = texts.indexOf('before the reset');
+      assert.ok(first >= 0 && history > first && texts.slice(history).some((t) => t.includes('word')),
+        `the compile sends part of the body, then the history, then more of the body: ${JSON.stringify(texts.map((t) => t.slice(0, 12)))}`);
+    });
+  });
+
   it('windowed passthrough: a message before the anchor comes back as null', async () => {
     await withManager(windowed({}), async (manager) => {
       const ids = Array.from({ length: 10 }, (_, i) => manager.addMessage('user', longText(`M${i}`, 60)));
@@ -564,6 +595,33 @@ describe('renderAsNewest', () => {
       const compiled = await manager.compile(BUDGET);
       assert.deepEqual(sent(first!), sent(compiled.messages.at(-10)!.content), "main's anchor holds it");
     });
+  });
+
+  it('a render releases no compression hold that has timed out, and the next compile does', async () => {
+    class Counting extends AutobiographicalStrategy {
+      released = 0;
+      override onCompressionHoldsReleased(ctx: Parameters<AutobiographicalStrategy['onCompressionHoldsReleased']>[0]): void {
+        this.released++;
+        super.onCompressionHoldsReleased(ctx);
+      }
+    }
+    const strategy = new Counting({
+      headWindowTokens: 0, recentWindowTokens: 1_000_000, hierarchical: true, imageStripDepthTokens: 0,
+    } as ConstructorParameters<typeof AutobiographicalStrategy>[0]);
+    const clock = { t: 1_000 };
+    const dir = mkdtempSync(join(tmpdir(), 'cm-render-as-newest-'));
+    const manager = await ContextManager.open({ path: join(dir, 'store'), strategy, now: () => clock.t });
+    try {
+      const id = manager.addMessage('user', [{ type: 'text', text: 'held' }], undefined, undefined, { holdCompression: { timeoutMs: 100 } });
+      clock.t = 1_200;
+      manager.renderAsNewest([id]);
+      assert.equal(strategy.released, 0, 'the render released nothing');
+      await manager.compile(BUDGET);
+      assert.equal(strategy.released, 1, 'the compile released the timed-out hold');
+    } finally {
+      await manager.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('a compression hold, held or timed out, changes nothing a render gives', async () => {

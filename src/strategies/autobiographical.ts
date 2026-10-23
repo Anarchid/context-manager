@@ -19118,14 +19118,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Both selects send raw every message the view holds that no summary
    * covers, whichever region holds it: the head window, the middle (the
    * history before a head window that was reset included) or the recent
-   * window, each through `cappedForSend`. The image pass decides by stored
-   * position, newest first, not by where a region puts an entry. So these
-   * steps give a message's form wherever the compile places it, and no id
-   * the view holds comes back as null. Two places differ. A message a summary
-   * covers comes back raw, while the compile sends its summary where its plan
-   * folds it. And the adaptive middle sends a raw run of a body's shards as
-   * their text alone, uncut, so a body it sends from there, or across it and
-   * the recent window, goes out otherwise than the windows' join given here.
+   * window. Each such message goes through `cappedForSend`, apart from a
+   * body's shards in the adaptive middle (below). The image pass decides by
+   * stored position, newest first, not by where a region puts an entry. So
+   * these steps give a message's form wherever the compile places it, and
+   * no id the view holds comes back as null. Two kinds of message differ.
+   * - A message a summary covers comes back raw, while the compile sends its
+   *   summary where its plan folds it. Rendered raw, its images also count
+   *   toward the image limits of the messages older than it, where the
+   *   compile, sending its summary, doesn't count them.
+   * - A body whose shards the compile doesn't send together. The adaptive
+   *   middle, kv-unified's included, sends a raw run of a body's shards as
+   *   their text alone, uncut. A body whose shards sit across the middle
+   *   and a window, or across a reset head window's end with the history
+   *   from before the reset between them, goes out in more than one entry.
+   *   Here such a body comes back whole, as the windows join it.
    *
    * Under adaptive resolution it loads the calibration as a dry select
    * does, so the store's estimates, by which the image depth is measured,
