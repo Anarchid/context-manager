@@ -17,6 +17,9 @@ import type {
   AutobiographicalOptions,
   CompressionQuarantineStatus,
   CompressionQuarantineSpan,
+  LoadRepairReport,
+  LoadRepairDroppedSummary,
+  LoadRepairDropReason,
   SummaryLevel,
   SummaryEntry,
   ProtectedRange,
@@ -352,9 +355,9 @@ function nextFailureStreak(
  * An L1 run's subject: the chunk's rung, by the chunk's sources (see
  * chunkRunSubject) and the rung's curve label, the stripped retry after a
  * carrier rejection being its own. Not the request's bytes: a pending
- * chunk's request carries the whole unmerged frontier as recall pairs, so
- * every other L1 that lands changes it, and those landings are the evidence
- * a run needs.
+ * chunk's request carries the unmerged frontier summaries that start before
+ * it as recall pairs, so an L1 that lands for history before it changes it,
+ * and those landings are the evidence a run needs.
  */
 function chunkRunKey(runSubject: string, curveLabel: string, stripped: boolean): string {
   return sha256Json({ runSubject, curveLabel, stripped });
@@ -2165,6 +2168,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected pins: ProtectedRange[] = [];
   /** Monotonically increasing counter for pin ids. Persisted as part of the pins snapshot. */
   protected pinIdCounter = 0;
+  /**
+   * Pins a compile narrowed (`selectNarrowingPins`), by `narrowKey`: their
+   * whole reading (`pinSpan`) covers only their own ids until the strategy
+   * loads the store again (`initialize`: an open, a branch switch, a fork or
+   * `setStrategy`, which clear it with the branch's other mirrors), a reload
+   * of the store's state mid-life (`takeUpStoreState`) excluded. Nothing
+   * records the narrowing itself, so a store loaded again reads every pin
+   * whole; what a narrowed compile sent is recorded as any compile's is. A pin
+   * unpinned and marked again is a new pin, and whole.
+   */
+  protected readonly narrowedPins = new Set<string>();
+
+  /** A pin's key in `narrowedPins`: its id, ends and creation time, which no API changes. */
+  protected narrowKey(pin: ProtectedRange): string {
+    return JSON.stringify([pin.id, pin.firstMessageId, pin.lastMessageId, pin.created]);
+  }
+
+  /**
+   * The reading the summarizer's prompt takes for pins (`pinSpan`), and so
+   * everything that describes that prompt: its pinned-raw warning and the
+   * count of queued work that predicts it (`requestCarriesToolBlocks`). By
+   * their ids: the prompt already has a marked message's other parts as
+   * summaries, and carrying them raw multiplied later compression requests'
+   * input.
+   */
+  protected static readonly PROMPT_PIN_READING = 'ids' as const;
 
   /**
    * Per-message resolution state for the adaptive-resolution picker.
@@ -2552,7 +2581,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * lock while it stands: under the greedy solvers and kv-stable, the pinned
    * message renders raw, and its locked level stays stored and returns when
    * the pin is removed. kv-unified treats a pin and a lock as constraints and
-   * reports a conflict when they are incompatible.
+   * reports a conflict when they are incompatible. A pin whose ids name
+   * another part of a message stored in parts doesn't cover a locked part
+   * (`pinPositions`): there the lock holds, under every solver.
    * No-op when adaptiveResolution is false. Set-only programmatic API per
    * the design (no agent-facing tool in V1). Persisted to chronicle.
    */
@@ -2847,6 +2878,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.warnedQuarantineSkips.clear();
     this.pins = [];
     this.pinIdCounter = 0;
+    this.narrowedPins.clear();
     this.resolutions.clear();
     this.locked.clear();
     this._adaptivePicker = null;
@@ -3159,6 +3191,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const emptyIds: string[] = [];
     const unreadableIds: string[] = [];
     const rebuiltIds: string[] = [];
+    // Each dropped summary that holds text, as it was when dropped, with why:
+    // what the load-repair report names (loadRepairReport).
+    const textDrops = new Map<string, { summary: SummaryEntry; reason: LoadRepairDropReason }>();
     const namesParent = (copy: SummaryEntry, pointer: unknown): boolean =>
       typeof pointer === 'string' && (copiesById.get(pointer) ?? []).some(
         (parent) => parent.level > copy.level && Array.isArray(parent.sourceIds) && parent.sourceIds.includes(copy.id),
@@ -3171,7 +3206,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // An L1's own sources, else its compressed chunk record's, else a
         // copy's. Its range is their ends, which every L1 writer sets.
         const ids = [summary.sourceIds, chunkSources.get(id), ...copies.map((copy) => copy.sourceIds)].find(isIdList);
-        if (!ids) { unreadableIds.push(id); continue; }
+        if (!ids) { unreadableIds.push(id); textDrops.set(id, { summary, reason: 'unreadable' }); continue; }
         const range = summary.sourceRange as { first?: unknown; last?: unknown } | undefined;
         if (ids !== summary.sourceIds || range?.first !== ids[0] || range?.last !== ids[ids.length - 1]) {
           summary = { ...summary, sourceIds: [...ids], sourceRange: { first: ids[0]!, last: ids[ids.length - 1]! } };
@@ -3181,7 +3216,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // Above L1 a range's ends are message ids that the sources don't
         // name, so sources and range come together from one copy.
         const donor = copies.find((copy) => isIdList(copy.sourceIds) && isReadableRange(copy.sourceRange));
-        if (!donor) { unreadableIds.push(id); continue; }
+        if (!donor) { unreadableIds.push(id); textDrops.set(id, { summary, reason: 'unreadable' }); continue; }
         summary = { ...summary, sourceIds: [...donor.sourceIds], sourceRange: { ...donor.sourceRange } };
         rebuiltIds.push(id);
       }
@@ -3210,7 +3245,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         for (const [id, summary] of byId) {
           if (!(summary.level > 1) || (!notBelow(summary) && summary.sourceIds.every((sourceId) => byId.has(sourceId)))) continue;
           byId.delete(id);
-          (notBelow(summary) ? misplacedIds : ancestorIds).push(id);
+          const misplaced = notBelow(summary);
+          (misplaced ? misplacedIds : ancestorIds).push(id);
+          textDrops.set(id, { summary, reason: misplaced ? 'names-not-below' : 'names-missing' });
           changed = true;
         }
       }
@@ -3278,6 +3315,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (summary.level > 1 && summary.sourceIds.some((sourceId) => parentOf.get(sourceId) !== id)) {
         byId.delete(id);
         notParentIds.push(id);
+        textDrops.set(id, { summary, reason: 'names-non-child' });
       }
     }
     dropMissingAndMisplaced();
@@ -3307,6 +3345,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const keptRebuiltIds = rebuiltIds.filter((id) => byId.has(id));
     if (malformed > 0 || dupes > 0 || droppedIds.length > 0 || keptRebuiltIds.length > 0 ||
         reparentedIds.length > 0 || clearedIds.length > 0) {
+      // Read before the write, which moves the branch's sequence past the
+      // summaries as they were. A repair that dropped only empty summaries,
+      // or none, lost no text and has no report: its line below says it all.
+      const report = textDrops.size > 0
+        ? this.loadRepairReport(this.store, [...copiesById.keys()], textDrops, emptyIds.length)
+        : undefined;
       this.store.setStateJson(this.summariesStateId, this.summaries);
       this.diag.warn(
         `[autobiographical] repaired summary state: removed ${malformed} malformed entr(ies) and deduped ${dupes}; ` +
@@ -3317,6 +3361,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           `[${keptRebuiltIds.join(', ')}]; set the parent of [${reparentedIds.join(', ')}]; cleared ` +
           `the parent pointers of [${clearedIds.join(', ')}], which named no kept parent`,
       );
+      if (report) this.deliverLoadRepair(report);
     }
 
     // An invalid L1 may also be referenced by a persisted chunk record. Make
@@ -3510,9 +3555,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Pin a range of messages. A pin's bound is its `level`, or without one
    * its `maxLevel` (`normalizePinLevels`). A raw pin, with no bound or a
-   * bound of 0, keeps the messages out of compression and renders them raw
-   * at their original position. A bound above 0 is read only under
-   * `foldingStrategy: 'kv-stable'` and `'kv-unified'` with
+   * bound of 0, keeps the messages it names out of compression and renders
+   * them raw at their original position, a message stored in parts whole
+   * (`pinSpan`): where the whole messages don't fit the budget but the rest
+   * does with the pin narrowed to its ids, a compile narrows it until the
+   * strategy loads the store again (`selectNarrowingPins`). A bound above 0
+   * is read only under `foldingStrategy: 'kv-stable'` and `'kv-unified'` with
    * `adaptiveResolution` (`readsPinBounds`): there the range is still
    * compressed, since only a summary can supply its level, and is held at
    * `level`, or no deeper than `maxLevel`, as `ProtectedRange` describes.
@@ -3543,6 +3591,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * with `kind: 'document'`, and `opts` reads as `pinRange`'s: without a
    * `level` or `maxLevel` the message is kept raw, while `{ maxLevel }` lets
    * it fold no deeper than that level where the selector reads level bounds.
+   * Under adaptive resolution, a mark on any part of a message stored in
+   * parts renders the whole message, less a part locked with `lockChunk`
+   * that it doesn't name (`pinPositions`), as `pinRange` does: where the
+   * whole message doesn't fit, a mark that renders it raw is narrowed to the
+   * part it names (`selectNarrowingPins`). Under `kv-stable`, a mark with
+   * `level` (not `maxLevel`) holds whole each summary it reaches, so a locked
+   * part that shares a summary with a part the mark covers renders at the
+   * level the mark holds that summary at.
    */
   markDocument(messageId: string, opts?: PinLevelOptions): string {
     this.requireLoadedBranch('markDocument');
@@ -3567,8 +3623,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * summary at `level` doesn't list it renders where one does, or raw
    * (`ProtectedRange.level`). Honored by `foldingStrategy: 'kv-stable'`
    * and `'kv-unified'` with adaptive resolution; under any other selector the
-   * range is raw (`resolvedPinBounds`), in the live view and in the canonical
-   * L1 compression prompt where its budgets allow (see
+   * range is raw (`resolvedPinBounds`), in the live view and, read by its
+   * ids, in the canonical L1 compression prompt where its budgets allow (see
    * `compressionRecallBudgetTokens`).
    * Equivalent to `pinRange(first, last, { level })`.
    */
@@ -3760,21 +3816,84 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Build a set of message-store positions covered by any pin. O(N pins · K range).
-   * Returns positions for which the message exists; orphan pins (deleted
-   * messages) are silently skipped.
+   * The store positions a pin covers, first and last inclusive, in one of its
+   * two readings (`ProtectedRange`):
+   * - `'ids'`: the messages from its first id to its last, a part of a
+   *   message stored in parts covering only itself. The summarizer's prompt
+   *   reads this (`PROMPT_PIN_READING`). Compression keeps out only parts raw
+   *   this way (`compressionPinnedPositions`).
+   * - `'whole'`: from the first part of the message its first id is in to the
+   *   last part of the message its last id is in. The selects read this under
+   *   adaptive resolution (`selectsPinReading`), so the whole message goes out
+   *   raw where the budget holds it. A pin narrowed in this instance
+   *   (`narrowedPins`) reads by its ids here too. A part locked with
+   *   `lockChunk` outside the pin's ids isn't covered (`pinPositions`).
+   * Undefined when either id is no longer in the store.
    */
-  protected pinnedPositions(messages: StoredMessage[]): Set<number> {
+  protected pinSpan(
+    pin: ProtectedRange,
+    positionOf: ReadonlyMap<MessageId, number>,
+    messages: readonly StoredMessage[],
+    reading: 'ids' | 'whole',
+  ): { lo: number; hi: number } | undefined {
+    if (reading !== 'ids' && reading !== 'whole') throw new TypeError(`pinSpan: a reading is 'ids' or 'whole', not ${String(reading)}`);
+    const first = positionOf.get(pin.firstMessageId);
+    const last = positionOf.get(pin.lastMessageId);
+    if (first === undefined || last === undefined) return undefined;
+    const lo = Math.min(first, last);
+    const hi = Math.max(first, last);
+    if (reading === 'ids' || this.narrowedPins.has(this.narrowKey(pin))) return { lo, hi };
+    return { lo: bodyBoundsIn(messages, lo).from, hi: bodyBoundsIn(messages, hi).to };
+  }
+
+  /**
+   * The store positions a pin covers in `reading`: its span (`pinSpan`),
+   * less the messages locked with `lockChunk` that only the whole reading
+   * adds. A lock is said of that part, while the whole reading is what a mark
+   * on another part implies, so the lock holds there. A pin over its own
+   * locked messages keeps the rule `lockChunk` describes. Undefined when
+   * either id is no longer in the store.
+   */
+  protected pinPositions(
+    pin: ProtectedRange,
+    positionOf: ReadonlyMap<MessageId, number>,
+    messages: readonly StoredMessage[],
+    reading: 'ids' | 'whole',
+  ): number[] | undefined {
+    const span = this.pinSpan(pin, positionOf, messages, reading);
+    if (!span) return undefined;
+    const ids = reading === 'ids' ? span : this.pinSpan(pin, positionOf, messages, 'ids')!;
+    const out: number[] = [];
+    for (let i = span.lo; i <= span.hi; i++) {
+      if ((i < ids.lo || i > ids.hi) && this.locked.has(messages[i].id)) continue;
+      out.push(i);
+    }
+    return out;
+  }
+
+  /**
+   * The reading the selects take (`pinSpan`), the agent's view, with what
+   * must agree with them (the narrowing's candidates, and what compression
+   * keeps out): `'whole'` under adaptive resolution, the only ingress that
+   * stores a message in parts, and `'ids'` otherwise, so a store written with
+   * it and opened without it reads its pins as before. The summarizer's prompt
+   * reads pins by their ids either way.
+   */
+  protected selectsPinReading(): 'ids' | 'whole' {
+    return this.config.adaptiveResolution ? 'whole' : 'ids';
+  }
+
+  /**
+   * Build a set of message-store positions covered by any pin, in `reading`
+   * (`pinSpan`). O(N pins · K range). Returns positions for which the message
+   * exists; orphan pins (deleted messages) are silently skipped.
+   */
+  protected pinnedPositions(messages: StoredMessage[], reading: 'ids' | 'whole'): Set<number> {
     if (this.pins.length === 0) return new Set();
     const positionOf = this.positionIndex(messages);
     const out = new Set<number>();
     for (const pin of this.pins) {
-      const first = positionOf.get(pin.firstMessageId);
-      const last = positionOf.get(pin.lastMessageId);
-      if (first === undefined || last === undefined) continue;
-      const lo = Math.min(first, last);
-      const hi = Math.max(first, last);
-      for (let i = lo; i <= hi; i++) out.add(i);
+      for (const i of this.pinPositions(pin, positionOf, messages, reading) ?? []) out.add(i);
     }
     return out;
   }
@@ -3789,13 +3908,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * kv-stable's reading applies: a bound there takes the place of a classic
    * pin, a fixed level takes the place of a cap, and within each kind the
    * lowest wins (`pinLevelBounds`). A level or cap of 0 is raw
-   * (`isRawPinBound`).
+   * (`isRawPinBound`). Pins are read in `reading` (`pinSpan`): the summarizer's
+   * prompt by their ids, the selects as whole messages, and compression keeps
+   * out what both keep raw.
    */
-  protected resolvedPinBounds(messages: StoredMessage[]): Map<number, ResolvedPinBound> {
+  protected resolvedPinBounds(messages: StoredMessage[], reading: 'ids' | 'whole'): Map<number, ResolvedPinBound> {
     const out = new Map<number, ResolvedPinBound>();
-    const pinned = this.pinnedPositions(messages);
+    const pinned = this.pinnedPositions(messages, reading);
     if (pinned.size > 0) {
-      const bounds = this.readsPinBounds() ? this.pinLevelBounds(messages) : undefined;
+      const bounds = this.readsPinBounds() ? this.pinLevelBounds(messages, reading) : undefined;
       for (const position of pinned) {
         const bound = bounds?.get(position);
         if (bound?.level !== undefined) out.set(position, { level: bound.level });
@@ -3823,10 +3944,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return 'level' in bound ? bound.level === 0 : bound.maxLevel === 0;
   }
 
-  /** Positions of the messages that pins keep raw (`resolvedPinBounds`). */
-  protected forceRawPinPositions(messages: StoredMessage[]): Set<number> {
+  /** Positions of the messages that pins keep raw, in `reading` (`resolvedPinBounds`). */
+  protected forceRawPinPositions(messages: StoredMessage[], reading: 'ids' | 'whole'): Set<number> {
     const out = new Set<number>();
-    for (const [position, bound] of this.resolvedPinBounds(messages)) {
+    for (const [position, bound] of this.resolvedPinBounds(messages, reading)) {
       if (AutobiographicalStrategy.isRawPinBound(bound)) out.add(position);
     }
     return out;
@@ -3837,21 +3958,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * `maxLevel`) by message position. Only pins that carry a bound appear; a
    * classic raw pin (no bound) is absent here and handled by `pinnedPositions`.
    * Where bounded pins overlap, the lowest fixed level and the lowest cap are
-   * kept; `resolvedPinBounds` decides between them and a classic pin.
+   * kept; `resolvedPinBounds` decides between them and a classic pin. Pins
+   * are read in `reading` (`pinSpan`).
    */
-  protected pinLevelBounds(messages: StoredMessage[]): Map<number, { level?: number; maxLevel?: number }> {
+  protected pinLevelBounds(messages: StoredMessage[], reading: 'ids' | 'whole'): Map<number, { level?: number; maxLevel?: number }> {
     const out = new Map<number, { level?: number; maxLevel?: number }>();
     if (this.pins.length === 0) return out;
     const positionOf = this.positionIndex(messages);
 
     for (const pin of this.pins) {
       if (pin.level === undefined && pin.maxLevel === undefined) continue;
-      const first = positionOf.get(pin.firstMessageId);
-      const last = positionOf.get(pin.lastMessageId);
-      if (first === undefined || last === undefined) continue;
-      const lo = Math.min(first, last);
-      const hi = Math.max(first, last);
-      for (let i = lo; i <= hi; i++) {
+      for (const i of this.pinPositions(pin, positionOf, messages, reading) ?? []) {
         const prev = out.get(i) ?? {};
         // A fixed level is the strongest constraint; when two pins fix the same
         // position, the shallower (lower) level wins (finest requirement).
@@ -4018,12 +4135,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Consecutive compression/merge requests share a long, append-mostly
    * prefix — head window + prior recall pairs (~60% of input on synthetic
    * workloads, ~93% on mature stores) — that previously went to the API
-   * with zero `cache_control` and was re-read cold on every call. Markers
+   * with zero `cache_control` and was re-read cold on every call. They share
+   * the head window only while they summarize one topic's history: after a
+   * head-window reset, requests for different topics' history each carry
+   * that topic's head (headAsOf). Markers
    * land at the three boundaries whose survival probability ranks highest
    * (measured optimum; `analysis/2026-08-20-cm37-cache-partition-experiments.md`
    * in the workspace root):
    *
-   *   1. end of head window        — survives everything short of identity edits
+   *   1. end of head window        — survives everything short of identity edits,
+   *                                  among requests for one topic's history
    *   2. last level>=2 recall pair — survives appends AND L1→L2 merges (a
    *      merge replaces the run at this boundary and extends it)
    *   3. last recall pair          — the append frontier
@@ -4087,7 +4208,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (frontierEnd === -1) return false; // no ladder yet — nothing stable to cache
     // A capped ladder front-evicts on every mint, so the pair seams shift and
     // writing them is waste. The head seam does not: tools, system prompt and
-    // head window precede the ladder and are the same request after request,
+    // head window precede the ladder and are the same request after request
+    // for one topic's history (headAsOf gives each topic its own head),
     // unless image shedding (one byte budget, spent newest-first) replaces a
     // head image for one payload and not for the next.
     let placed = false;
@@ -5141,6 +5263,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** When tick last swept ladder progress (sweepCompressionProgressIfDue). */
   private compressionProgressSweptAt = 0;
   private onQuarantineAlarm?: (status: CompressionQuarantineStatus) => void;
+  /** Where a load-repair report goes (setLoadRepairHandler); unset, reports are held. */
+  private onLoadRepair?: (report: LoadRepairReport) => unknown;
+  /** Load-repair reports not yet handed to a handler, oldest first: in memory only. */
+  private heldLoadRepairs: LoadRepairReport[] = [];
+  /** The newest load-repair report this instance has made (getLatestLoadRepairReport). */
+  private latestLoadRepair: LoadRepairReport | null = null;
 
   /**
    * Host wiring point: the framework maps this to its ops-alert channel
@@ -5161,6 +5289,140 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   setQuarantineAlarmHandler(fn: (status: CompressionQuarantineStatus) => void): void {
     this.onQuarantineAlarm = fn;
+  }
+
+  /**
+   * Host wiring point for telling whoever keeps the agent that a load's
+   * repair of the summary state dropped summaries holding text: memory that
+   * changed, which the repair's diagnostic line alone doesn't reach anyone
+   * with (context-manager#175). A load (loadPersistedState) runs at each
+   * initialization (an open, a branch switch, a fork, setStrategy) and at
+   * each take-up of what another instance on the store wrote. A repair that
+   * drops only empty summaries, or none, loses no text and makes no report.
+   *
+   * A host that sets this after the store's open, as one that wires its
+   * handlers once the manager is open does, has missed that load, so reports
+   * made while none is set are held, in memory only, and setting a handler
+   * hands it each of them at once, oldest first. A report made while one is
+   * set goes to it once its load's synchronous run has ended: a microtask
+   * later, or, for a load a handler runs itself, when that handler returns.
+   * So a handler that calls back into the manager, such as to switch
+   * branches, never meets a load partway. It can meet an operation that ran
+   * the load and is still going, as any caller between that operation's
+   * steps can: an initialization, which keeps the manager's operations
+   * fenced until it has finished, or a compression that took up the store's
+   * state (takeUpStoreState). Each strategy instance holds its own. A throw
+   * from `fn`, or a rejection of what it returns (a promise or any
+   * thenable), is logged, and stops neither the load nor the next report.
+   * The report isn't handed over again, and the getter gives it until a
+   * newer one.
+   */
+  setLoadRepairHandler(fn: (report: LoadRepairReport) => unknown): void {
+    this.onLoadRepair = fn;
+    this.handHeldLoadRepairs();
+  }
+
+  /**
+   * The newest load-repair report this instance has made, whether held or
+   * handed on, for a health surface to show; null until a load it ran makes
+   * one (setLoadRepairHandler). A load that drops summaries holding text
+   * makes none only where the store's branch or sequence can't be read,
+   * which is logged.
+   */
+  getLatestLoadRepairReport(): LoadRepairReport | null {
+    return this.latestLoadRepair;
+  }
+
+  /**
+   * A load-repair report, queued for the handler: one already set takes it
+   * a microtask later, once the load's synchronous run has ended, and one
+   * set later takes it when it's set (setLoadRepairHandler).
+   */
+  private deliverLoadRepair(report: LoadRepairReport): void {
+    this.latestLoadRepair = report;
+    this.heldLoadRepairs.push(report);
+    if (this.onLoadRepair) queueMicrotask(() => this.handHeldLoadRepairs());
+  }
+
+  /**
+   * Each queued report to the handler set when it's taken, oldest first,
+   * those queued meanwhile included.
+   */
+  private handHeldLoadRepairs(): void {
+    while (this.onLoadRepair && this.heldLoadRepairs.length > 0) {
+      this.handLoadRepair(this.onLoadRepair, this.heldLoadRepairs.shift()!);
+    }
+  }
+
+  private handLoadRepair(fn: (report: LoadRepairReport) => unknown, report: LoadRepairReport): void {
+    const failed = (error: unknown): void => this.diag.warn(
+      `[autobiographical] the load-repair handler failed on the report for ${report.stateId} on branch ${report.branch} at sequence ${report.sequenceBefore}:`, error,
+    );
+    try {
+      // Promise.resolve adopts a promise from another realm or a library's
+      // thenable as well as this realm's, and passes anything else through.
+      Promise.resolve(fn(report)).catch(failed);
+    } catch (error) {
+      failed(error);
+    }
+  }
+
+  /**
+   * The report of a load's repair that dropped summaries holding text
+   * (LoadRepairReport), read before the repair writes: `drops` in the order
+   * of `ids`, the summary ids as stored. Undefined where the store's branch
+   * or sequence can't be read, which is logged: the repair goes ahead either
+   * way. A range end whose time can't be read has a null time.
+   */
+  private loadRepairReport(
+    store: JsStore,
+    ids: readonly string[],
+    drops: ReadonlyMap<string, { summary: SummaryEntry; reason: LoadRepairDropReason }>,
+    emptyDropped: number,
+  ): LoadRepairReport | undefined {
+    try {
+      const messages = this.hostContext?.messageStore;
+      // A view that throws, or an invalid Date's toISOString, gives null.
+      const storedAt = (id: string): string | null => {
+        try {
+          return messages?.get(id)?.timestamp.toISOString() ?? null;
+        } catch {
+          return null;
+        }
+      };
+      // Loaded state is untyped: a number field that isn't one is null. (The
+      // store holds JSON, which refuses NaN and the infinities.)
+      const numberOrNull = (value: unknown): number | null => typeof value === 'number' ? value : null;
+      const dropped: LoadRepairDroppedSummary[] = [];
+      for (const id of ids) {
+        const drop = drops.get(id);
+        if (!drop) continue;
+        const { summary, reason } = drop;
+        // The range the repair held for it: its chosen copy's, or another
+        // copy's where the repair rebuilt it from one. A summary whose
+        // sources can't be read can still hold a readable range.
+        const range = isReadableRange(summary.sourceRange) ? summary.sourceRange : null;
+        dropped.push({
+          id: String(id),
+          level: numberOrNull(summary.level),
+          tokens: numberOrNull(summary.tokens),
+          reason,
+          sourceRange: range && { first: range.first, last: range.last, firstAt: storedAt(range.first), lastAt: storedAt(range.last) },
+        });
+      }
+      return {
+        namespace: this.ns,
+        branch: store.currentBranch().name,
+        stateId: this.summariesStateId,
+        sequenceBefore: store.currentSequence(),
+        dropped,
+        droppedTokens: dropped.reduce((sum, d) => sum + (d.tokens ?? 0), 0),
+        emptyDropped,
+      };
+    } catch (error) {
+      this.diag.warn('[autobiographical] a load\'s repair drops summaries holding text, and its report couldn\'t be read:', error);
+      return undefined;
+    }
   }
 
   /**
@@ -7798,6 +8060,169 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   private selectPath(store: MessageStoreView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
+    const cacheKeys = this._prevCacheKeys;
+    try {
+      return this.selectOnce(store, budget, opts);
+    } catch (err) {
+      if (!(err instanceof OverBudgetError)) throw err;
+      return this.selectNarrowingPins(store, budget, opts, err, cacheKeys);
+    }
+  }
+
+  /**
+   * Answers a select refused over budget (`refusal`) where the whole messages
+   * pins cover may be what doesn't fit: a mark on a long message's first part
+   * keeps the whole message raw (`pinSpan`), which can be more than the
+   * budget holds beside the rest. Pins are narrowed to their own ids one at a
+   * time, the one that frees the most first (`freedByNarrowing`), and the
+   * select runs again after each. Compression reads pins by their ids, so the
+   * parts a narrowing frees are chunked and summarized like any history, and
+   * the narrowed select can send their summaries.
+   * - A refusal whose middle holds nothing, as when the head and recent
+   *   windows alone are over the budget, stands as it was: nothing is
+   *   narrowed and no select runs again.
+   * - Where the selects read pins by their ids, as without adaptive
+   *   resolution, no pin covers more than its ids, so the refusal stands
+   *   without that look.
+   * - When a select goes ahead, the pins narrowed so far stay narrowed until
+   *   the strategy loads the store again (`narrowedPins`), and a warning
+   *   names each. Nothing records them, so a store loaded again reads every
+   *   pin whole: with a larger budget it sends the whole message, and one
+   *   that still doesn't fit narrows again at its first refused compile.
+   * - A provisional calibration multiplier above 1 that puts the whole
+   *   reading over is dropped first (`selectOnce`), as for any refusal, so a
+   *   guess the first sample replaces doesn't narrow a pin.
+   * - When no pin is left to narrow, the pins go back to whole messages and
+   *   the first refusal is thrown, with its preview and the frontier it
+   *   planned (`getHotContextSettings`).
+   * - A dry compile narrows for its own select only: it puts the pins back
+   *   and warns nothing.
+   */
+  private selectNarrowingPins(
+    store: MessageStoreView,
+    budget: TokenBudget,
+    opts: SelectOptions | undefined,
+    refusal: OverBudgetError,
+    cacheKeys: string[] | undefined,
+  ): ContextEntry[] {
+    if (this.selectsPinReading() === 'ids' || !(refusal.diagnostics.middleTokens > 0)) throw refusal;
+    // What the refused select recorded for observers, which a narrowed
+    // attempt overwrites and a refusal that stands puts back.
+    const preview = this._lastPreview;
+    const frontier = this.lastFrontierTokens;
+    const blocked = this.transitionBlocked;
+    const narrowed: ProtectedRange[] = [];
+    const putBack = (): void => {
+      for (const pin of narrowed) this.narrowedPins.delete(this.narrowKey(pin));
+      this._lastPreview = preview;
+      this.lastFrontierTokens = frontier;
+      this.transitionBlocked = blocked;
+    };
+    let entries: ContextEntry[] | undefined;
+    try {
+      // The order is taken once, before the first narrowing. Narrowing a raw
+      // pin changes no other pin's reading, and what it stops covering
+      // mostly stays out of compression as it was (a position there is raw
+      // by some pin's ids, and so by that pin's whole reading too). Where a
+      // pin with a level overlaps that position, the level can take the
+      // other pin's place once this one is narrowed (`resolvedPinBounds`), so
+      // later candidates' counts can be off there; the loop doesn't take
+      // them again.
+      for (const { pin } of this.freedByNarrowing(store)) {
+        this.narrowedPins.add(this.narrowKey(pin));
+        narrowed.push(pin);
+        // A refused select can have placed its cache markers; each attempt is
+        // measured against the request before the compile, as select puts back.
+        this._prevCacheKeys = cacheKeys;
+        try {
+          entries = this.selectOnce(store, budget, opts);
+          break;
+        } catch (err) {
+          if (!(err instanceof OverBudgetError)) throw err;
+        }
+      }
+    } catch (err) {
+      putBack();
+      throw err;
+    }
+    if (!entries) {
+      putBack();
+      throw refusal;
+    }
+    if (opts?.dryRun === true) for (const pin of narrowed) this.narrowedPins.delete(this.narrowKey(pin));
+    else this.warnNarrowedPins(narrowed, refusal);
+    return entries;
+  }
+
+  /**
+   * What narrowing each raw pin would free, the most first: the raw tokens of
+   * the messages its reading as the selects take it (`selectsPinReading`)
+   * covers beyond its own ids that compression can summarize
+   * (`getCompressibleMessages`: outside the head and recent windows) and that
+   * have an L1 the select can fold them to (their chunk's summary, else
+   * `l1ByMessageIndex`, as selectAdaptive finds it), priced as the selects
+   * price them (`postStripEstimates`), less those the selects hold at a
+   * level. A part locked with `lockChunk` isn't among them: the whole reading
+   * leaves it out (`pinPositions`). Only those can go out as summaries once
+   * it's narrowed. Where the selects read bounds, a pin with a level or cap
+   * above 0 frees nothing, since its parts are held at that level: its parts
+   * already fold, and where it overlaps a raw pin, narrowing it could turn
+   * parts raw. Elsewhere every pin renders raw and can be narrowed. A pin
+   * that frees nothing, a narrowed one included, isn't listed.
+   */
+  private freedByNarrowing(store: MessageStoreView): Array<{ pin: ProtectedRange; tokens: number }> {
+    if (this.pins.length === 0) return [];
+    const messages = store.getAll();
+    const positionOf = this.positionIndex(messages);
+    const compressible = new Set(this.getCompressibleMessages(store).map((m) => m.id));
+    const summarized = new Set<MessageId>(this.l1ByMessageIndex().keys());
+    for (const chunk of this.chunks) if (chunk.summaryId !== undefined) for (const m of chunk.messages) summarized.add(m.id);
+    const reading = this.selectsPinReading();
+    // A pin keeps raw only where the selects resolve it raw: where they read
+    // bounds, a position a pin holds at a level (this one's own, if it has a
+    // level or cap) stays held, so a pin with a level or cap frees nothing
+    // there.
+    const bounds = this.resolvedPinBounds(messages, reading);
+    const prices = this.postStripEstimates(store);
+    const out: Array<{ pin: ProtectedRange; tokens: number }> = [];
+    for (const pin of this.pins) {
+      const whole = this.pinPositions(pin, positionOf, messages, reading);
+      const ids = this.pinSpan(pin, positionOf, messages, 'ids');
+      if (!whole || !ids) continue;
+      let tokens = 0;
+      for (const i of whole) {
+        const id = messages[i].id;
+        const bound = bounds.get(i);
+        const raw = bound !== undefined && AutobiographicalStrategy.isRawPinBound(bound);
+        if ((i < ids.lo || i > ids.hi) && raw && compressible.has(id) && summarized.has(id)) tokens += prices[i] ?? 0;
+      }
+      if (tokens > 0) out.push({ pin, tokens });
+    }
+    return out.sort((a, b) => b.tokens - a.tokens);
+  }
+
+  /** Warn, naming each pin `selectNarrowingPins` narrowed, of what it now covers and how to have it whole again. */
+  private warnNarrowedPins(narrowed: readonly ProtectedRange[], refusal: OverBudgetError): void {
+    for (const pin of narrowed) {
+      const what = pin.kind === 'document' ? 'document mark' : 'pin';
+      const label = pin.name !== undefined ? `"${pin.name}" (${pin.id})` : pin.id;
+      const one = pin.firstMessageId === pin.lastMessageId;
+      const covers = one
+        ? `only message ${pin.firstMessageId}, one part of a message stored in parts, not the whole message`
+        : `only messages ${pin.firstMessageId} to ${pin.lastMessageId}, not the whole of the messages stored in parts at its ends`;
+      this.diag.warn(
+        `autobio: ${what} ${label} now covers ${covers}. ${narrowed.length > 1 ? `With the ${narrowed.length} pins narrowed here covering their whole messages` : `With it covering ${one ? 'the whole message' : 'them whole'}`}, ` +
+          `the compile came to ~${refusal.actual} tokens against a hard budget of ${refusal.budget}` +
+          `${refusal.diagnostics.configuredBudget === undefined ? '' : ` (maxTokens ${refusal.diagnostics.configuredBudget})`}. Until this ` +
+          `context is loaded again, the parts it no longer covers fold like any history. Loaded again, as at a restart, the ${what} ` +
+          `covers ${one ? 'the whole message' : 'them'} again where the budget holds ${one ? 'it' : 'them'}: to have ` +
+          `${one ? 'it' : 'them'} whole, raise the budget, then restart or unpin ${pin.id} and ` +
+          `${pin.kind === 'document' ? 'mark the message' : 'pin the range'} again.`,
+      );
+    }
+  }
+
+  private selectOnce(store: MessageStoreView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
     // Image stripping runs inside each select path (before stats commit / cache
     // markers), so the returned entries are already bounded — see
     // applyImageStripping.
@@ -7808,7 +8233,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // A provisional multiplier above 1 that puts the compile over budget
         // is dropped to 1 and the select runs again: with the refusal
         // standing, no inference would run, so no sample could ever correct
-        // it (#179, the startup wedge). Any other refusal stands.
+        // it (#179, the startup wedge). Any other refusal stands here, for
+        // selectNarrowingPins to answer.
         if (!(err instanceof OverBudgetError) || !this.dropProvisionalCalibration(err, opts?.dryRun === true)) throw err;
         // The retry answers for the select: a preview the discarded attempt
         // recorded mustn't stand in for a retry that refuses before recording
@@ -8978,9 +9404,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     //      ("Antra came to me to explore the transformation story
     //      again…"), compounding across merges into runaway false
     //      memories (the "68 initiations" incident). Chronological
-    //      order is also the KV-stable order — the head never changes.
-    //      (executeMerge always had head-first; this site was the odd
-    //      one out.)
+    //      order is also the KV-stable order: chunks of one topic after its
+    //      head share that head, so their requests share its prefix. The
+    //      head is the head as of the chunk (headAsOf): after a head-window
+    //      reset, the head that history followed, the opening or its own
+    //      topic's, never the later topic's. (executeMerge always had
+    //      head-first; this site was the odd one out.)
     //   2. Prior summaries — narrativized as CM-asks / agent-recalls
     //      pairs, in source order. The unmerged frontier of the
     //      summary forest: any summary that has not yet been merged
@@ -8998,10 +9427,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // future information into the model's KV state and corrupt the
     // as-of framing of memory formation.
     const allMessages = ctx.messageStore.getAll();
-    const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
-    // Compression holds: provisional content never enters a prompt, not even
-    // as head context (a reset head can sit past the hold boundary).
-    const headEndIdx = Math.min(this.getHeadWindowEnd(ctx.messageStore), this.holdBoundary(ctx.messageStore));
+    // Message IDs are opaque strings, not sortable sequence numbers. Chronicle's
+    // default IDs happen to be decimal text, where lexical order corrupts the
+    // timeline at the first width transition (`"103" < "15"`). Use the store's
+    // canonical order instead so recall pairs remain chronological for every ID
+    // representation and newly-created summaries extend rather than splice the
+    // provider-cache prefix.
+    const messageOrder = new Map<MessageId, number>(
+      allMessages.map((message, index) => [message.id, index]),
+    );
+    const chunkFirstId = chunk.messages[0]?.id;
+    // The chunk's start is its first message still in the store: a host can
+    // remove a stored message (agent-framework's Discord module does, on a
+    // delete) while the chunk holding it waits in the queue. -1 only when
+    // none of its messages is left (startInStore).
+    const chunkStartIdx = this.startInStore(chunk.messages.map((m) => m.id), messageOrder);
+    // The head as of the chunk (headAsOf): after a head-window reset, history
+    // from before it is given the head it followed, not the new topic's, which
+    // came after it. Clipped at a hold there, as before.
+    const { start: headStartIdx, end: headEndIdx } = this.headAsOf(ctx.messageStore, chunkStartIdx);
 
     // ---- Prior recall set (the unmerged frontier) ----
     // Computed BEFORE the head emission because the head loop needs the
@@ -9014,17 +9458,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // optimization that scales catastrophically: a 4000-message import
     // converged to ~500 L1s that never aged out, blowing the 200k
     // window around chunk 118.
-    // Message IDs are opaque strings, not sortable sequence numbers. Chronicle's
-    // default IDs happen to be decimal text, where lexical order corrupts the
-    // timeline at the first width transition (`"103" < "15"`). Use the store's
-    // canonical order instead so recall pairs remain chronological for every ID
-    // representation and newly-created summaries extend rather than splice the
-    // provider-cache prefix.
-    const messageOrder = new Map<MessageId, number>(
-      allMessages.map((message, index) => [message.id, index]),
-    );
-    // Pins in the canonical L1 prompt. The live view shows a message that a
-    // pin keeps raw (forceRawPinPositions) raw, so this prompt does too. A
+    // Pins in the canonical L1 prompt, read by their ids (PROMPT_PIN_READING,
+    // forceRawPinPositions): a marked message's other parts reach the prompt
+    // as their summaries, though the selects send them raw. A
     // frontier summary that can't be shown as a recall pair (it covers such a
     // message, or its content is empty) is DESCENDED, not dropped: its
     // children take its place, so only the branch holding the pin opens,
@@ -9060,20 +9496,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // stay declared (reasoning_extraction guard). L1 only; merge/transition
     // paths do not consult this flag.
     const sourceOnly = this.config.compressionSourceOnly === true;
-    const chunkFirstId = chunk.messages[0]?.id;
-    const chunkStartIdx = chunkFirstId ? allMessages.findIndex((m) => m.id === chunkFirstId) : -1;
 
     // History before the chunk, laid out for the messages that pins keep raw.
     const layoutHistory = (forceRawMessageIds: ReadonlySet<MessageId>) => {
       // The recall frontier, the chunks pins open and the leaf coverage, as
       // compressionWorkQueued's count reads them too (recallCoverage).
       const { frontier, openedMessageIds, coveredMessageIds: priorSummaryMessageIds } = this.recallCoverage(forceRawMessageIds);
+      // Recall pairs only for history before the chunk: a summary whose
+      // source range starts before the chunk's first message, as a merge's
+      // prior recall set takes only what starts before its range (1a). A
+      // chunk compressed after later history already has summaries (the old
+      // head's chunk, which a head-window reset makes compressible after the
+      // chunks behind it; a pinned or quarantined chunk let go late) was
+      // given their recall pairs too, ahead of it: what came after it
+      // (#317). It now sees fewer pairs: only those that start before it.
+      // Coverage is the whole frontier's still, so a later summary's
+      // messages stay out of the raw middle (one-to-one). A summary that
+      // starts before the chunk and reaches past it (a sparse sweep
+      // artifact, issue #42) is still recalled, since the messages it covers
+      // before the chunk have no other form here; so its later part, what it
+      // says of history after the chunk, still reaches this request, and only
+      // where a summary straddles the chunk. A summary written before this
+      // rule may also carry what came after its own history, from the head or
+      // recall pairs it was written with; that stays in its text. Where a
+      // summary starts is summaryStartInStore's rule, the one
+      // a merge's prior recall set uses: a summary whose first message a host
+      // removed starts at its first message still there, and one with none
+      // left isn't recalled. A chunk with no message left (chunkStartIdx -1)
+      // recalls none.
+      const summariesById = new Map<string, SummaryEntry>();
+      for (const s of this.summaries) summariesById.set(s.id, s);
+      const startOf = new Map<string, number>();
+      for (const s of frontier) startOf.set(s.id, this.summaryStartInStore(s, messageOrder, summariesById));
       const priorSummaries = frontier
-        .sort((a, b) => {
-          const aOrder = messageOrder.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
-          const bOrder = messageOrder.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
-          return aOrder - bOrder || a.sourceRange.first.localeCompare(b.sourceRange.first);
-        });
+        .filter((s) => { const at = startOf.get(s.id)!; return at >= 0 && at < chunkStartIdx; })
+        .sort((a, b) => startOf.get(a.id)! - startOf.get(b.id)! || a.sourceRange.first.localeCompare(b.sourceRange.first));
 
       // Raw messages before the chunk outside the head window, by position.
       // From the head window's end on, any message no summary represents yet
@@ -9117,7 +9574,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           rawMiddle.push({ position: i, message: m });
         }
       }
-      return { priorSummaries, priorSummaryMessageIds, rawMiddle, pinnedRaw, pinnedRawTokens };
+      return { priorSummaries, startOf, priorSummaryMessageIds, rawMiddle, pinnedRaw, pinnedRawTokens };
     };
 
     // When the chunk is a portion of a substantially larger sharded message
@@ -9143,9 +9600,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Pins count only before the chunk being compressed: this prompt is the
     // history the chunk follows. A summary after it (a chunk compressed out of
-    // order, after a head-window reset or an unpin) is recalled as on main.
+    // order, after a head-window reset or an unpin) isn't recalled at all
+    // (layoutHistory), and its messages stay covered.
     const forceRawMessageIds = new Set<MessageId>();
-    for (const i of this.forceRawPinPositions(allMessages)) {
+    for (const i of this.forceRawPinPositions(allMessages, AutobiographicalStrategy.PROMPT_PIN_READING)) {
       if (i < chunkStartIdx) forceRawMessageIds.add(allMessages[i].id);
     }
     const recallBudget = sourceOnly ? 0 : (this.config.compressionRecallBudgetTokens ?? 100_000);
@@ -9153,7 +9611,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // The canonical request's messages for one layout of history, sections 1
     // to 6, shaped as they are sent. Admitting the pins prices this list.
     const assemble = (
-      { priorSummaryMessageIds, rawMiddle }: ReturnType<typeof layoutHistory>,
+      { startOf, priorSummaryMessageIds, rawMiddle }: ReturnType<typeof layoutHistory>,
       keptSummaries: readonly SummaryEntry[],
     ) => {
       const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
@@ -9172,7 +9630,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the chunk." For doc-heavy chronicles, "everything before" would
       // be hundreds of thousands of tokens; the recall pairs below
       // represent that intermediate content. The head is just the
-      // permanent prefix that the original instance always saw.
+      // prefix the original instance saw ahead of this history: the head
+      // window as of the chunk (headAsOf), which after a head-window reset
+      // is the opening, or the transition and opening of the chunk's topic.
       //
       // ONE-TO-ONE INVARIANT: chunk records (and the summaries over them)
       // are the persistent authority over how a message is represented.
@@ -9197,13 +9657,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // ---- 2. Prior recall pairs (budget-capped, above) and the raw middle ----
 
       // One sequence by source position after the head window, which always
-      // comes first, so the summarizer never reads an older raw turn as coming
-      // after a later memory. Where the raw middle follows every recall pair,
-      // as it does when chunking runs contiguously, this is the order the
-      // prompt always had: recall pairs, then raw.
+      // comes first, so the summarizer never reads an older raw turn, or an
+      // older memory, as coming after a later memory. A recall pair sits at
+      // its summary's start as the recall filter read it (layoutHistory's
+      // startOf, summaryStartInStore): a summary whose first message a host
+      // removed sits at its first message still in the store, not last.
+      // Where the raw middle follows every recall pair, as it does when
+      // chunking runs contiguously, this is the order the prompt always had:
+      // recall pairs, then raw.
       const middle: Array<{ position: number; summary?: SummaryEntry; message?: StoredMessage }> = [
         ...keptSummaries.map((summary) => ({
-          position: messageOrder.get(summary.sourceRange.first) ?? Number.MAX_SAFE_INTEGER,
+          position: startOf.get(summary.id) ?? Number.MAX_SAFE_INTEGER,
           summary,
         })),
         ...rawMiddle,
@@ -9654,17 +10118,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // The pins that keep one of those messages raw: a pin whose own bound
       // reads as raw here, over a message the pins keep raw.
       const pinnedRawSet = new Set(pinned.pinnedRaw);
-      const forceRawPositions = this.forceRawPinPositions(allMessages);
+      const forceRawPositions = this.forceRawPinPositions(allMessages, AutobiographicalStrategy.PROMPT_PIN_READING);
       const readsBounds = this.readsPinBounds();
       const positionOf = this.positionIndex(allMessages);
       const pins = this.pins.filter((pin) => {
         const own: ResolvedPinBound = pin.level !== undefined ? { level: pin.level }
           : pin.maxLevel !== undefined ? { maxLevel: pin.maxLevel } : 'raw';
         if (readsBounds && !AutobiographicalStrategy.isRawPinBound(own)) return false;
-        const first = positionOf.get(pin.firstMessageId);
-        const last = positionOf.get(pin.lastMessageId);
-        if (first === undefined || last === undefined) return false;
-        for (let i = Math.min(first, last); i <= Math.max(first, last); i++) {
+        const span = this.pinSpan(pin, positionOf, allMessages, AutobiographicalStrategy.PROMPT_PIN_READING);
+        if (!span) return false;
+        for (let i = span.lo; i <= span.hi; i++) {
           if (pinnedRawSet.has(i) && forceRawPositions.has(i)) return true;
         }
         return false;
@@ -11662,7 +12125,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     //
     // No tail-after-merge: same as-of principle as L1 compression. The
     // consolidation is being formed at the moment the last source was
-    // ready, so nothing after that is visible.
+    // ready, so nothing after that is visible, except what a recalled
+    // summary's own text carries: one written before this as-of rule may
+    // say what came after its history.
     const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
 
     // Build lookup maps
@@ -11688,9 +12153,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
     for (const src of sources) collectLeaves(src);
 
-    // Find the start of the merge range in the message store.
-    const mergeFirstMsgId = sources[0].sourceRange.first;
-    const mergeStartIdx = allMessages.findIndex((m) => m.id === mergeFirstMsgId);
+    // The merge range's start in the store: its first leaf still there
+    // (startInStore), as a summary's start is read (summaryStartInStore). -1
+    // only when none is: nothing in the store says when that history
+    // happened, so the merge gets no head (headAsOf) and recalls no summary
+    // (1a), as a compression chunk in that state does.
+    const positionOf = this.positionIndex(allMessages);
+    const mergeStartIdx = this.startInStore(sourceLeafIds, positionOf);
 
     // ---- 1a. PRIOR RECALL SET (chronologically before merge range) ----
     // Computed BEFORE the head emission because the head loop needs the
@@ -11704,20 +12173,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // (`!mergedInto`) lets a merged L1 drop out in favour of its L2/L3
     // parent — the same rule used everywhere else and now in
     // `compressChunkHierarchical`. The cap below is the defense-in-depth.
+    const priorStart = new Map<string, number>();
     const priorSummariesAll = this.summaries
       // Skip empty-content summaries (see compressChunkHierarchical): an empty
       // text block in the merge recall header 400s and stalls compression.
       .filter((s) => !s.mergedInto && !!s.content && s.content.trim().length > 0)
       .filter((s) => {
         for (const lid of s.sourceIds) if (sourceLeafIds.has(lid)) return false;
-        const firstIdx = allMessages.findIndex((m) => m.id === s.sourceRange.first);
-        return firstIdx >= 0 && (mergeStartIdx < 0 || firstIdx < mergeStartIdx);
+        // Where it starts (summaryStartInStore): a summary whose first message
+        // a host removed starts at its first message still in the store, so
+        // it's recalled and its other messages, which its coverage holds out
+        // of the raw middle, keep a form here. One with none left isn't.
+        const firstIdx = this.summaryStartInStore(s, positionOf, summariesById);
+        priorStart.set(s.id, firstIdx);
+        return firstIdx >= 0 && firstIdx < mergeStartIdx;
       })
-      .sort((a, b) => {
-        const ai = allMessages.findIndex((m) => m.id === a.sourceRange.first);
-        const bi = allMessages.findIndex((m) => m.id === b.sourceRange.first);
-        return ai - bi;
-      });
+      .sort((a, b) => priorStart.get(a.id)! - priorStart.get(b.id)!);
 
     // Leaf coverage of every live summary — the rendering authority
     // (one-to-one invariant; see compressChunkHierarchical). Uses the
@@ -11740,9 +12211,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // ---- 1b. HEAD WINDOW (raw, FIRST, ownership-capped) ----
     //
-    // The head window is the foundational identity anchor — the actual
-    // opening of the chronicle. It establishes who is speaking to whom.
-    // Without it, when the merge target's content is heavily first-person
+    // The head window is the foundational identity anchor — the opening
+    // the merged history followed (headAsOf: the chronicle's opening, or
+    // after a head-window reset the opening of its topic). It establishes
+    // who is speaking to whom. Without it, when the merge target's content
+    // is heavily first-person
     // from someone other than the agent, the agent loses its first-person
     // grounding and drifts into the content author's voice.
     //
@@ -11750,10 +12223,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // wins over the token-derived head boundary. A head-range message
     // covered by a live summary renders via its recall pair; one inside
     // the merge tree renders in the TARGET expansion. Never raw here too.
-    const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
-    // Compression holds: provisional content never enters a prompt, not even
-    // as head context (a reset head can sit past the hold boundary).
-    const headEndIdx = Math.min(this.getHeadWindowEnd(ctx.messageStore), this.holdBoundary(ctx.messageStore));
+    // The head as of the merge's first message (headAsOf), as for an L1: a
+    // merge over history from before a head-window reset is given the head
+    // that history followed. Clipped at a hold there, as before.
+    const { start: headStartIdx, end: headEndIdx } = this.headAsOf(ctx.messageStore, mergeStartIdx);
     let headCoveredSkipped = 0;
     for (let i = headStartIdx; !mergeSourceOnly && i < headEndIdx && i < allMessages.length; i++) {
       const m = allMessages[i];
@@ -12542,9 +13015,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     within?: ReadonlySet<MessageId>,
   ): boolean {
     // Work frees room only where its summary folds a message the selection
-    // can fold now: both selectors keep the head and recent windows raw, and
-    // a message a pin keeps raw. That's the chunker's own reading of what's
-    // compressible (getCompressibleMessages).
+    // can fold: both selectors keep the head and recent windows raw, and a
+    // message a pin keeps raw. That's the chunker's own reading of what's
+    // compressible (getCompressibleMessages), which counts the parts a pin
+    // covers only as the selects read it: their summaries are what a
+    // narrowing sends (selectNarrowingPins).
     const foldable = new Set(
       this.getCompressibleMessages(store).map((m) => m.id).filter((id) => within === undefined || within.has(id)),
     );
@@ -12672,48 +13147,58 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the chunk's own messages, and, unless compressionSourceOnly, each message
    * the request carries raw ahead of the chunk, by the coverage tick's request
    * reads with the pins before the chunk (recallCoverage). From the lower of
-   * the head window's start and headEnd (headEnd clipped at a hold as tick
-   * clips it, and 0 with the head window off, headWindowTokens <= 0), that's
-   * every message the coverage leaves uncovered, up to the chunk or to
-   * headEnd, whichever is later. Before it, only what pins keep raw: the
+   * the start and end of the head that request gives (headAsOf, the head as
+   * of the chunk, its end clipped at a hold as tick clips it, and 0 with the
+   * head window off, headWindowTokens <= 0), that's every message the coverage
+   * leaves uncovered, up to the chunk or to that head's end, whichever is
+   * later. Before it, only what pins keep raw: the
    * messages of an L1 a pin opens, and a pinned message. Tick lays its
    * history out without the pins when the raw they add doesn't fit, so the
    * pins can only add raw here that tick leaves out; and tick strips unpaired
    * tool blocks first. So this can say yes where tick's request has none,
    * never the reverse. The test it returns takes one chunk. Chunks with the
-   * same pins before them read the same coverage, so each coverage is read
-   * once, for the first message its request carries raw with a tool block,
-   * and a chunk's answer is whether that message comes before the later of
-   * the chunk's start and headEnd.
+   * same pins before them, and the same head start, read the same coverage
+   * from the same place, so each is read once, for the first message its
+   * request carries raw with a tool block, and a chunk's answer is whether
+   * that message comes before the later of the chunk's start and its head's
+   * end.
    */
   private requestCarriesToolBlocks(store: MessageStoreView): (chunk: Chunk) => boolean {
     const all = store.getAll();
     const sourceOnly = this.config.compressionSourceOnly === true;
-    const headEnd = Math.min(this.getHeadWindowEnd(store), this.holdBoundary(store));
-    const from = Math.min(this.getHeadWindowStartIndex(store), headEnd);
     const position = new Map(all.map((message, i) => [message.id, i]));
-    const pins = sourceOnly ? [] : [...this.forceRawPinPositions(all)].sort((a, b) => a - b);
-    // For each count of pins before a chunk, the index of the first message
-    // that request carries raw with a tool block, or all.length for none.
-    const firstToolBlock = new Map<number, number>();
+    const pins = sourceOnly ? [] : [...this.forceRawPinPositions(all, AutobiographicalStrategy.PROMPT_PIN_READING)].sort((a, b) => a - b);
+    // Built at the first head read, so a count that reads none (source-only,
+    // or each chunk holding a tool block itself) scans no holds.
+    let heads: ((pos: number) => { start: number; end: number }) | undefined;
+    // For each count of pins before a chunk and the start its head's raw
+    // reading takes, the index of the first message that request carries raw
+    // with a tool block, or all.length for none.
+    const firstToolBlock = new Map<string, number>();
     return (chunk) => {
       if (chunk.messages.some((m) => hasToolBlocks(m.content))) return true;
       if (sourceOnly) return false;
-      const start = position.get(chunk.messages[0]?.id ?? '') ?? -1;
+      // The chunk's start as tick's request takes it (startInStore).
+      const start = this.startInStore(chunk.messages.map((m) => m.id), position);
+      heads ??= this.headsAsOf(store);
+      const head = heads(start);
+      const headEnd = head.end;
+      const from = Math.min(head.start, headEnd);
       const pinned = pins.filter((i) => i < start);
-      let first = firstToolBlock.get(pinned.length);
+      const key = `${pinned.length}:${from}`;
+      let first = firstToolBlock.get(key);
       if (first === undefined) {
         const pinnedIds = new Set(pinned.map((i) => all[i].id));
         const seen = this.recallCoverage(pinnedIds);
         // Before `from`, the request carries only what pins keep raw: an L1 a
-        // pin opens, and a pinned message (which lies before headEnd, since
-        // from is at most headEnd).
+        // pin opens, and a pinned message. (Either lies before headEnd there,
+        // since from is at most headEnd.)
         const carried = (message: StoredMessage, i: number): boolean =>
           !seen.coveredMessageIds.has(message.id)
           && (i >= from || seen.openedMessageIds.has(message.id) || pinnedIds.has(message.id));
         const found = all.findIndex((message, i) => carried(message, i) && hasToolBlocks(message.content));
         first = found === -1 ? all.length : found;
-        firstToolBlock.set(pinned.length, first);
+        firstToolBlock.set(key, first);
       }
       return first < Math.max(headEnd, start);
     };
@@ -12948,15 +13433,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
 
     // Each pinned position's fold bound, resolved once (resolvedPinBounds),
-    // so the picker doesn't fold what the user marked keep-raw and every
-    // selector reads a pin as compression does. A chunk carries at most one
+    // so the picker doesn't fold what the user marked keep-raw, read as the
+    // selects read pins (selectsPinReading). A chunk carries at most one
     // of `pinned` (raw: a classic pin, or a level or cap of 0), `pinLevel` or
     // `pinMaxLevel`, so every reader of `pinned` agrees on what stays raw.
     // The last two appear only under the strategies that honor them
     // (kv-stable, kv-unified), which must be able to move the chunk to or
     // within its bound; elsewhere a bounded pin resolves to `pinned`. Built
     // once and reused.
-    const pinBounds = this.resolvedPinBounds(messages);
+    const pinBounds = this.resolvedPinBounds(messages, this.selectsPinReading());
 
     // O(1) summary lookup for findAncestorAt — avoids O(summaries) find()
     // calls during emission.
@@ -15955,7 +16440,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const positionOf = this.positionIndex(messages);
     // Without adaptive resolution no selector reads a pin's level bound, so
     // every pinned position resolves to raw (resolvedPinBounds).
-    const pinnedPositionsSet = this.forceRawPinPositions(messages);
+    const pinnedPositionsSet = this.forceRawPinPositions(messages, this.selectsPinReading());
     // Pinned messages between head and recent (head/recent pinned ones
     // already emit raw via Phase 0 / Phase 4).
     const pinnedInMiddle: { msg: StoredMessage; position: number }[] = [];
@@ -16743,10 +17228,33 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   // ============================================================================
 
   /**
+   * The positions compression leaves out for pins: raw both by the pins' ids
+   * and as the selects read them (`forceRawPinPositions`, `'ids'` and
+   * `selectsPinReading`). A part a pin's ids name that another pin's whole
+   * reading holds at a level isn't one, since the selects need its summary,
+   * and a part a pin covers only as the selects read it isn't either: its
+   * summary is what a narrowing sends. No chunk made while a position is in
+   * this set takes it (a chunk recorded before keeps its messages), so what
+   * relies on that reads it.
+   */
+  protected compressionPinnedPositions(messages: StoredMessage[]): Set<number> {
+    // Where the selects read pins by their ids too, the two sets are one.
+    if (this.selectsPinReading() === 'ids') return this.forceRawPinPositions(messages, 'ids');
+    const rawAsSelected = this.forceRawPinPositions(messages, this.selectsPinReading());
+    const out = new Set<number>();
+    for (const i of this.forceRawPinPositions(messages, 'ids')) if (rawAsSelected.has(i)) out.add(i);
+    return out;
+  }
+
+  /**
    * Get messages in the compressible zone: outside both head window and
    * recent window AND not kept raw by a pin. Returns messages from
    * [0, headStart) ∪ [headEnd, recentStart) minus any position a pin or
-   * document mark keeps raw (forceRawPinPositions). A pin with a positive
+   * document mark keeps raw both by its ids and as the selects read it
+   * (compressionPinnedPositions): of a message stored in parts, only the
+   * parts a pin's ids name stay out, though the selects send the whole
+   * message raw, and a part another pin's whole reading holds at a level
+   * comes in for its summary. A pin with a positive
    * level or cap is compressible where bounds are read (kv-stable and
    * kv-unified, with adaptive resolution: readsPinBounds): it renders at a
    * level, which only a summary can supply.
@@ -16756,7 +17264,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
     const recentStart = this.getRecentWindowStart(store);
-    const pinned = this.forceRawPinPositions(messages);
+    const pinned = this.compressionPinnedPositions(messages);
     const out: StoredMessage[] = [];
     for (let i = 0; i < recentStart; i++) {
       if (i >= headStart && i < headEnd) continue;
@@ -18034,6 +18542,137 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Where history starts in the store: the position of the first of `ids`
+   * still there (store order), or -1 when none is. A host can remove stored
+   * messages (agent-framework's Discord module does, on a delete or a history
+   * sync) while a summary over them, or a queued chunk holding them, lives
+   * on; -1 means nothing in the store says when that history happened.
+   */
+  protected startInStore(ids: Iterable<MessageId>, position: ReadonlyMap<MessageId, number>): number {
+    let start = -1;
+    for (const id of ids) {
+      const at = position.get(id);
+      if (at !== undefined && (start < 0 || at < start)) start = at;
+    }
+    return start;
+  }
+
+  /**
+   * Where a summary starts in the store: its first leaf message still there
+   * (expandSummaryToLeafMessageIds, startInStore), whether or not that is
+   * sourceRange.first; -1 when none is. The one rule for both recall sets, a
+   * compression request's and a merge's (1a), and for where a recall pair
+   * sits among them: a summary starting before the history being summarized
+   * is recalled, at its start. A summary with no message left isn't: its
+   * place is unknown, and its coverage holds no message out of the request.
+   */
+  protected summaryStartInStore(
+    summary: SummaryEntry,
+    position: ReadonlyMap<MessageId, number>,
+    summariesById: ReadonlyMap<string, SummaryEntry>,
+  ): number {
+    const leaves = new Set<MessageId>();
+    this.expandSummaryToLeafMessageIds(summary, summariesById, leaves);
+    return this.startInStore(leaves, position);
+  }
+
+  /**
+   * The head window a compression or merge request gives as context for the
+   * history it summarizes from `pos` on: the head in force when the message at
+   * `pos` was the newest, cut at `pos` and at the compression holds
+   * (holdBoundary). From the live head's start on, that is the live head,
+   * cut at `pos`, so a chunk inside the live head window (one a widened
+   * window grew over) no longer gets the head's messages after its start.
+   * A `pos` that's unknown (-1: none of the history's messages is left in
+   * the store, startInStore) gets no head: nothing in the store says when
+   * that history happened, and the live head may have come after it. Before
+   * the live head's start, it is the head starting at the latest topic
+   * transition message at or before `pos` (isTopicTransitionMessage, the test
+   * that restores the live head's start at a restart), or at the opening when
+   * there is none, ending by the walk the live head takes from its start
+   * (headWindowEndFrom). So history from before a head-window reset gets the
+   * head it followed: the opening, or the transition and opening of the topic
+   * it was in. There, a chunk that starts at a transition, or at the
+   * store's first message (the opening's own chunk, which a reset releases),
+   * gets none: nothing came before it.
+   *
+   * After a reset, these requests gave the new topic's opening ahead of the
+   * older history they summarize (#317), where section 1 of
+   * compressChunkHierarchical places the chronicle's opening "exactly where
+   * the original instance saw it" and keeps later events out.
+   *
+   * Three things it is, by choice:
+   * - Before the live head's start, where a head starts comes from the store
+   *   alone, as a restart reads it. A strategy-level resetHeadWindow to a
+   *   message that isn't a transition isn't in the store: history before that
+   *   message gets the latest transition before it, or the opening, as after a
+   *   restart. History from that message on gets the live head, which a
+   *   restart moves to the last transition in the store. So a restart gives
+   *   the same heads while the live head starts at the last transition in the
+   *   store.
+   * - A past head is priced with today's headWindowTokens and calibration, as
+   *   the live head is, and the ratchet guard (anchorHeadToCoverage) extends
+   *   it by today's chunk ownership, not by those in force when it was the
+   *   head.
+   * - Before the live head's start, any Context Manager message whose text
+   *   starts with "[Topic Transition]" starts a head, as the restart reads
+   *   one, whether or not resetHeadWindow wrote it.
+   */
+  protected headAsOf(store: MessageStoreView, pos: number): { start: number; end: number } {
+    return this.headsAsOf(store)(pos);
+  }
+
+  /**
+   * headAsOf for many positions in one store state, such as each queued chunk
+   * a count of queued work reads (requestCarriesToolBlocks): the live head's
+   * start, the holds and the live head's end are read once, the transitions
+   * before the live head's start once when a position before it is asked
+   * for, and each past head's end once per start. Tick's requests (through
+   * headAsOf) and the count both read heads here, so a subclass that changes
+   * heads overrides this.
+   */
+  protected headsAsOf(store: MessageStoreView): (pos: number) => { start: number; end: number } {
+    const liveStart = this.getHeadWindowStartIndex(store);
+    const hold = this.holdBoundary(store);
+    let liveEnd: number | undefined;
+    let messages: StoredMessage[] | undefined;
+    let transitions: number[] | undefined;
+    const pastEnds = new Map<number, number>();
+    return (pos) => {
+      if (pos < 0) return { start: liveStart, end: liveStart };
+      if (pos >= liveStart) {
+        liveEnd ??= this.getHeadWindowEnd(store);
+        return { start: liveStart, end: Math.min(liveEnd, hold, pos) };
+      }
+      messages ??= store.getAll();
+      if (!transitions) {
+        const found: number[] = [];
+        for (let i = 1; i < liveStart && i < messages.length; i++) {
+          if (this.isTopicTransitionMessage(messages[i])) found.push(i);
+        }
+        transitions = found;
+      }
+      // The latest transition at or before pos, or the opening.
+      let start = 0;
+      for (let lo = 0, hi = transitions.length - 1; lo <= hi;) {
+        const mid = (lo + hi) >> 1;
+        if (transitions[mid]! <= pos) {
+          start = transitions[mid]!;
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      let end = pastEnds.get(start);
+      if (end === undefined) {
+        end = this.headWindowEndFrom(store, messages, start);
+        pastEnds.set(start, end);
+      }
+      return { start, end: Math.min(end, hold, pos) };
+    };
+  }
+
+  /**
    * Index of the first message AFTER the head window.
    * Messages [headStart, headEnd) are sent raw, never summarized.
    *
@@ -18049,10 +18688,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * material (issue #122). See anchorHeadToCoverage.
    */
   protected getHeadWindowEnd(store: MessageStoreView): number {
-    if (this.config.headWindowTokens <= 0) return 0;
+    return this.headWindowEndFrom(store, store.getAll(), this.getHeadWindowStartIndex(store));
+  }
 
-    const messages = store.getAll();
-    const startIdx = this.getHeadWindowStartIndex(store);
+  /**
+   * Where a head window starting at `startIdx` ends, by the walk the live head
+   * window takes (getHeadWindowEnd): the live head's start, or a past head's
+   * (headAsOf).
+   */
+  protected headWindowEndFrom(store: MessageStoreView, messages: StoredMessage[], startIdx: number): number {
+    if (this.config.headWindowTokens <= 0) return 0;
     let tokens = 0;
 
     for (let i = startIdx; i < messages.length; i++) {

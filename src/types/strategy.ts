@@ -858,6 +858,71 @@ export interface CompressionQuarantineStatus {
   unreadable?: true;
 }
 
+/** Why a load's repair dropped a summary that held text (LoadRepairReport). */
+export type LoadRepairDropReason =
+  /**
+   * At L1, no copy or chunk record holds its sources as a list of ids;
+   * above L1, no one copy holds both its sources and its range.
+   */
+  | 'unreadable'
+  /** It names a summary the repaired state doesn't hold. */
+  | 'names-missing'
+  /** It names a summary at its own level or above. */
+  | 'names-not-below'
+  /** It names a summary it isn't the parent of. */
+  | 'names-non-child';
+
+/** One summary holding text that a load's repair dropped. */
+export interface LoadRepairDroppedSummary {
+  /** Its id as stored, as text. */
+  id: string;
+  /** Its `level` as stored; null where that isn't a number. */
+  level: number | null;
+  /** Its `tokens` as stored; null where that isn't a number. */
+  tokens: number | null;
+  reason: LoadRepairDropReason;
+  /**
+   * The messages it covered, by the range the repair held for it (the copy
+   * it chose for the summary's text, or another copy it rebuilt the summary
+   * from): the range's end ids, each with that message's stored time (ISO).
+   * A time is null where the strategy's message view doesn't give it: the
+   * store doesn't hold the message, the host's view filter leaves it out, or
+   * its time can't be read. The range is null where it isn't two message
+   * ids. An 'unreadable' drop can still have one, where what couldn't be read
+   * was its sources.
+   */
+  sourceRange: { first: string; last: string; firstAt: string | null; lastAt: string | null } | null;
+}
+
+/**
+ * What a load's repair of the summary state dropped, when it dropped a
+ * summary holding text (AutobiographicalStrategy.setLoadRepairHandler). It
+ * holds no summary text: the text dropped is read back from the store's
+ * history with `getStateJsonAt(stateId, sequenceBefore)` while `branch` is
+ * the store's current branch, since Chronicle reads a state at a sequence
+ * on the current branch only.
+ */
+export interface LoadRepairReport {
+  /** The namespace whose summary state was repaired. */
+  namespace: string;
+  /**
+   * The Chronicle branch the repair wrote on, by name. The read back at
+   * `sequenceBefore` gives the old summaries only with this branch current:
+   * on another, it gives that branch's state at that sequence.
+   */
+  branch: string;
+  /** The state the repair rewrote. */
+  stateId: string;
+  /** The branch's sequence just before the repair's write: the state there is the summaries as they were. */
+  sequenceBefore: number;
+  /** Each summary holding text that the repair dropped, in stored order. */
+  dropped: LoadRepairDroppedSummary[];
+  /** The sum of `dropped`'s tokens that are numbers. */
+  droppedTokens: number;
+  /** Empty summaries the same repair dropped, which held no text. */
+  emptyDropped: number;
+}
+
 /** One quarantined span: a chunk's messages, which stay raw while it's quarantined. */
 export interface CompressionQuarantineSpan {
   /** The span's identity: the hash of its chunk's message ids. */
@@ -2022,6 +2087,26 @@ export function getSummaryParentId(s: SummaryEntry): string | undefined {
  * how far the span folds instead, and where pins overlap at a message, one
  * bound holds it (see `level`), so a raw pin there might not keep it raw.
  *
+ * A message stored in parts (a long message that ingress splits under
+ * `adaptiveResolution`) counts as one where a pin is rendered: under adaptive
+ * resolution, an end inside one covers it from its first part to its last in
+ * the selects, the agent's view, less a part locked with `lockChunk` that the
+ * pin's ids don't name, where the lock holds. The summarizer's prompt reads a pin by its
+ * ids, as compression does, so a raw pin keeps out of compression only the
+ * parts its ids name (a part chunked before the pin was made stays in its
+ * chunk, as before), and the message's other parts are chunked and
+ * summarized like any history. A summary whose chunk runs past the message's
+ * edge goes out beside the raw message, so some of the message is sent twice.
+ * A pin with a fixed level reads whole too: under kv-unified, as for any
+ * pinned level, compiles fail until each part of the message in the middle
+ * (outside the head and recent windows) has the summary that level needs.
+ * When a compile can't hold the whole messages within its budget but can
+ * hold the rest with the pin narrowed to its ids, it narrows a pin it renders
+ * raw (one held at a level frees nothing narrowed) until the strategy loads
+ * the store again (an open, a branch switch, a fork or `setStrategy`), and
+ * warns. Nothing records the narrowing, so a store loaded again reads the
+ * pin whole.
+ *
  * - `kind: 'pin'` — generic protected range (any first/last span).
  * - `kind: 'document'` — typically a single message containing a body of
  *   information the agent wants to keep; semantically identical to a
@@ -2058,7 +2143,7 @@ export interface ProtectedRange {
    * conflict, and every compile fails until one does. Under
    * any other selector, and without adaptive resolution, the range is raw (a
    * safe superset). The canonical L1 compression prompt shows raw what the
-   * configured selector keeps raw, where its budgets allow (see
+   * configured selector keeps raw, reading pins by their ids, where its budgets allow (see
    * `compressionRecallBudgetTokens`); it doesn't hold a span at its pinned
    * level. Where pins overlap at a message, a bound takes a classic pin's
    * place there, `level` takes `maxLevel`'s, and the lowest of each kind

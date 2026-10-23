@@ -8,7 +8,8 @@
  * window too, in source order with the recall pairs; nothing else loses
  * coverage; the raw pins add is spent from the recall budget, and a
  * compression whose pinned raw can't fit it recalls what the pins override,
- * and says so. A pin resolves once, for compression and every selector.
+ * and says so. A pin's bounds resolve by one rule, for compression and every
+ * selector, in the reading each takes (resolvedPinBounds).
  */
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -225,7 +226,7 @@ describe('raw pins open only their own branch of the L1 recall frontier', () => 
     cm.close();
   });
 
-  it('a pin after the chunk being compressed opens nothing: its summary is recalled, as on main', async () => {
+  it('a pin after the chunk being compressed opens nothing, and its summary, which comes after the chunk, is not recalled (#317)', async () => {
     // A message the chunker skipped while it was pinned raw, then unpinned, is
     // compressed out of order, after the history that follows it.
     let skippedPin = '';
@@ -247,7 +248,9 @@ describe('raw pins open only their own branch of the L1 recall frontier', () => 
     const request = requests.find(compressing);
     assert.ok(request, 'setup: the skipped message was compressed');
     const texts = textsOf(request);
-    assert.ok(texts.includes(`[CM] Recall memory ${root.id}.`), 'the summary holding the later pin is recalled');
+    const rootFirst = ids.indexOf((root as unknown as { sourceRange: { first: string } }).sourceRange.first);
+    assert.ok(rootFirst > 30, `setup: the summary holding the later pin starts after the chunk (at ${rootFirst})`);
+    assert.ok(!texts.includes(`[CM] Recall memory ${root.id}.`), 'the summary holding the later pin, after the chunk, is not recalled: the request holds only what came before');
     assert.ok(!texts.includes(textOf.get(ids[100])!), 'the later pin adds no raw');
     cm.close();
   });
@@ -834,7 +837,7 @@ describe('the raw pins add is spent from the recall budget', () => {
   });
 });
 
-describe('a pin resolves once, for compression and every selector', () => {
+describe('a pin\'s bounds resolve by one rule, for compression and every selector', () => {
   const messages = Array.from({ length: 11 }, (_, i) => ({ id: `m${i}`, content: [] }));
   const pins: Array<Omit<ProtectedRange, 'firstMessageId' | 'lastMessageId' | 'kind' | 'created' | 'id'> & { at: number }> = [
     { at: 1 },                          // classic raw pin
@@ -854,10 +857,10 @@ describe('a pin resolves once, for compression and every selector', () => {
       id: `pin-${n}`, firstMessageId: `m${at}`, lastMessageId: `m${at}`, kind: 'pin', created: 0, ...bound,
     }));
     const internals = strategy as unknown as {
-      resolvedPinBounds(m: typeof messages): Map<number, unknown>;
-      forceRawPinPositions(m: typeof messages): Set<number>;
+      resolvedPinBounds(m: typeof messages, reading: 'ids' | 'whole'): Map<number, unknown>;
+      forceRawPinPositions(m: typeof messages, reading: 'ids' | 'whole'): Set<number>;
     };
-    return { bounds: internals.resolvedPinBounds(messages), raw: internals.forceRawPinPositions(messages) };
+    return { bounds: internals.resolvedPinBounds(messages, 'whole'), raw: internals.forceRawPinPositions(messages, 'whole') };
   };
 
   for (const foldingStrategy of ['kv-stable', 'kv-unified'] as const) {
