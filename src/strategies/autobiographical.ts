@@ -2198,9 +2198,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private runtimeTransitionPaceTokens: number | undefined;
   /** Diagnostics from the most recent dry-run select. Not persisted. */
   private _lastPreview: PreviewResult | undefined;
-  /** The last dry select's own render stats, which select() keeps apart from
-   *  the live ones for previewContext. */
-  private _lastPreviewStats: RenderStats | undefined;
+  /** The render stats the most recent select() recorded, live or dry
+   *  (getLastSelectStats). A dry select's are kept apart from the live ones
+   *  getRenderStats() returns. */
+  private _lastSelectStats: RenderStats | null = null;
   /** Set while a dry select runs: its chunking persists no chunk record. */
   private _dryRunSelect = false;
   /** Serializes previews against each other (see previewContext). */
@@ -2475,7 +2476,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return {
         ...preview,
         ...(opts?.render
-          ? { entries: rendered, stats: this._lastPreviewStats }
+          ? { entries: rendered, stats: this._lastSelectStats ?? undefined }
           : {}),
       };
     } finally {
@@ -2483,7 +2484,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._adaptivePicker = savedPicker;
       this._cachedHeadStartIndex = savedHeadCache;
       this._lastPreview = undefined;
-      this._lastPreviewStats = undefined;
       this._previewInFlight = false;
     }
   }
@@ -2854,6 +2854,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.transitionBlocked = undefined;
     this._rs = null;
     this._lastRenderStats = null;
+    this._lastSelectStats = null;
     this._lastCompileEstimate = 0;
     this._storeView = null;
     // Prices memoized over the view just cleared: the next one may estimate otherwise.
@@ -7730,9 +7731,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     budget: TokenBudget,
     opts?: SelectOptions
   ): ContextEntry[] {
+    // Only stats this select records are its own: on a throw before they're
+    // written, an earlier select's must not pose as this one's.
+    this._lastSelectStats = null;
     this.requireLoadedBranch('select');
     this._selectStartedAt = performance.now();
     this._selectMessages = store.length();
+    const lastRenderStats = this._lastRenderStats;
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     const _t0 = _diag ? Date.now() : 0;
     if (opts?.dryRun !== true) {
@@ -7749,6 +7754,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       } catch (err) {
         this._prevCacheKeys = prevCacheKeys;
         throw err;
+      } finally {
+        if (this._lastRenderStats !== lastRenderStats) this._lastSelectStats = this._lastRenderStats;
       }
     }
     // A dry run commits nothing, and that includes what a select leaves for
@@ -7768,8 +7775,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // than the one saved here (refreshStoreOrder). They are put back
     // here, on every path out, throws included; each select path gates its
     // own persistence and enqueueing. The dry run's own
-    // render stats are its output, as its plan is (_lastPreview), and
-    // previewContext reads them from _lastPreviewStats.
+    // render stats are its output, as its plan is (_lastPreview): they stay
+    // in _lastSelectStats, which previewContext and a compile read.
     // Chunking runs dry too: a chunk the dry run closes gets no record, and
     // the chunks, the compression queue and whether chunk records are trusted
     // (a dry rebuild at a preview's chunk size can read them as orphaned) go
@@ -7778,8 +7785,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // queue's generation: a call in flight must not read the dry rebuild as
     // one that re-queued its chunk (requeuePendingChunk).
     const restore = this.saveDryRunState(store);
-    const lastRenderStats = this._lastRenderStats;
-    this._lastPreviewStats = undefined;
     this._dryRunSelect = true;
     try {
       this.rebuildChunks(store);
@@ -7787,11 +7792,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return this.withToolPruning(store, () => this.selectPath(store, budget, opts));
     } finally {
       this._dryRunSelect = false;
-      // Only stats this dry run produced are its preview's: on a throw before
-      // they're written, the previous select's must not pose as the preview's.
-      if (this._lastRenderStats !== lastRenderStats) {
-        this._lastPreviewStats = this._lastRenderStats ?? undefined;
-      }
+      if (this._lastRenderStats !== lastRenderStats) this._lastSelectStats = this._lastRenderStats;
       restore();
     }
   }
@@ -8608,11 +8609,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * depend on the budget a compile is given, which this read isn't, so nothing
    * stands in for them before one: the pyramid of live summaries this used to
    * return instead was neither the hierarchical cut nor the adaptive one (#304,
-   * connectome-host#425). A dry run or preview records none (see `select()`).
+   * connectome-host#425). A dry run or preview leaves them as they were (see
+   * `select()`); its own stats come back with it.
    */
   getRenderStats(_store: MessageStoreView): RenderStats | null {
     this.requireLoadedBranch('getRenderStats');
     return this._lastRenderStats;
+  }
+
+  /**
+   * The stats the most recent `select()` on this branch recorded, live or
+   * dry, or null when it recorded none (it was refused). A compile reads them
+   * right after its select, so a dry compile's result carries its own stats,
+   * which `getRenderStats()` never returns.
+   */
+  getLastSelectStats(): RenderStats | null {
+    return this._lastSelectStats;
   }
 
   /**
