@@ -154,16 +154,19 @@ export function ceilingSetLimits(configured: ConfiguredImageLimits): { images: b
 /**
  * Which ceilings decide that an image is stripped: those whose limit it
  * passes (`over`) where the ceiling sets the window's limit (`ceilingSet`,
- * see ceilingSetLimits), when nothing else strips it. Something else strips
- * it when `strippedOtherwise` says so, as the host's depth limit or the
- * memory strategy's hysteresis watermark does, or when it also passes a
- * count or byte limit the host set itself and has in force, under its
- * ceiling. A limit the host set above its ceiling isn't in force: the
- * ceiling holds it, and the warning at initialize says so. Only a ceiling
- * that decides changes what the window keeps, so only that one says its
- * line. An image the watermark strips is the ceiling's when a ceiling's
- * move alone put it there; the memory strategy credits that from its record
- * of the move (applyImageStripping), not here.
+ * see ceilingSetLimits), when nothing else strips it. An image passes the
+ * count limit when the window already keeps that many, and the byte limit
+ * when it doesn't fit with what's kept, a single image bigger than the limit
+ * included. Something else strips it when `strippedOtherwise` says so, as
+ * the host's depth limit does, or when it also passes a count or byte limit
+ * the host set itself and has in force, under its ceiling. A limit the host
+ * set above its ceiling isn't in force: the ceiling holds it, and the
+ * warning at initialize says so. Only a ceiling that decides changes what
+ * the window keeps, so only that one says its line. With the memory
+ * strategy's `imageStripHysteresisRatio`, whose set decides in place of the
+ * limits, the strategy credits the set's images itself, not here: a ceiling
+ * decides an image the set strips when the set without the ceilings keeps
+ * it and the set with that ceiling alone strips it (ruleCeilingHits).
  */
 export function ceilingsDeciding(
   over: { images: boolean; bytes: boolean },
@@ -178,10 +181,7 @@ export function ceilingsDeciding(
  * The line a strategy says once for each ceiling, the first time that
  * ceiling decides that an image is stripped (see ceilingsDeciding): which
  * ceiling, at what value, and the window limit of 0 or above it that the
- * ceiling held, so an operator who set no limit sees where one now applies.
- * An image passes the count ceiling when the window already keeps the
- * ceiling's worth, and the byte ceiling when it doesn't fit with what's
- * kept, a single image bigger than the ceiling included.
+ * ceiling holds, so an operator who set no limit sees where one now applies.
  */
 export function ceilingBoundLine(
   strategy: string,
@@ -195,8 +195,8 @@ export function ceilingBoundLine(
     : ['imageByteCeiling', 'maxLiveImageBytes', configured.maxLiveImageBytes, showBytes] as const;
   const limit = asLimit(value) === 0 ? `${value} (no limit)` : show(asLimit(value));
   const mark = (name: string) => defaultMark(name, configured, defaulted);
-  return `[${strategy}] an image fell past ${ceilingName} ${show(ceiling[kind])}${mark(ceilingName)}, ` +
-    `which holds ${limitName} ${limit}${mark(limitName)} to it, so some images are now shown as placeholders`;
+  return `[${strategy}] ${ceilingName} ${show(ceiling[kind])}${mark(ceilingName)} ` +
+    `holds ${limitName} ${limit}${mark(limitName)} to it, so some images are now shown as placeholders`;
 }
 
 /**

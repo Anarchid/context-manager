@@ -380,8 +380,8 @@ export interface SelectOptions {
    * A compression hold ends at its deadline, whoever looks: the manager
    * releases an expired hold at any compile or hold query, a dry compile
    * included, and that release is the one thing a dry compile can leave.
-   * The release's committing rebuild includes any image-watermark advance;
-   * the dry select then restores the state it found after that rebuild.
+   * The release's rebuild commits; the dry select then restores the state it
+   * found after that rebuild.
    */
   dryRun?: boolean;
   /** Exact normalized tools/system/context-prefix identity supplied by the
@@ -446,7 +446,8 @@ export interface PreviewResult {
   /**
    * Segment breakdown (head / middle / tail / summaries-by-level) for the
    * HYPOTHETICAL compile. Also `{render:true}` only. Distinct from
-   * `getRenderStats()`, which continues to describe the live context.
+   * `getRenderStats()`, which describes the last live compile, or is null
+   * before one.
    */
   stats?: RenderStats;
 }
@@ -669,7 +670,7 @@ export interface SummaryOverviewStrategy extends ContextStrategy {
    * List summaries whose source message span overlaps `[fromMs, toMs]`
    * (both ends inclusive; either bound may be omitted for an open range).
    * Requires a `MessageStoreView` to resolve each summary's source message
-   * IDs to timestamps — same reason `getRenderStats` takes one.
+   * IDs to timestamps.
    */
   listSummariesInRange(
     store: MessageStoreView,
@@ -701,11 +702,14 @@ export interface CalibrationReset {
 }
 
 /**
- * Per-render observability stats from a strategy. Counts and token sums for
- * head / tail / summaries / pending work, suitable for TUIs and dashboards
- * that want to display "how much of the context is folded vs raw" at a
- * glance. Token sums use the strategy's own estimates so they line up with
- * the numbers `select()` uses for budget math.
+ * Per-render observability stats from a strategy, recorded by a compile as it
+ * emits each entry: any compile's from its `CompileResult.renderStats`, the
+ * last live compile's from `getRenderStats()`, a preview's from
+ * `previewContext(..., { render: true })`. Counts and token sums for head / tail / summaries /
+ * pending work, suitable for TUIs and dashboards that want to display "how
+ * much of the context is folded vs raw" at a glance. Token sums use the
+ * strategy's own estimates so they line up with the numbers `select()` uses
+ * for budget math.
  */
 export interface RenderStats {
   head: { messages: number; tokens: number };
@@ -815,10 +819,10 @@ export interface RenderStats {
     ceiling?: string;
     /** Set on a dry run or preview (`dryRun: true`, `previewContext`), which
      *  skips work a live compile does; logged as `dryRun=true`. Absent on a
-     *  live compile. A caller reads a dry pass's stats only from
-     *  `previewContext(..., { render: true })`'s `stats`: `compile()` returns
-     *  no stats, and a dry pass leaves `getRenderStats()` describing the last
-     *  live compile. */
+     *  live compile. A caller reads a dry pass's stats from its compile's
+     *  `CompileResult.renderStats`, or from `previewContext(..., { render:
+     *  true })`'s `stats`; a dry pass leaves `getRenderStats()` describing the
+     *  last live compile, or null before one. */
     dryRun?: true;
     /** Which chunks moved between which levels, and where this request's
      *  entries first differ from those of the last request the strategy
@@ -834,7 +838,15 @@ export interface RenderStats {
  * implement it simply have `ContextManager.getRenderStats()` return `null`.
  */
 export interface RenderStatsCapableStrategy extends ContextStrategy {
-  getRenderStats(store: MessageStoreView): RenderStats;
+  /** The stats of the last live compile, or null before one has run since
+   *  the strategy loaded its branch. */
+  getRenderStats(store: MessageStoreView): RenderStats | null;
+  /** The stats the strategy's most recent `select()` on its branch
+   *  recorded, live or dry, or null when it recorded none.
+   *  `ContextManager.compile` reads them right after its select for
+   *  `CompileResult.renderStats`; a strategy without this method gives
+   *  compiles none. */
+  getLastSelectStats?(): RenderStats | null;
 }
 
 /** Type guard for strategies that produce render stats. */
@@ -865,6 +877,71 @@ export interface CompressionQuarantineStatus {
    * its all-clear nor calls its handler until a read succeeds.
    */
   unreadable?: true;
+}
+
+/** Why a load's repair dropped a summary that held text (LoadRepairReport). */
+export type LoadRepairDropReason =
+  /**
+   * At L1, no copy or chunk record holds its sources as a list of ids;
+   * above L1, no one copy holds both its sources and its range.
+   */
+  | 'unreadable'
+  /** It names a summary the repaired state doesn't hold. */
+  | 'names-missing'
+  /** It names a summary at its own level or above. */
+  | 'names-not-below'
+  /** It names a summary it isn't the parent of. */
+  | 'names-non-child';
+
+/** One summary holding text that a load's repair dropped. */
+export interface LoadRepairDroppedSummary {
+  /** Its id as stored, as text. */
+  id: string;
+  /** Its `level` as stored; null where that isn't a number. */
+  level: number | null;
+  /** Its `tokens` as stored; null where that isn't a number. */
+  tokens: number | null;
+  reason: LoadRepairDropReason;
+  /**
+   * The messages it covered, by the range the repair held for it (the copy
+   * it chose for the summary's text, or another copy it rebuilt the summary
+   * from): the range's end ids, each with that message's stored time (ISO).
+   * A time is null where the strategy's message view doesn't give it: the
+   * store doesn't hold the message, the host's view filter leaves it out, or
+   * its time can't be read. The range is null where it isn't two message
+   * ids. An 'unreadable' drop can still have one, where what couldn't be read
+   * was its sources.
+   */
+  sourceRange: { first: string; last: string; firstAt: string | null; lastAt: string | null } | null;
+}
+
+/**
+ * What a load's repair of the summary state dropped, when it dropped a
+ * summary holding text (AutobiographicalStrategy.setLoadRepairHandler). It
+ * holds no summary text: the text dropped is read back from the store's
+ * history with `getStateJsonAt(stateId, sequenceBefore)` while `branch` is
+ * the store's current branch, since Chronicle reads a state at a sequence
+ * on the current branch only.
+ */
+export interface LoadRepairReport {
+  /** The namespace whose summary state was repaired. */
+  namespace: string;
+  /**
+   * The Chronicle branch the repair wrote on, by name. The read back at
+   * `sequenceBefore` gives the old summaries only with this branch current:
+   * on another, it gives that branch's state at that sequence.
+   */
+  branch: string;
+  /** The state the repair rewrote. */
+  stateId: string;
+  /** The branch's sequence just before the repair's write: the state there is the summaries as they were. */
+  sequenceBefore: number;
+  /** Each summary holding text that the repair dropped, in stored order. */
+  dropped: LoadRepairDroppedSummary[];
+  /** The sum of `dropped`'s tokens that are numbers. */
+  droppedTokens: number;
+  /** Empty summaries the same repair dropped, which held no text. */
+  emptyDropped: number;
 }
 
 /** One quarantined span: a chunk's messages, which stay raw while it's quarantined. */
@@ -1298,10 +1375,31 @@ export interface AutobiographicalConfig {
    * (`maxLiveImages`, `imageStripDepthTokens`, `maxLiveImageBytes`), each new
    * image strips the oldest live one, a change mid-history that invalidates
    * the prompt cache from that message on, on every image. With a ratio in
-   * (0, 1), a binding limit instead trims down to ratio × each limit and
-   * records a watermark (a message sequence, persisted): every image at or
-   * before it stays stripped, so the stripped set changes once per trim, not
-   * once per image. E.g. 0.7. Costs up to (1 - ratio) of the image budget.
+   * (0, 1), a binding limit instead trims down to ratio × each limit, so the
+   * stripped set changes once per trim, not once per image. E.g. 0.7. Costs
+   * up to (1 - ratio) of the image budget right after a trim, and a little
+   * more where ratio × a limit falls between whole images: a count target
+   * rounds down (`maxLiveImages: 4` at 0.7 keeps 2), and the byte and depth
+   * targets are met by stripping whole images.
+   *
+   * The set is computed from the stored messages, keeping no state of its
+   * own: they're replayed oldest first, and whenever a limit binds, the
+   * oldest live images are stripped one at a time until every limit fits
+   * ratio × itself. Within a message they go first to last, so the option
+   * keeps a message's last images, where the limits without it keep the first
+   * that fit: switching the option on can change which of a message's images
+   * stay, not only how many. A target that rounds to 0 is 0, but the newest image
+   * stays while it fits the full limits, so `maxLiveImages: 1` gets no
+   * headroom, and so do the other images of its message while only depth is
+   * over its target, since stripping them can't lower the depth they're at.
+   * A compile, a preview, a reopen and a fork at the same point give the
+   * same set, switching the option on later gives the set it would have
+   * had from the start, and a fold moves nothing. An edit or a removal of any
+   * message, text-only included, replays a different history, so it can
+   * strip or bring back images on either side of it; many of them are newer
+   * than the change, where the prompt is rewritten anyway. Depth is counted
+   * at the store's calibrated estimates, as the limits are counted without
+   * the option, so a calibration change can move the set as it moves theirs.
    */
   imageStripHysteresisRatio?: number;
 
@@ -1793,8 +1891,15 @@ export interface AutobiographicalConfig {
    * the result exceeds the model's context window — the philosophy is
    * "surface the overage rather than silently lose content."
    *
-   * Default: true (legacy budget-aware truncation: stops emitting recall
-   * pairs and recent messages when the running total exceeds maxTokens).
+   * Default: true. Selection targets the input budget (`budget.maxTokens`
+   * less `reserveForResponse`): it takes no summary past it, except one
+   * coverage completion must include so that no message goes unrepresented.
+   * Emission drops nothing to fit: past the grace window
+   * (`overBudgetGraceRatio`), the hierarchical path's head, its recall pairs
+   * (each positioned pair, or the combined pair under
+   * `positionedRecallPairs: false`) and its raw middle messages refuse the
+   * compile with `OverBudgetError`, and a recent-window eviction that would
+   * drop history no summary covers refuses it with `UncoveredDropError`.
    *
    * Recommended setting for long-lived agents on large-context models
    * (e.g. opus-4-7 with 1M context): false. The window is generous enough
