@@ -227,6 +227,8 @@ describe('estimator calibration band', () => {
     assert.deepStrictEqual([internals._calibration, internals._calibrationProvisional], [1, null]);
     // A first sample that only confirms the 1 writes nothing over it.
     strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.01);
+    const ema = (internals as unknown as { _calibrationEma: number | null })._calibrationEma;
+    assert.ok(ema !== null && Math.abs(ema - 1.002) < 0.001, `premise: the sample reached the EMA, got ${ema}`);
     assert.deepStrictEqual(internals.store!.getStateJson(internals.calibrationStateId), future);
     cm.close();
   });
@@ -758,9 +760,18 @@ describe('estimator calibration band', () => {
     first.cm.close();
     const { cm, strategy, internals } = await openManager('drop-declared');
     const declared = () => (internals as unknown as { _calibrationDeclared: boolean })._calibrationDeclared;
+    await cm.compile(BUDGET); // loads the seed, which fits this budget
+    assert.deepStrictEqual([internals._calibration, declared()], [1.45, true], 'premise: loaded, marked');
+    // A dry compile drops it too, in the dry compile only: select() puts the mark back.
+    const dry = await calibrationWarnings(() => cm.compile(tight, undefined, { dryRun: true }));
+    assert.equal(dry.result.renderStats!.calibration!.multiplier, 1, 'premise: the dry compile dropped it');
+    assert.deepStrictEqual([internals._calibration, declared()], [1.45, true], 'put back after the dry compile that dropped it');
     await calibrationWarnings(() => cm.compile(tight));
-    assert.equal(internals._calibration, 1, 'premise: the refused compile dropped it');
+    assert.equal(internals._calibration, 1);
+    assert.equal(cm.getRenderStats()!.calibration!.reset?.discardedMultiplier, 1.45, 'premise: the seeded 1.45 was loaded and dropped');
     assert.equal(declared(), false);
+    const dropped = internals.store!.getStateJson(internals.calibrationStateId) as { multiplier?: number; provisional?: boolean; declaredOverhead?: boolean };
+    assert.deepStrictEqual([dropped.multiplier, dropped.provisional, dropped.declaredOverhead], [1, true, undefined], 'the record the drop writes');
     // An undeclared sample confirming the 1 writes no mark either.
     strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.01);
     const saved = internals.store!.getStateJson(internals.calibrationStateId) as { multiplier?: number; declaredOverhead?: boolean };

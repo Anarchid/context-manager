@@ -14333,7 +14333,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * refusal, which it otherwise only reports.
    *
    * A binary from before a bump still learns after a rollback, and its first
-   * applied sample overwrites the newer epoch's record with its own stamp
+   * applied sample, or two declared samples that confirm and mark its 1,
+   * overwrite the newer epoch's record with its own stamp
    * (reportRealInputTokens); rolling forward again treats that as an older
    * record.
    */
@@ -14581,14 +14582,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // leaves it on disk and doesn't use it, and logs nothing, since
           // re-stamping it as the discard warning advises would destroy it.
           // This binary's learner still writes its own record over it on its
-          // first applied sample (see CALIBRATION_PRICING_EPOCH).
+          // first applied sample, or when two declared samples confirm and
+          // mark the 1 (see CALIBRATION_PRICING_EPOCH).
         } else if (!(typeof saved?.pricing === 'number' && saved.pricing > AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH)) {
           // No record, or none with a multiplier to use: nothing this store
           // kept says what its multiplier is, so its 1 is a guess, as a
           // discard's restart is, and the first sample the band accepts sets
           // it (#328). Learned, it would take the slowest path for the store
-          // with the least evidence, nine applied EMA steps to reach a true
-          // 1.4, each a reprice of every message and summary. Nothing is
+          // with the least evidence: for an undeclared caller nine applied
+          // EMA steps to reach a true 1.4, each a reprice of every message and
+          // summary, and for a declared one two samples, the first held.
+          // Nothing is
           // written: with no record, the next load decides the same, and the
           // first sample's write gives the stamp. A record from a newer epoch,
           // with a multiplier this binary can read or not, and a read that
@@ -14597,7 +14601,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // write over even when it only confirms the 1.
           this._calibrationProvisional = { fromEpoch: null };
         }
-      } catch { /* absent slot is fine */ }
+      } catch { /* a record the store can't read loads 1, not provisional: see the no-record branch above */ }
     }
     // A dry select changes the store's multiplier only where select() read it
     // first and can put it back (see MessageStoreView).
@@ -14625,8 +14629,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const reset: CalibrationReset = { discardedMultiplier: discarded, fromEpoch: provisional.fromEpoch, at: Date.now() };
     this._calibration = 1;
     this._calibrationReset = reset;
-    // The mark was about the multiplier dropped; the record below is written
-    // without it, and memory agrees.
+    // The mark was about the multiplier dropped, and goes with it, as the
+    // record below is written without it.
     this._calibrationDeclared = false;
     this.applyCalibration();
     if (dryRun) return true;

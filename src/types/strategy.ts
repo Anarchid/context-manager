@@ -747,7 +747,8 @@ export interface RenderStats {
    * than stepping toward it (see
    * `AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH`): one kept from a
    * record without a stamp, the 1 a discard restarts from, or the 1 a store
-   * with no calibration record starts from. A discard's 1 stays
+   * with no calibration record, or none with a multiplier to use, starts
+   * from. A discard's 1 stays
    * provisional through a later epoch's load, which re-stamps it whatever
    * that epoch repriced.
    * `reset` is present once a multiplier from an older or unknown epoch has
