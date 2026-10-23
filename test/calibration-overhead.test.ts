@@ -16,6 +16,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Membrane, MockAdapter, NativeFormatter, type ContentBlock, type ToolDefinition } from '@animalabs/membrane';
+import type { ContextInjection } from '../src/types/index.js';
+import type { RequestOverhead } from '../src/index.js';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { StoredMessage } from '../src/types/index.js';
 
@@ -82,8 +84,11 @@ describe('estimator calibration and request overhead (#323)', () => {
     const overhead = overheadPrice(cm, SYSTEM, tools);
     assert.ok(overhead > window * 0.4 && overhead < window * 0.7, `overhead ${overhead} vs window ${window}`);
     // Undeclared, this sample reads real/est ≈ 1.5: in band, so it would be
-    // learned as a per-token rate 50% above the truth.
+    // learned as a per-token rate 50% above the truth. Two samples, since a
+    // store's first declared sample is held until a second agrees.
     strategy.reportRealInputTokens(window + overhead, { system: SYSTEM, tools });
+    await cm.compile(BUDGET);
+    strategy.reportRealInputTokens(internals._lastCompileEstimate + overhead, { system: SYSTEM, tools });
     assert.equal(internals._calibration, 1);
     cm.close();
   });
@@ -191,6 +196,422 @@ describe('estimator calibration and request overhead (#323)', () => {
     assert.ok(internals._calibrationProvisional, 'and the load treats it as provisional');
     strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.3);
     assert.ok(Math.abs(internals._calibration - 1.3) <= 0.01, `replaced outright, got ${internals._calibration}`);
+    cm.close();
+  });
+});
+
+/** The store's price of some content, at its current multiplier. */
+function priceOf(cm: ContextManager, content: ContentBlock[]): number {
+  return (cm as unknown as { messageStore: { estimateTokens(m: StoredMessage): number } }).messageStore.estimateTokens({ content } as unknown as StoredMessage);
+}
+
+/** An injection at a position, of about `tokens` estimated tokens. */
+function injectionOf(position: 'beforeUser' | 'afterUser' | 'system', tokens: number): ContextInjection {
+  return { namespace: 'probe', position, content: [{ type: 'text', text: 'Retrieved knowledge. '.repeat(Math.ceil(tokens / 4)) }] };
+}
+
+type DeclaredInternals = Internals & { _calibrationDeclared: boolean; _calibrationArmed: boolean };
+const epoch = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
+
+async function seeded(name: string, record: Record<string, unknown>) {
+  const first = await openManager(name);
+  await first.cm.compile(BUDGET);
+  first.internals.store!.setStateJson(first.internals.calibrationStateId, record);
+  first.cm.close();
+  const opened = await openManager(name);
+  await opened.cm.compile(BUDGET);
+  return { ...opened, internals: opened.internals as DeclaredInternals };
+}
+
+/** Compile, then one sample at implied multiplier k, with system and tools declared or not. */
+async function sampleAt(cm: ContextManager, strategy: AutobiographicalStrategy, internals: Internals, k: number, declared: boolean): Promise<void> {
+  await cm.compile(BUDGET);
+  const m = internals._calibration;
+  const tools = toolsOf(internals._lastCompileEstimate / m / 2);
+  const rawWindow = internals._lastCompileEstimate / m;
+  const rawOverhead = overheadPrice(cm, SYSTEM, tools) / m;
+  strategy.reportRealInputTokens(k * (rawWindow + (declared ? rawOverhead : 0)), declared ? { system: SYSTEM, tools } : undefined);
+}
+
+const declaredOf = (internals: Internals) =>
+  (internals.store!.getStateJson(internals.calibrationStateId) as { declaredOverhead?: boolean } | null)?.declaredOverhead;
+
+describe('estimator calibration: what the compile adds among the messages', () => {
+  /** Two compiles with the injection, each sampled with system, tools and the injection in the provider's count. */
+  async function twoSamples(name: string, injection: (window: number) => ContextInjection) {
+    const { cm, strategy, internals } = await openManager(name);
+    await cm.compile(BUDGET);
+    const window = internals._lastCompileEstimate;
+    const inj = injection(window);
+    const tools = toolsOf(window / 2);
+    for (let i = 0; i < 2; i++) {
+      await cm.compile(BUDGET, [inj]);
+      assert.equal(internals._lastCompileEstimate, window, 'the window estimate leaves the injection out');
+      strategy.reportRealInputTokens(window + overheadPrice(cm, SYSTEM, tools) + priceOf(cm, inj.content), { system: SYSTEM, tools });
+    }
+    return { cm, internals, window, inj };
+  }
+
+  it('a message-position injection is priced into the sample: in band, it is not learned as a per-token rate', async () => {
+    const { cm, internals, window, inj } = await twoSamples('injected-in-band', (w) => injectionOf('afterUser', w / 2));
+    // Premise: priced as the window and the declared head alone, these samples read about 1.33.
+    assert.ok(priceOf(cm, inj.content) > window * 0.4, `injection ${priceOf(cm, inj.content)} vs window ${window}`);
+    assert.equal(internals._calibration, 1);
+    assert.equal(declaredOf(internals), true, 'both samples were taken, and agreed');
+    cm.close();
+  });
+
+  it('a large injection on a small window is not learned at the clamp', async () => {
+    const { cm, strategy, internals } = await openManager('injected-out-of-band');
+    await cm.compile(BUDGET);
+    const window = internals._lastCompileEstimate;
+    const injection = injectionOf('beforeUser', window * 3);
+    const tools = toolsOf(window / 2);
+    for (let i = 0; i < 4; i++) {
+      await cm.compile(BUDGET, [injection]);
+      strategy.reportRealInputTokens(internals._lastCompileEstimate + overheadPrice(cm, SYSTEM, tools) + priceOf(cm, injection.content), { system: SYSTEM, tools });
+    }
+    assert.equal(internals._calibration, 1);
+    assert.equal(declaredOf(internals), true, 'the samples were taken in band');
+    cm.close();
+  });
+
+  it('a dry compile between the compile and its sample leaves the compile\'s injection priced', async () => {
+    const { cm, strategy, internals } = await openManager('injected-dry');
+    await cm.compile(BUDGET);
+    const window = internals._lastCompileEstimate;
+    const injection = injectionOf('afterUser', window / 2);
+    const tools = toolsOf(window / 2);
+    for (let i = 0; i < 2; i++) {
+      await cm.compile(BUDGET, [injection]);
+      await cm.compile(BUDGET, undefined, { dryRun: true });
+      strategy.reportRealInputTokens(window + overheadPrice(cm, SYSTEM, tools) + priceOf(cm, injection.content), { system: SYSTEM, tools });
+    }
+    assert.equal(internals._calibration, 1);
+    assert.equal(declaredOf(internals), true, 'both samples were taken, and agreed');
+    cm.close();
+  });
+
+  it('a compile without injections prices none, after one with', async () => {
+    const { cm, strategy, internals } = await openManager('injected-then-none');
+    await cm.compile(BUDGET);
+    const window = internals._lastCompileEstimate;
+    const injection = injectionOf('afterUser', window / 2);
+    const tools = toolsOf(window / 2);
+    await cm.compile(BUDGET, [injection]);
+    strategy.reportRealInputTokens(window + overheadPrice(cm, SYSTEM, tools) + priceOf(cm, injection.content), { system: SYSTEM, tools });
+    await cm.compile(BUDGET);
+    strategy.reportRealInputTokens(internals._lastCompileEstimate + overheadPrice(cm, SYSTEM, tools), { system: SYSTEM, tools });
+    assert.equal(internals._calibration, 1);
+    assert.equal(declaredOf(internals), true, 'both samples were taken, and agreed');
+    cm.close();
+  });
+
+  it('a system-position injection is priced once, as part of the declared system prompt', async () => {
+    const { cm, strategy, internals } = await openManager('injected-system');
+    await cm.compile(BUDGET);
+    const window = internals._lastCompileEstimate;
+    const injection = injectionOf('system', window / 2);
+    const tools = toolsOf(window / 2);
+    for (let i = 0; i < 2; i++) {
+      const result = await cm.compile(BUDGET, [injection]);
+      // The caller appends systemInjections to its system prompt, and declares that.
+      const system = `${SYSTEM}\n${result.systemInjections.map((b) => (b as { text: string }).text).join('\n')}`;
+      strategy.reportRealInputTokens(internals._lastCompileEstimate + overheadPrice(cm, system, tools), { system, tools });
+    }
+    assert.equal(internals._calibration, 1);
+    assert.equal(declaredOf(internals), true, 'both samples were taken, and agreed');
+    cm.close();
+  });
+
+  it('a dry compile with injections leaves the committing compile\'s count', async () => {
+    const { cm, strategy, internals } = await openManager('dry-with-injections');
+    await cm.compile(BUDGET);
+    const window = internals._lastCompileEstimate;
+    const tools = toolsOf(window / 2);
+    for (let i = 0; i < 2; i++) {
+      await cm.compile(BUDGET);
+      await cm.compile(BUDGET, [injectionOf('afterUser', window / 2)], { dryRun: true });
+      strategy.reportRealInputTokens(internals._lastCompileEstimate + overheadPrice(cm, SYSTEM, tools), { system: SYSTEM, tools });
+    }
+    assert.equal(internals._calibration, 1);
+    assert.equal(declaredOf(internals), true, 'both samples were taken, and agreed');
+    cm.close();
+  });
+
+  it('several message-position injections are each priced', async () => {
+    const { cm, strategy, internals } = await openManager('two-injections');
+    await cm.compile(BUDGET);
+    const window = internals._lastCompileEstimate;
+    const injections = [injectionOf('beforeUser', window / 4), injectionOf('afterUser', window / 4)];
+    const tools = toolsOf(window / 2);
+    for (let i = 0; i < 2; i++) {
+      await cm.compile(BUDGET, injections);
+      const injected = injections.reduce((sum, inj) => sum + priceOf(cm, inj.content), 0);
+      strategy.reportRealInputTokens(internals._lastCompileEstimate + overheadPrice(cm, SYSTEM, tools) + injected, { system: SYSTEM, tools });
+    }
+    assert.equal(internals._calibration, 1);
+    assert.equal(declaredOf(internals), true, 'both samples were taken, and agreed');
+    cm.close();
+  });
+
+  it('an injection is priced at the multiplier in force, as the window is', async () => {
+    const { cm, strategy, internals } = await seeded('injected-calibrated', { multiplier: 1.5, at: 1, pricing: epoch, declaredOverhead: true });
+    assert.equal(internals._calibration, 1.5);
+    const tools = toolsOf(internals._lastCompileEstimate / 2);
+    const injection = injectionOf('afterUser', internals._lastCompileEstimate / 2);
+    await cm.compile(BUDGET, [injection]);
+    // A provider at k = 1.5: the window, the head and the injection, each at the store's price.
+    strategy.reportRealInputTokens(internals._lastCompileEstimate + overheadPrice(cm, SYSTEM, tools) + priceOf(cm, injection.content), { system: SYSTEM, tools });
+    assert.equal(internals._calibration, 1.5);
+    assert.equal((internals as unknown as { _calibrationEma: number | null })._calibrationEma, 1.5, 'the sample was taken');
+    cm.close();
+  });
+
+  it('an undeclared sample counts the injections too', async () => {
+    const { cm, strategy, internals } = await openManager('injected-undeclared');
+    await cm.compile(BUDGET);
+    const window = internals._lastCompileEstimate;
+    const injection = injectionOf('afterUser', window / 2);
+    await cm.compile(BUDGET, [injection]);
+    strategy.reportRealInputTokens(window + priceOf(cm, injection.content));
+    assert.equal(internals._calibration, 1);
+    assert.equal((internals as unknown as { _calibrationEma: number | null })._calibrationEma, 1, 'the sample was taken');
+    cm.close();
+  });
+
+  it('a system prompt alone is priced into the sample', async () => {
+    const { cm, strategy, internals } = await openManager('system-only');
+    await cm.compile(BUDGET);
+    const window = internals._lastCompileEstimate;
+    const system = `You are a resident. ${'Keep to your purpose. '.repeat(Math.ceil(window / 14))}`;
+    // Premise: left out, the samples read 1.25 to 1.7, inside the band, where they'd be learned.
+    const share = overheadPrice(cm, system, []) / window;
+    assert.ok(share > 0.25 && share < 0.7, `the system prompt is ${share} of the window`);
+    for (let i = 0; i < 2; i++) {
+      await cm.compile(BUDGET);
+      strategy.reportRealInputTokens(internals._lastCompileEstimate + overheadPrice(cm, system, []), { system });
+    }
+    assert.equal(internals._calibration, 1);
+    assert.equal(declaredOf(internals), true, 'both samples were taken, and agreed');
+    cm.close();
+  });
+});
+
+describe('estimator calibration: consistent out-of-band runs', () => {
+  /** Compile, then one declared sample at `ratio` of the compile's estimate. */
+  async function oob(cm: ContextManager, strategy: AutobiographicalStrategy, internals: Internals, ratio: number, declared = true) {
+    await cm.compile(BUDGET);
+    const nothingBesides: RequestOverhead = {}; // the package's type, from its root
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * ratio, declared ? nothingBesides : undefined);
+  }
+
+  it('an undeclared out-of-band sample ends a declared run', async () => {
+    const { cm, strategy, internals } = await openManager('undeclared-ends-run');
+    await oob(cm, strategy, internals, 2.1);
+    await oob(cm, strategy, internals, 2.1);
+    await oob(cm, strategy, internals, 2.1, false);
+    await oob(cm, strategy, internals, 2.1);
+    assert.equal(internals._calibration, 1);
+    await oob(cm, strategy, internals, 2.1);
+    await oob(cm, strategy, internals, 2.1);
+    assert.equal(internals._calibration, 1.8, 'a fresh run of three is learned');
+    cm.close();
+  });
+
+  it('a run agrees with its first sample: within 10% it is learned, and a drift past 10% of the first is not', async () => {
+    const drift = await openManager('run-drift');
+    for (const ratio of [2.0, 2.18, 2.38]) await oob(drift.cm, drift.strategy, drift.internals, ratio);
+    assert.equal(drift.internals._calibration, 1, 'each within 10% of the one before, the third 19% past the first');
+    drift.cm.close();
+    const near = await openManager('run-near');
+    for (const ratio of [2.0, 2.18, 2.08]) await oob(near.cm, near.strategy, near.internals, ratio);
+    assert.equal(near.internals._calibration, 1.8, 'each within 10% of the first');
+    near.cm.close();
+  });
+
+  it('a consistent run below the band is learned at the floor', async () => {
+    const { cm, strategy, internals } = await openManager('run-low');
+    for (let i = 0; i < 3; i++) await oob(cm, strategy, internals, 0.3);
+    assert.equal(internals._calibration, 0.6);
+    cm.close();
+  });
+
+  it('one compile counts once toward a run, however many reports follow it', async () => {
+    const { cm, strategy, internals } = await openManager('run-one-arm');
+    await cm.compile(BUDGET);
+    for (let i = 0; i < 3; i++) strategy.reportRealInputTokens(internals._lastCompileEstimate * 2.1, {});
+    assert.equal(internals._calibration, 1, 'three reports of one compile');
+    await oob(cm, strategy, internals, 2.1);
+    assert.equal(internals._calibration, 1, 'the second compile is the run\'s second sample');
+    await oob(cm, strategy, internals, 2.1);
+    assert.equal(internals._calibration, 1.8, 'the third compile is its third');
+    cm.close();
+  });
+
+  it('a branch switch starts a run afresh', async () => {
+    const { cm, strategy, internals } = await openManager('run-branch');
+    await oob(cm, strategy, internals, 2.1);
+    await oob(cm, strategy, internals, 2.1);
+    await cm.fork('other');
+    await oob(cm, strategy, internals, 2.1);
+    assert.equal(internals._calibration, 1);
+    assert.equal((internals as unknown as { _outOfBandRun: { count: number } | null })._outOfBandRun?.count, 1, 'the sample on the new branch starts a run');
+    cm.close();
+  });
+});
+
+describe('estimator calibration: a store that learned the overhead as a rate', () => {
+  it('two declared samples that agree replace a multiplier learned without them, by their mean', async () => {
+    const { cm, strategy, internals } = await seeded('learned-undeclared', { multiplier: 1.8, at: 1, pricing: epoch });
+    assert.equal(internals._calibration, 1.8);
+    await sampleAt(cm, strategy, internals, 1, true);
+    assert.equal(internals._calibration, 1.8, 'the first is held');
+    assert.equal(declaredOf(internals), undefined);
+    await sampleAt(cm, strategy, internals, 1.04, true);
+    assert.ok(Math.abs(internals._calibration - 1.02) <= 0.01, `replaced by the mean, got ${internals._calibration}`);
+    assert.equal(declaredOf(internals), true, 'and the record says its samples declare their overhead');
+    cm.close();
+  });
+
+  it('two declared samples that disagree step by the EMA, and mark the record declared', async () => {
+    const { cm, strategy, internals } = await seeded('learned-disagree', { multiplier: 1.8, at: 1, pricing: epoch });
+    await sampleAt(cm, strategy, internals, 1, true);
+    await sampleAt(cm, strategy, internals, 1.5, true);
+    assert.ok(Math.abs(internals._calibration - 1.74) <= 0.01, `stepped toward the second, got ${internals._calibration}`);
+    assert.equal(declaredOf(internals), true);
+    await sampleAt(cm, strategy, internals, 1, true);
+    assert.ok(Math.abs(internals._calibration - 1.592) <= 0.01, `then steps by the EMA, got ${internals._calibration}`);
+    cm.close();
+  });
+
+  it('a branch switch between the two loses the held sample', async () => {
+    const { cm, strategy, internals } = await seeded('held-branch', { multiplier: 1.8, at: 1, pricing: epoch });
+    await sampleAt(cm, strategy, internals, 1, true);
+    await cm.fork('other');
+    await cm.compile(BUDGET);
+    assert.equal(internals._calibration, 1.8, 'the fork has the record');
+    await sampleAt(cm, strategy, internals, 1, true);
+    assert.equal(internals._calibration, 1.8, 'held, not paired with the other branch\'s sample');
+    assert.notEqual((internals as unknown as { _declaredCandidate: number | null })._declaredCandidate, null, 'and held afresh');
+    cm.close();
+  });
+
+  it('a consistent run between the two ends the held sample', async () => {
+    const { cm, strategy, internals } = await seeded('held-run', { multiplier: 1, at: 1, pricing: epoch });
+    await sampleAt(cm, strategy, internals, 1, true);
+    for (let i = 0; i < 3; i++) {
+      await cm.compile(BUDGET);
+      strategy.reportRealInputTokens(internals._lastCompileEstimate * 2.1, {});
+    }
+    assert.equal(internals._calibration, 1.8, 'the run is learned');
+    await sampleAt(cm, strategy, internals, 1.5, false);
+    assert.ok(Math.abs(internals._calibration - 1.74) <= 0.01, `an undeclared sample steps and unmarks, got ${internals._calibration}`);
+    await sampleAt(cm, strategy, internals, 1, true);
+    assert.ok(Math.abs(internals._calibration - 1.74) <= 0.01, `held, not paired with the sample from before the run, got ${internals._calibration}`);
+    cm.close();
+  });
+
+  it('a restart between the two loses the held sample: it starts over, and the record is not marked', async () => {
+    const first = await seeded('held-restart', { multiplier: 1.8, at: 1, pricing: epoch });
+    await sampleAt(first.cm, first.strategy, first.internals, 1, true);
+    first.cm.close();
+    const { cm, strategy, internals } = await openManager('held-restart');
+    await cm.compile(BUDGET);
+    const typed = internals as DeclaredInternals;
+    assert.deepEqual([internals._calibration, typed._calibrationDeclared, declaredOf(internals)], [1.8, false, undefined]);
+    await sampleAt(cm, strategy, internals, 1, true);
+    assert.equal(internals._calibration, 1.8, 'held again');
+    await sampleAt(cm, strategy, internals, 1, true);
+    assert.ok(Math.abs(internals._calibration - 1) <= 0.02, `then replaced, got ${internals._calibration}`);
+    cm.close();
+  });
+
+  it('a multiplier learned from declared samples steps by the EMA', async () => {
+    const { cm, strategy, internals } = await seeded('learned-declared', { multiplier: 1.8, at: 1, pricing: epoch, declaredOverhead: true });
+    await sampleAt(cm, strategy, internals, 1, true);
+    assert.ok(Math.abs(internals._calibration - 1.64) <= 0.01, `stepped, got ${internals._calibration}`);
+    cm.close();
+  });
+
+  it('after the replacement, a restart steps by the EMA', async () => {
+    const first = await seeded('declared-restart', { multiplier: 1.8, at: 1, pricing: epoch });
+    await sampleAt(first.cm, first.strategy, first.internals, 1, true);
+    await sampleAt(first.cm, first.strategy, first.internals, 1, true);
+    first.cm.close();
+    const { cm, strategy, internals } = await openManager('declared-restart');
+    await cm.compile(BUDGET);
+    await sampleAt(cm, strategy, internals, 1.3, true);
+    assert.ok(Math.abs(internals._calibration - 1.06) <= 0.01, `stepped, got ${internals._calibration}`);
+    cm.close();
+  });
+
+  it('an undeclared sample that moves the multiplier unmarks the record, and the next two declared replace it', async () => {
+    const { cm, strategy, internals } = await seeded('undeclared-after-declared', { multiplier: 1, at: 1, pricing: epoch, declaredOverhead: true });
+    await sampleAt(cm, strategy, internals, 1.5, false);
+    assert.ok(internals._calibration > 1.05, `the undeclared sample stepped, got ${internals._calibration}`);
+    assert.equal(declaredOf(internals), undefined);
+    await sampleAt(cm, strategy, internals, 1, true);
+    await sampleAt(cm, strategy, internals, 1, true);
+    assert.ok(Math.abs(internals._calibration - 1) <= 0.02, `replaced, got ${internals._calibration}`);
+    cm.close();
+  });
+
+  it('two declared samples that confirm the multiplier mark the record declared', async () => {
+    const { cm, strategy, internals } = await seeded('confirmed-declared', { multiplier: 1, at: 1, pricing: epoch });
+    await sampleAt(cm, strategy, internals, 1, true);
+    await sampleAt(cm, strategy, internals, 1, true);
+    assert.equal(internals._calibration, 1);
+    assert.equal(declaredOf(internals), true);
+    await sampleAt(cm, strategy, internals, 1.5, true);
+    assert.ok(Math.abs(internals._calibration - 1.1) <= 0.01, `stepped, got ${internals._calibration}`);
+    cm.close();
+  });
+
+  it('a provisional multiplier is replaced by one declared sample, and marked declared', async () => {
+    const { cm, strategy, internals } = await seeded('provisional-declared', { multiplier: 1, at: 1, pricing: epoch, provisional: true });
+    await sampleAt(cm, strategy, internals, 1, true);
+    const saved = internals.store!.getStateJson(internals.calibrationStateId) as { provisional?: boolean; declaredOverhead?: boolean };
+    assert.deepEqual([saved.provisional, saved.declaredOverhead], [undefined, true]);
+    cm.close();
+  });
+
+  it('a dry compile after the load keeps a record\'s declared overhead', async () => {
+    const { cm, strategy, internals } = await seeded('declared-dry', { multiplier: 1.8, at: 1, pricing: epoch, declaredOverhead: true });
+    await cm.compile(BUDGET, undefined, { dryRun: true });
+    assert.equal(internals._calibrationDeclared, true);
+    await sampleAt(cm, strategy, internals, 1, true);
+    assert.ok(Math.abs(internals._calibration - 1.64) <= 0.01, `stepped, not held, got ${internals._calibration}`);
+    cm.close();
+  });
+
+  it('an undeclared sample inside the dead band leaves a record marked, and a rejected declared one leaves it unmarked', async () => {
+    const marked = await seeded('deadband-undeclared', { multiplier: 1, at: 1, pricing: epoch, declaredOverhead: true });
+    await sampleAt(marked.cm, marked.strategy, marked.internals, 1.01, false);
+    assert.deepEqual([marked.internals._calibration, marked.internals._calibrationDeclared, declaredOf(marked.internals)], [1, true, true]);
+    marked.cm.close();
+    const unmarked = await seeded('rejected-declared', { multiplier: 1, at: 1, pricing: epoch });
+    await unmarked.cm.compile(BUDGET);
+    unmarked.strategy.reportRealInputTokens(unmarked.internals._lastCompileEstimate * 2.1, {});
+    assert.deepEqual([unmarked.internals._calibration, unmarked.internals._calibrationDeclared, declaredOf(unmarked.internals)], [1, false, undefined]);
+    unmarked.cm.close();
+  });
+
+  it('a null overhead from a JS caller counts as undeclared', async () => {
+    const { cm, strategy, internals } = await seeded('null-overhead', { multiplier: 1, at: 1, pricing: epoch });
+    await cm.compile(BUDGET);
+    strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.5, null as unknown as RequestOverhead);
+    assert.ok(Math.abs(internals._calibration - 1.1) <= 0.01, `stepped as undeclared, not held, got ${internals._calibration}`);
+    assert.deepEqual([internals._calibrationDeclared, declaredOf(internals)], [false, undefined]);
+    cm.close();
+  });
+
+  it('a re-stamp keeps a record\'s declared overhead', async () => {
+    const { cm, internals } = await seeded('restamp-declared', { multiplier: 1.2, at: 1, pricing: epoch - 1, declaredOverhead: true });
+    const saved = internals.store!.getStateJson(internals.calibrationStateId) as { pricing?: number; declaredOverhead?: boolean };
+    assert.equal(saved.pricing, epoch, 're-stamped');
+    assert.equal(saved.declaredOverhead, true);
+    assert.equal(internals._calibrationDeclared, true);
     cm.close();
   });
 });
