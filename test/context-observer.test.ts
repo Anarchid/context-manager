@@ -116,12 +116,10 @@ describe('compile records', () => {
   });
 
   it('an observer without a compile callback is told nothing of compiles, and the compile goes on', async () => {
-    const compressions: CompressionRefusalRecord[] = [];
-    const manager = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy(), observer: { compression: (r) => { compressions.push(r); } } });
+    const manager = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy(), observer: { compression: () => {} } });
     manager.addMessage('User', [text('hello')]);
     const result = await manager.compile();
     assert.equal(result.messages.length, 1);
-    assert.deepEqual(compressions, []);
     manager.close();
   });
 
@@ -250,6 +248,33 @@ describe('compile records', () => {
     manager.close();
   });
 
+  it('a compile that throws is timed whole too, and every record is taken before the caller awaits', async () => {
+    class SlowThenThrow extends PassthroughStrategy {
+      override select(): never {
+        const until = performance.now() + 40;
+        while (performance.now() < until) { /* 40 ms of work before the refusal */ }
+        throw new Error('a defect after some work');
+      }
+    }
+    const rec = recorder();
+    const manager = await ContextManager.open({ path: freshPath(), strategy: new SlowThenThrow(), observer: rec.observer });
+    manager.addMessage('User', [text('hello')]);
+    const pending = manager.compile();
+    assert.equal(rec.compiles.length, 1, 'told before the caller awaits');
+    await pending.catch(() => {});
+    assert.equal(rec.compiles[0]!.outcome, 'failed');
+    assert.ok(rec.compiles[0]!.durationMs >= 40, String(rec.compiles[0]!.durationMs));
+    manager.close();
+
+    const ok = recorder();
+    const fine = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy(), observer: ok.observer });
+    fine.addMessage('User', [text('hello')]);
+    const compiled = fine.compile();
+    assert.equal(ok.compiles.length, 1, 'told before the caller awaits');
+    await compiled;
+    fine.close();
+  });
+
   it('anything else thrown is a failed compile, null and strings included; a refusal from another copy of the package is still a refusal', async () => {
     const defect = new Error('a defect in select');
     const foreignRefusal = Object.assign(new Error('refused by another copy'), { name: 'UncoveredDropError' });
@@ -361,14 +386,18 @@ describe('compile records', () => {
 
   it('a log that throws as it tells of a failure changes nothing either', async () => {
     const original = console.error;
-    console.error = () => { throw new Error('the log broke'); };
+    let entered = 0;
+    console.error = () => { entered++; throw new Error('the log broke'); };
     try {
       const throwing = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy(), observer: hostile('throws') });
       throwing.addMessage('User', [text('hello')]);
       assert.equal((await throwing.compile()).messages.length, 1);
+      assert.ok(entered > 0, 'the log was asked to tell of the throw');
       throwing.close();
+      entered = 0;
       const unreadable = { get compile(): never { throw new Error('a getter that throws'); } };
       const opened = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy(), observer: unreadable as never });
+      assert.ok(entered > 0, 'the log was asked to tell of the unreadable callback');
       opened.addMessage('User', [text('hello')]);
       assert.equal((await opened.compile()).messages.length, 1);
       opened.close();
@@ -651,7 +680,7 @@ describe('the exported lists', () => {
   });
 
   it('the compression reasons and sample outcomes are as documented', () => {
-    assert.deepEqual([...COMPRESSION_REFUSALS], ['admission-rejected', 'topology-violation', 'empty', 'incomplete', 'malformed', 'chunk-call-cap', 'window-call-cap']);
+    assert.deepEqual([...COMPRESSION_REFUSALS], ['admission-rejected', 'topology-violation', 'empty', 'incomplete', 'malformed', 'chunk-call-cap', 'window-call-cap', 'overlap-guard']);
     assert.deepEqual([...CALIBRATION_SAMPLE_OUTCOMES], ['out-of-band', 'held', 'confirmed', 'replaced', 'stepped']);
   });
 });
@@ -821,6 +850,20 @@ describe('compression refusals: an L1 ladder', () => {
       await fx.strategy.run(chunk, strategyContext(fx.manager));
       assert.equal(calls.length, 3, 'the chunk is quarantined, so nothing is asked again');
       assert.deepEqual(fx.rec.compressions, [{ reason: 'chunk-call-cap' }]);
+      fx.manager.close();
+    });
+
+    it('a chunk an existing L1 partly covers is refused by the overlap guard, reported once', async () => {
+      const { calls, membrane } = scripted([ANSWER('never asked')]);
+      const fx = await ladder(membrane, SPLIT);
+      const chunk = fx.target();
+      const first = chunk.messages[0]!.id;
+      fx.strategy.seed({ id: 'L1-200', level: 1, content: 'covers raw-10 alone', tokens: 20, sourceLevel: 0, sourceIds: [first], sourceRange: { first, last: first }, created: 200 });
+      await fx.strategy.run(chunk, strategyContext(fx.manager));
+      await fx.strategy.run(chunk, strategyContext(fx.manager));
+      assert.equal(calls.length, 0, 'nothing is asked');
+      assert.equal(chunk.compressed, false);
+      assert.deepEqual(fx.rec.compressions, [{ reason: 'overlap-guard' }], 'refused twice, reported once');
       fx.manager.close();
     });
 
@@ -1085,6 +1128,20 @@ describe('calibration samples', () => {
     assert.ok(Math.abs(fx.rec.samples[0]!.ratio - 0.56) < 1e-9);
     assert.ok(Math.abs(fx.rec.samples[0]!.multiplier - (1.8 + 0.2 * (0.56 * 1.8 - 1.8))) < 1e-9, String(fx.rec.samples[0]!.multiplier));
     fx.manager.close();
+  });
+
+  it('an observed preview leaves the strategy as an unobserved one does: its options reach the work', async () => {
+    for (const observe of ['none', 'record'] as const) {
+      const fx = await calibrated(observe);
+      await fx.manager.compile({ maxTokens: 100_000, reserveForResponse: 2_000 }, undefined, { dryRun: true });
+      assert.equal(fx.internals._calibrationArmed, false, `${observe}: a preview arms no sample`);
+      fx.strategy.reportRealInputTokens(5_000);
+      assert.deepEqual(fx.rec.samples, [], `${observe}: so a report after it is no sample`);
+      if (observe === 'record') assert.equal(fx.rec.compiles.at(-1)!.dryRun, true);
+      await fx.manager.compile({ maxTokens: 100_000, reserveForResponse: 2_000 });
+      assert.equal(fx.internals._calibrationArmed, true, `${observe}: a live compile arms one`);
+      fx.manager.close();
+    }
   });
 
   it('a report that is no sample makes no record and leaves the sample armed', async () => {

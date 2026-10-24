@@ -148,8 +148,10 @@ interface ContextManagerBaseConfig {
    * `ContextObserver`). The manager hands it to its strategy in
    * `StrategyContext`. It's called synchronously, and what it throws or
    * rejects never reaches the work: the manager logs a callback's first
-   * failure through its diagnostics and drops the rest. A record's error and
-   * render stats are the objects the caller gets, so treat them as read-only.
+   * failure through its diagnostics and drops the rest. (A returned native
+   * promise whose `constructor` or species getter throws can't be handled
+   * from JavaScript; see `ContextObserver`.) A record's error and render
+   * stats are the objects the caller gets, so treat them as read-only.
    */
   observer?: ContextObserver;
   /**
@@ -1181,7 +1183,9 @@ export class ContextManager {
   // ==========================================================================
 
   /**
-   * Check if compile() will block waiting for background work.
+   * Whether the strategy has no background work pending (its
+   * `checkReadiness()`). compile() doesn't wait for that work: it compiles
+   * from what's there.
    */
   isReady(): boolean {
     this.requireInitialized('isReady');
@@ -1222,7 +1226,7 @@ export class ContextManager {
    * With `ContextManagerConfig.observer`, it tells the observer of the
    * compile as it returns or throws (`ContextObserver.compile`).
    *
-   * May block if strategy has pending work.
+   * It awaits nothing, so it doesn't wait for the strategy's background work.
    */
   async compile(
     budget?: TokenBudget,

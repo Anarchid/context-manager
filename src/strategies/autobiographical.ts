@@ -1128,9 +1128,9 @@ type CompressionAttemptOutcome =
 /**
  * The refusal an outcome is when context-manager itself made it (see
  * `COMPRESSION_REFUSALS`), or nothing. A provider's refusal, and an error it
- * returned or a run of them decided, are membrane's to report; a response's
- * shape is context-manager's verdict (`assessFallbackCompressionResponse`'s
- * `malformed_*`).
+ * returned or a run of them decided, are the provider's decisions, which
+ * context-manager doesn't report; a response's shape is context-manager's
+ * verdict (`assessFallbackCompressionResponse`'s `malformed_*`).
  */
 function ownCompressionRefusal(outcome: CompressionAttemptOutcome, errorType?: string): CompressionRefusal | undefined {
   switch (outcome) {
@@ -9155,6 +9155,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const key = chunk.recordId ?? chunkIdKey;
       if (!this._overlapBlocked.has(key)) {
         this._overlapBlocked.add(key);
+        this.hostContext?.observer?.compression?.({ reason: 'overlap-guard' });
         this.diag.error(
           `[autobiographical] OVERLAP GUARD: refusing to compress chunk ` +
           `${chunk.recordId ?? `#${chunk.index}`} — ${overlapIds.length}/${chunk.messages.length} ` +

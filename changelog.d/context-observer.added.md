@@ -5,8 +5,11 @@
   called synchronously. What it throws or rejects never reaches the work: the
   manager logs a callback's first failure once through its diagnostics and
   drops the rest, so a compile's result is the same with an observer as
-  without one. A record's error and render stats are the objects the caller
-  gets, so an observer treats them as read-only.
+  without one. The one exception is a returned native promise whose
+  `constructor` or species getter throws, which no JavaScript can handle: that
+  throw is logged, and the promise's rejection goes unhandled. A record's
+  error and render stats are the objects the caller gets, so an observer
+  treats them as read-only.
   - `compile(record)`, once per `compile()`: the strategy, `dryRun`,
     `startedAt` on the wall clock (`Date.now()`), the whole compile's
     `durationMs` on the monotonic clock, `outcome` (`'compiled'`, `'refused'`
@@ -14,9 +17,10 @@
     and a compiled compile's `renderStats`, the object its result holds.
   - `compression(record)`: a `reason` from `COMPRESSION_REFUSALS`
     (`'admission-rejected'`, `'topology-violation'`, `'empty'`, `'incomplete'`,
-    `'malformed'`, and the split rung's caps, `'chunk-call-cap'` and
-    `'window-call-cap'`). A provider's refusal or error on a compression call
-    isn't one of these.
+    `'malformed'`, the split rung's caps, `'chunk-call-cap'` and
+    `'window-call-cap'`, and `'overlap-guard'`, a chunk refused because an L1
+    already covers part of it). A provider's refusal or error on a compression
+    call isn't one of these.
   - `calibration(record)`, once per sample `reportRealInputTokens` takes: an
     `outcome` from `CALIBRATION_SAMPLE_OUTCOMES` (`'out-of-band'`, `'held'`,
     `'confirmed'`, `'replaced'`, `'stepped'`), the `ratio`, and the

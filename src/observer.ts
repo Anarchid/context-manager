@@ -25,8 +25,8 @@ export type CompileRefusal = typeof COMPILE_REFUSALS[number];
 
 /**
  * Context-manager's own refusals of compression, from a closed list. A
- * provider's refusal or error on a compression call is membrane's fact, not
- * one of these:
+ * provider's refusal or error on a compression call is the provider's
+ * decision, not one of these:
  * - `'admission-rejected'`: the request didn't fit `compressionContextBudgetTokens`,
  *   so no call was made.
  * - `'topology-violation'`: a merge's sources don't make a group it can
@@ -47,8 +47,14 @@ export type CompileRefusal = typeof COMPILE_REFUSALS[number];
  * - `'window-call-cap'`: the split rung's attempt alone used every call its
  *   ten-minute window allows (`compressionSplitMaxCallsPer10Min`), so it ended
  *   before another call.
+ * - `'overlap-guard'`: a chunk's messages are partly covered by an L1 that
+ *   already exists, which only damaged bookkeeping or store surgery leaves,
+ *   so the strategy refuses to compress it rather than mint a duplicate
+ *   memory. It's refused on every attempt while the overlap stands, and
+ *   reported once per chunk until the strategy loads its state again (an
+ *   open, a branch switch), as its log line is.
  *
- * Each is reported once per decision. A verdict on an answer the L1 ladder
+ * The rest are reported once per decision. A verdict on an answer the L1 ladder
  * keeps in its saved progress isn't decided again when the ladder resumes,
  * so it isn't reported again; an admission rejection makes no call, so
  * progress keeps none, and each ladder run that reaches it decides and
@@ -64,6 +70,7 @@ export const COMPRESSION_REFUSALS = [
   'malformed',
   'chunk-call-cap',
   'window-call-cap',
+  'overlap-guard',
 ] as const;
 
 /** A reason of {@link COMPRESSION_REFUSALS}. */
@@ -133,8 +140,12 @@ export interface CalibrationSampleRecord {
  * Called synchronously as each fact happens, each callback optional. What
  * it throws, or a promise it returns that rejects, never reaches the work it
  * observes: the manager logs a callback's first failure through its
- * diagnostics, and drops the rest. A record's error and render stats are the
- * objects the caller gets, so an observer treats them as read-only.
+ * diagnostics, and drops the rest. The one exception is a returned native
+ * promise whose `constructor` or species getter throws: no JavaScript can
+ * attach a handler to it, so that throw is logged and the promise's own
+ * rejection, if it rejects, goes unhandled. A record's error and render
+ * stats are the objects the caller gets, so an observer treats them as
+ * read-only.
  */
 export interface ContextObserver {
   compile?(record: CompileRecord): void;
@@ -152,7 +163,7 @@ export interface ContextObserver {
  */
 export function isolateObserver(
   observer: ContextObserver,
-  failed: (callback: keyof ContextObserver, error: unknown) => void = () => {},
+  failed: (callback: keyof ContextObserver, error: unknown) => void,
 ): ContextObserver {
   const isolated: ContextObserver = {};
   const told = new Set<keyof ContextObserver>();
