@@ -8,6 +8,7 @@ import type {
   PendingWork,
 } from './context.js';
 import type { OverBudgetClearedBy } from '../adaptive/picker.js';
+import type { ContextObserver } from '../observer.js';
 import { DEFAULT_IMAGE_BYTE_CEILING, DEFAULT_IMAGE_CEILING } from '../live-image-limits.js';
 
 /**
@@ -114,6 +115,12 @@ export interface StrategyContext {
    * CompressionWithdrawn).
    */
   membrane?: Membrane;
+  /**
+   * The host's observer (`ContextManagerConfig.observer`), already isolated:
+   * a strategy reports its compression refusals and calibration samples to it
+   * and needs no guard of its own. Absent when the host gave none.
+   */
+  observer?: ContextObserver;
   /** Current sequence number */
   currentSequence: Sequence;
   /**
