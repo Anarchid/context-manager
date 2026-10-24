@@ -13042,10 +13042,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (this.pins.length === 0) return undefined;
     const messages = store.getAll();
     const raw = this.forceRawPinPositions(messages);
+    // A message of system changes stays raw whatever the pins (resolvedPinBounds), so unpinning frees none of it.
+    const changes = new Set(systemChangePositions(messages));
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
     const tailStart = Math.max(this.getRecentWindowStart(store), headEnd);
-    const kept = (i: number): boolean => raw.has(i) && i < tailStart && !(i >= headStart && i < headEnd);
+    const kept = (i: number): boolean => raw.has(i) && !changes.has(i) && i < tailStart && !(i >= headStart && i < headEnd);
 
     let tokens = 0;
     for (const i of raw) if (kept(i)) tokens += price(i);
