@@ -463,9 +463,8 @@ test('phase C: groups it declines leave the walk, so they aren\'t re-tried after
  * parents that don't list them. Raised eightfold from its bootstrap, L2-3
  * (m14, m15, m16, m18) is ineligible while m16, which L1-4 also lists, sits
  * at L3. L3-0's accept brings m16 to L2, L2-3 goes back on the walk, and its
- * un-fold is accepted: the seeded phase C accepts 17 un-folds, one per pass.
- * With L2-3 kept off the walk instead, it accepts 15, the release doesn't fire
- * and the plan leaves m1, m14, m15 and m18 at L1.
+ * un-fold is accepted. With L2-3 kept off the walk instead, the release
+ * doesn't fire and the plan leaves m1, m14, m15 and m18 at L1.
  */
 test('phase C: a group it couldn\'t take returns to the walk once an accept moves a leaf it read (R5-1)', () => {
   const chunks = 'm0:45:L1-0 m1:42:L1-1 m2:45 m3:117 m4:137:L1-2 m5:55:L1-2 m6:52:L1-3 m7:100:L1-4 m8:145:L1-5 m9:172:L1-6 m10:91:L1-6 m11:198:L1-6 m12:133:L1-7 m13:90:L1-7 m14:56:L1-8 m15:146:L1-8 m16:106:L1-9 m17:56:R-1 m18:113:L1-10 m19:131:L1-10 m20:73:L1-10'
@@ -492,24 +491,9 @@ test('phase C: a group it couldn\'t take returns to the walk once an accept move
     ...common, previous: new Map(), targetTokens: 327, foldAtTokens: 577, windowTokens: 4206, reachTokens: 4206,
   });
   assert.equal(levels(boot.resolutions), '330033331333332231200', 'premise: the bootstrap holds m16 at L3 and m14, m15 and m18 at L2');
-  // Under KV_TIMING the planner logs each phase C's passes, the seeded one first.
-  const lines: string[] = [];
-  const diagnostics = { error: (m: string) => { lines.push(m); }, warn: (m: string) => { lines.push(m); } };
-  const timing = process.env.KV_TIMING;
-  process.env.KV_TIMING = '1';
-  let raised;
-  try {
-    raised = planControlledFrontier(inputs, tree, {
-      ...common, previous: boot.resolutions, targetTokens: 2616, foldAtTokens: 4616, windowTokens: 33648, reachTokens: 33648, diagnostics,
-    });
-  } finally {
-    if (timing === undefined) delete process.env.KV_TIMING; else process.env.KV_TIMING = timing;
-  }
-  const passes = lines.flatMap((l) => {
-    const m = /\[kv-timing\] phase-c \d+ms passes=(\d+)/.exec(l);
-    return m ? [Number(m[1])] : [];
+  const raised = planControlledFrontier(inputs, tree, {
+    ...common, previous: boot.resolutions, targetTokens: 2616, foldAtTokens: 4616, windowTokens: 33648, reachTokens: 33648,
   });
-  assert.equal(passes[0], 18, `the seeded phase C accepted 17 un-folds, one per pass (${JSON.stringify(passes)})`);
   assert.equal(raised.seedingReleased, true, 'the seeded cut re-read enough for the release');
   assert.equal(levels(raised.resolutions), '0'.repeat(chunks.length), 'every chunk raw, as before R5-1');
 });

@@ -505,8 +505,8 @@ function relevanceCut(
     // member (store surgery) or whose accept came through its oldest member
     // waited for the next pass, and an older group took the headroom first
     // (#156 review, Greptile P1). Cost: each node/level is accepted at most
-    // once, so passes are bounded by accepts + 1 and the memo keeps each
-    // rejected group to one attempt per pass.
+    // once, so passes are bounded by accepts + 1, and a rejected group is
+    // tried again only after an accept moves a leaf its verdict read.
     // Phase C only lowers levels (an accept lowers its group, a revert puts
     // back levels of at least 1), so a chunk that is raw or protected stays
     // out of reach for the rest of the phase. The walk follows a list of the
