@@ -13030,7 +13030,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * head, and outside the head window; with the head window disabled after a
    * reset, the plan's tail holds the recent messages before the head) that
    * pins keep raw
-   * (`forceRawPinPositions`), each priced by `price`, the plan's own raw
+   * (`forceRawPinPositions`), less the messages of system changes, which
+   * stay raw whatever the pins, each priced by `price`, the plan's own raw
    * price. Every such position counts, a part locked with `lockChunk` among
    * them, so the tokens are what unpinning frees at most: a pin that keeps no
    * part raw alone is still named. Where bounds are read, a pin whose own
