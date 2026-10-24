@@ -435,14 +435,14 @@ function phaseCRuns(shape: 'plain' | 'bigYoungGroup' | 'shortThirds') {
 test('phase C: a large raise walks each chunk a bounded number of times, not once per un-fold (R4-1)', () => {
   const { runs, chunks } = phaseCRuns('plain');
   assert.ok(runs.some((r) => r.passes >= 200), `premise: phase C un-folded about 215 groups, one per pass (${JSON.stringify(runs)})`);
-  for (const r of runs) assert.ok(r.visits <= 3 * chunks, `phase C visited ${r.visits} chunks over ${r.passes} passes`);
+  for (const r of runs) assert.ok(r.visits <= 3 * chunks, `phase C counted ${r.visits} visits over ${r.passes} passes`);
 });
 
 test('phase C: a youngest group that stays declined doesn\'t make the walk rescan the groups behind it (R4-1)', () => {
   const { runs, chunks, plan, young } = phaseCRuns('bigYoungGroup');
   assert.ok(runs.some((r) => r.passes >= 200), `premise: phase C un-folded about 214 groups, one per pass (${JSON.stringify(runs)})`);
   assert.ok(young.every((id) => plan.resolutions.get(id) === 1), 'premise: the big youngest group stays at L1');
-  for (const r of runs) assert.ok(r.visits <= 3 * chunks, `phase C visited ${r.visits} chunks over ${r.passes} passes`);
+  for (const r of runs) assert.ok(r.visits <= 3 * chunks, `phase C counted ${r.visits} visits over ${r.passes} passes`);
 });
 
 test('phase C: groups it declines leave the walk, so they aren\'t re-tried after every accept (R5-1)', () => {
@@ -452,7 +452,7 @@ test('phase C: groups it declines leave the walk, so they aren\'t re-tried after
   const { runs, chunks, plan } = phaseCRuns('shortThirds');
   assert.ok(runs.some((r) => r.passes >= 140), `premise: phase C un-folded about 143 groups, one per pass (${JSON.stringify(runs)})`);
   assert.equal(plan.seedingReleased, true, 'premise: the release took the from-scratch cut');
-  for (const r of runs) assert.ok(r.visits <= 3 * chunks, `phase C visited ${r.visits} chunks over ${r.passes} passes`);
+  for (const r of runs) assert.ok(r.visits <= 3 * chunks, `phase C counted ${r.visits} visits over ${r.passes} passes`);
 });
 
 /**
