@@ -40,6 +40,7 @@ export type {
   JournalMark,
   RenderedLayout,
   LayoutUnit,
+  ThinkingStrip,
 } from './context.js';
 
 // Strategy types
@@ -83,6 +84,8 @@ export type {
   RenderStatsCapableStrategy,
   RenderedSummaryInfo,
   ImageCeilings,
+  ThinkingBinding,
+  RequestIdentity,
 } from './strategy.js';
 
 export {
