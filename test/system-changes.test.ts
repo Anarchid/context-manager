@@ -1131,6 +1131,24 @@ describe('firstChanged', () => {
     assert.equal((await cm.compile(BIG)).firstChanged, 0);
   });
 
+  it('takes an injection\'s bytes as it compiles, also when a binding compile sends it without its thinking', async () => {
+    const cm = await open(new PassthroughStrategy());
+    cm.addMessage('User', [text('a')]);
+    cm.addMessage('Claude', [text('b')]);
+    cm.addMessage('User', [text('c')]);
+    const binds = {
+      thinkingBinding: { binds: true, participant: 'Claude' },
+      identity: { system: 'zz-system', tools: 'zz-tools', model: 'zz-model', request: 'zz-request' },
+    };
+    const said = text('note v1');
+    const note = [{ type: 'thinking', thinking: 'zz-reasoning', signature: 'zz-sig' } as ContentBlock, said];
+    const first = await cm.compile(BIG, [{ namespace: 'n', position: 'afterUser', content: note }], binds);
+    assert.deepEqual(first.messages[3]!.content, [text('note v1')], 'setup: the injection goes without its thinking, as a new array');
+    // A block of the caller's, changed in place between compiles.
+    (said as { text: string }).text = 'note v2';
+    assert.equal((await cm.compile(BIG, [{ namespace: 'n', position: 'afterUser', content: note }], binds)).firstChanged, 3);
+  });
+
   it('is not compared with a compile that throws before it returns', async () => {
     const cm = await open(new PassthroughStrategy());
     cm.addMessage('User', [text('a')]);
