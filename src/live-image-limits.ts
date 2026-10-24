@@ -37,7 +37,12 @@ export const DEFAULT_IMAGE_CEILING = 500;
  * as this package's compression requests do. Then it replaces images,
  * oldest first, until the request fits or no image is left, and passes it
  * on either way; the Anthropic adapter's own check, which never sheds,
- * refuses one still over the cap. 24 MiB of base64 images leaves 4 MiB of that
+ * refuses one still over the cap. The shed works on the messages the
+ * formatter built, and replaces only membrane's `image` blocks, top-level or
+ * in a `tool_result`: a request that sets `shedOversizeImages` and is built
+ * by membrane's `openai-responses` formatter, whose images are
+ * `input_image` parts, has none shed and isn't checked against the cap
+ * there, and that adapter doesn't check it again. 24 MiB of base64 images leaves 4 MiB of that
  * default cap for everything else the messages carry: their text, their
  * JSON, and any documents or other media.
  */

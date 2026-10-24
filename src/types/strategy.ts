@@ -1593,7 +1593,11 @@ export interface AutobiographicalConfig {
    * request that asks membrane to shed images, as this strategy's compression
    * requests do, first has its oldest images replaced until it fits or none
    * is left, and then only the Anthropic adapter's own check refuses it if
-   * it's still over (`src/live-image-limits.ts` says where each check runs). This
+   * it's still over (`src/live-image-limits.ts` says where each check runs).
+   * That's for a formatter whose messages keep membrane's `image` blocks:
+   * such a request built with membrane's `openai-responses` formatter
+   * carries `input_image` parts, which aren't shed, and it isn't checked
+   * either. This
    * setting isn't read from `MEMBRANE_MAX_REQUEST_BYTES`: a host that changes
    * membrane's cap sets this too, keeping room under the cap for what this
    * doesn't count.
