@@ -1497,5 +1497,7 @@ describe('compression prompts within the image ceilings', () => {
     );
     assert.equal(prepared.imageReplacements, 0);
     assert.equal(prepared.request.messages.filter((m) => m.content[0]!.type === 'image').length, 501, 'all 501 are still images');
+    assert.equal(prepared.imagesKept, 501, 'the counts say what was kept');
+    assert.equal(prepared.imageBytesKept, 501 * 4);
   });
 });

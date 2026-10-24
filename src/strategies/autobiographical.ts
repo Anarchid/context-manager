@@ -18350,7 +18350,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * uses, so the summarizer is told plainly that it is not seeing them.
    * A cap of 0 or less is none.
    * Returns the number of images replaced; `stats`, when given, receives the
-   * bytes and the images kept.
+   * bytes and the images kept, every image's where neither cap is set.
    */
   protected capCompressionImageBytes(
     messages: Array<{ content: ContentBlock[] }>,
@@ -18359,7 +18359,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     capImages = 0,
   ): number {
     const countCap = capImages > 0 ? capImages : 0;
-    if (capBytes <= 0 && countCap === 0) return 0;
     let kept = 0;
     let keptImages = 0;
     let dropped = 0;
