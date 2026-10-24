@@ -1,5 +1,6 @@
 import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
-import type { MessageId, StoredContentBlock, StoredMessage } from './message.js';
+import type { MessageId, Sequence, StoredContentBlock, StoredMessage } from './message.js';
+import type { RenderStats, RequestIdentity } from './strategy.js';
 
 /**
  * Describes how a context entry relates to its source message.
@@ -171,6 +172,104 @@ export interface CompileResult {
    * read-only. It's transient and isn't part of the persisted provenance.
    */
   rawBodies?: ReadonlyMap<MessageId, readonly StoredMessage[]>;
+
+  /**
+   * Where this compile's messages first differ from the last committing
+   * compile's, for every strategy: the index of the first message, injections
+   * included, whose participant or content bytes differ from that compile's
+   * message at the same index, or that has none there. So when this compile
+   * only appended to that one's messages it is the first appended index, and
+   * it equals `messages.length` when these messages are that compile's or a
+   * prefix of them. An injection placed beside the newest user message moves
+   * with each new user message, so after one it's that injection's old index
+   * rather than the first appended one. Null only for the manager's first
+   * committing compile, since the comparison is with what this manager last
+   * compiled, held in memory: a manager opened again, as after a restart,
+   * starts with none. The comparison is by bytes, so it holds across a
+   * branch switch or a new strategy, whichever way the switch was made. The
+   * store's content is taken as the same bytes where it's the same array, so
+   * a block a caller changed in place after storing it, which the store's
+   * contract rules out, isn't seen.
+   * Cache markers don't count, and neither do `systemInjections`, which the
+   * caller adds to the system prompt itself. A dry compile leaves it out and
+   * doesn't move the comparison; a committing compile that returns moves it
+   * whether or not its request is sent, and one that throws doesn't. A
+   * caller can tell from it whether a compile rewrote what the last
+   * committing compile gave, such as a system change it wrote. It's compared
+   * when read, so a compile whose caller never reads it serializes only its
+   * injections, whose bytes a committing compile takes since a caller may
+   * change its own array: read it only where it's used.
+   * Read after later compiles, it still compares this compile with the one
+   * before it. Until it's read, the result keeps this compile's compiled
+   * messages and the last committing compile's, by reference; once read, it
+   * holds the number.
+   */
+  firstChanged?: number | null;
+
+  /**
+   * This compile's render stats, as its select tallied them while emitting
+   * entries: the same accounting `getRenderStats()` gives a live compile.
+   * They describe the selection rather than the exact request: injections
+   * merged in afterwards aren't counted, an entry that mixes tool calls and
+   * results counts once though the compile splits it into several messages,
+   * and the select's last structural passes, which can trim an orphaned tool
+   * call or add a stub tool result, aren't counted either. A live compile's
+   * are the object `ContextManager.getRenderStats()` then returns, so treat
+   * them as read-only. A dry compile's
+   * (`dryRun`) are its own, which `getRenderStats()` never returns, so a host
+   * can show the composition of the request a dry compile built without
+   * sending it. Absent when the strategy records none.
+   */
+  renderStats?: RenderStats;
+
+  /**
+   * Set on a compile with `thinkingBinding.binds` that newly leaves out a
+   * stored reply's thinking: what, and why (see
+   * `SelectOptions.thinkingBinding`).
+   */
+  thinkingStrip?: ThinkingStrip;
+
+  /**
+   * On every compile with `thinkingBinding.binds`: the branch's sequence
+   * (`JsStore.currentSequence`) when its binding record began, at or above
+   * every message stored before then. A branch that inherits its parent's
+   * record keeps its value, which is at most the branch point; a dry compile
+   * with no record reports what the first record would hold. A reply at or
+   * below it was stored before the context manager recorded what the branch
+   * sent, so the provider may refuse or set aside its thinking without any
+   * strip having missed. Sequences are branch-global across slots, so a
+   * stored message's `sequence` compares with it directly.
+   */
+  thinkingRecordedAfter?: Sequence;
+}
+
+/** What a compile with `thinkingBinding.binds` newly leaves out. */
+export interface ThinkingStrip {
+  /**
+   * The stored bodies (`RawBodySource.messageId`) of the participant's
+   * replies whose thinking this compile leaves out and the compile that
+   * wrote the branch's record didn't, whether or not its request went out:
+   * that compile sent them with their thinking, they were stored since, or
+   * it didn't send them as stored replies at all. A record is written by a
+   * committing compile with `binds`, so a compile without it is passed
+   * over.
+   * So a reply can be reported again: one whose thinking went, that a later
+   * compile didn't send, and that renders again. A host that tells each
+   * loss once keeps its own set of what it has told.
+   */
+  newly: MessageId[];
+  /**
+   * `'head'`: an `identity` digest changed, and every message goes without
+   * its thinking. `'first'`: a reply stored before the branch's record
+   * began, which only the drop control lets keep its thinking, goes without
+   * it, as every reply does at a branch's first compile without the control.
+   * `'messages'`: a compiled message differs from the record, and every
+   * message from it on goes without. When a compile has more than one,
+   * `'head'` is given before `'first'`, and `'first'` before `'messages'`.
+   */
+  cause: 'messages' | 'head' | 'first';
+  /** With `'head'`: which digests changed. */
+  changed?: Array<keyof RequestIdentity>;
 }
 
 /** A branch as a compile or receipt saw it: native id, name, creation time. */

@@ -5,6 +5,7 @@ import { registerStateIfAbsent } from '../state-registration.js';
 import { phaseChannel } from '../phase-channel.js';
 import type {
   ContextStrategy,
+  ImageCeilings,
   ResettableStrategy,
   StrategyContext,
   ReadinessState,
@@ -17,6 +18,9 @@ import type {
   AutobiographicalOptions,
   CompressionQuarantineStatus,
   CompressionQuarantineSpan,
+  LoadRepairReport,
+  LoadRepairDroppedSummary,
+  LoadRepairDropReason,
   SummaryLevel,
   SummaryEntry,
   ProtectedRange,
@@ -33,6 +37,7 @@ import type {
   DerivationManifest,
   DerivationManifestOptions,
   RenderedSummaryInfo,
+  ThinkingBinding,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
@@ -52,7 +57,7 @@ import { persistMintRequestPreimage } from '../mint-preimage.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
-import { Picker, OverBudgetError, UncoveredDropError, type OverBudgetClearedBy, type PickerChunk, type PickerInputs, type PickerResult } from '../adaptive/picker.js';
+import { Picker, OverBudgetError, UncoveredDropError, type OverBudgetClearedBy, type OverBudgetDiagnostics, type OverBudgetRawPin, type PickerChunk, type PickerInputs, type PickerResult } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { reportOverlap } from '../adaptive/kv-control.js';
@@ -76,13 +81,26 @@ import type {
 import { chunkMessage, DEFAULT_CHUNKER_OPTIONS } from '../adaptive/chunker.js';
 import { observeStoreBranch } from '../branch-generation.js';
 import { bodyBoundsIn, bodyEnd, bodyStart } from '../body-runs.js';
+import { canonicalJson } from '../canonical-json.js';
+import { withoutThinking } from '../thinking-binding.js';
 import { releaseEditedRawForms, releaseSharedRawFormsOnMove, releaseTrailingReasoning, releaseVanishedRawForms, withoutRawForms } from '../raw-forms.js';
 import { isCompressionWithdrawn } from '../compression-withdrawn.js';
 import { hasImage, imagePayload, imagesIn, inlineImageBytes, isImageBlock, replaceImages, strippedImageSaving } from '../inline-images.js';
 import { CAP_OMISSION_TEXT, capContent, cappedPriceExtra, cappedWhole, isCapMarker, isEmptyTextBlock } from './message-cap.js';
+import {
+  DEFAULT_IMAGE_CEILING,
+  DEFAULT_IMAGE_BYTE_CEILING,
+  clampToCeiling,
+  liveImageLimitsWarning,
+  ceilingBoundLine,
+  ceilingSetLimits,
+  resolveLiveImageLimits,
+  type ResolvedImageLimits,
+} from '../live-image-limits.js';
 import type { MessageId } from '../types/message.js';
-import type { IngressChunkResult } from '../types/strategy.js';
+import type { CarrierPolicy, IngressChunkResult } from '../types/strategy.js';
 import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
+import { holdsSystemChange, isSystemChange, systemChangePositions } from '../system-changes.js';
 import { storedJson } from '../stored-json.js';
 
 /** A persisted reset record is trusted only if it has the expected shape. */
@@ -353,9 +371,9 @@ function nextFailureStreak(
  * An L1 run's subject: the chunk's rung, by the chunk's sources (see
  * chunkRunSubject) and the rung's curve label, the stripped retry after a
  * carrier rejection being its own. Not the request's bytes: a pending
- * chunk's request carries the whole unmerged frontier as recall pairs, so
- * every other L1 that lands changes it, and those landings are the evidence
- * a run needs.
+ * chunk's request carries the unmerged frontier summaries that start before
+ * it as recall pairs, so an L1 that lands for history before it changes it,
+ * and those landings are the evidence a run needs.
  */
 function chunkRunKey(runSubject: string, curveLabel: string, stripped: boolean): string {
   return sha256Json({ runSubject, curveLabel, stripped });
@@ -605,6 +623,28 @@ function hasToolBlocks(content: readonly ContentBlock[]): boolean {
 type ToolPruningDecision = {
   readonly replaced: ReadonlyMap<MessageId, ReadonlyMap<number, string>>;
   readonly inputCap: number;
+};
+
+/** The verdict postStripEstimates gives one image, which the strip applies
+ *  (applyImageStripping's asEstimated): the image's payload (imagePayload),
+ *  whether it's kept, and, for the ceiling line, the count and byte limits
+ *  it passes. */
+type ImageVerdict = {
+  key: unknown;
+  keep: boolean;
+  over: CeilingKinds;
+};
+
+/** The count limit and the byte limit, by the ceiling that can set each. */
+type CeilingKinds = { images: boolean; bytes: boolean };
+
+/** imageStripHysteresisRatio's set at the window's limits
+ *  (stripReplayAtLimits): how many of each message's images it strips, and
+ *  which of the count and byte limits brought a trim on anywhere in the
+ *  history it replays, for the ceiling line. */
+type StripReplay = {
+  out: ReadonlyMap<MessageId, number>;
+  over: Readonly<CeilingKinds>;
 };
 
 /** A tool call the conversation answers: its message's place in the listing,
@@ -1379,8 +1419,12 @@ interface CompressionInFlightResult {
 interface PreparationCounts {
   serializedMediaReplacements: number;
   imageReplacements: number;
+  /** The inline image byte budget, 0 for none. */
   imageBudgetBytes: number;
   imageBytesKept: number;
+  /** The most images the prompt may carry (imageCeiling), 0 for none. */
+  imageCountCap: number;
+  imagesKept: number;
 }
 
 /** A compression request after preparation, with what preparation replaced. */
@@ -1430,21 +1474,6 @@ interface KvUnifiedRebuilt {
 
 function sha256Json(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
-}
-
-/**
- * JSON with each object's keys in one order whatever order they were set in
- * (sorted, though integer-like keys come first, ascending, as in any object),
- * and each array's items in their own order, so two values that differ only
- * in the order their keys were set give the same text. An object the store
- * keeps comes back with its keys sorted, while one built here keeps the order
- * it was built in.
- */
-function canonicalJson(value: unknown): string {
-  return JSON.stringify(value, (_key, inner: unknown) => {
-    if (inner === null || typeof inner !== 'object' || Array.isArray(inner)) return inner;
-    return Object.fromEntries(Object.keys(inner).sort().map((key) => [key, (inner as Record<string, unknown>)[key]]));
-  });
 }
 
 /**
@@ -1647,15 +1676,22 @@ export function stripEmptyTextBlocks(content: ContentBlock[]): ContentBlock[] {
  * `full` replay arm). Passing raw thinking through requires keeping those
  * turns byte-identical — a follow-up experiment, not a blanket strip removal.
  *
- * A stripped Responses reasoning item releases the raw item it was paired
- * with, so the follower isn't replayed with an id whose reasoning is gone
- * (see raw-forms.ts).
+ * The blocks are left out as `withoutThinking` leaves them, raw forms
+ * included (thinking-binding.ts).
  */
-function stripThinkingBlocks(content: ContentBlock[]): ContentBlock[] {
-  return releaseEditedRawForms(
-    content,
-    content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking'),
-  );
+const stripThinkingBlocks = withoutThinking;
+
+/**
+ * A raw message's content as it enters compression input: its thinking
+ * stripped (stripThinkingBlocks), and its system changes left out. A system
+ * change alters the request's tools and system text, not the conversation, and
+ * a summarizer's request would apply it, or be refused for it
+ * (system-changes.ts). A message of system changes alone enters empty, and
+ * every request path drops an empty message before sending.
+ */
+function compressionInputContent(content: ContentBlock[]): ContentBlock[] {
+  const stripped = stripThinkingBlocks(content);
+  return holdsSystemChange(stripped) ? stripped.filter((b) => !isSystemChange(b)) : stripped;
 }
 
 /**
@@ -2203,9 +2239,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private runtimeTransitionPaceTokens: number | undefined;
   /** Diagnostics from the most recent dry-run select. Not persisted. */
   private _lastPreview: PreviewResult | undefined;
-  /** The last dry select's own render stats, which select() keeps apart from
-   *  the live ones for previewContext. */
-  private _lastPreviewStats: RenderStats | undefined;
+  /** The render stats the most recent select() recorded, live or dry
+   *  (getLastSelectStats). A dry select's are kept apart from the live ones
+   *  getRenderStats() returns. */
+  private _lastSelectStats: RenderStats | null = null;
   /** Set while a dry select runs: its chunking persists no chunk record. */
   private _dryRunSelect = false;
   /** Serializes previews against each other (see previewContext). */
@@ -2393,7 +2430,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     log: ContextLogView,
     budget: TokenBudget,
     overrides?: AutobiographicalOptions,
-    opts?: { render?: boolean },
+    opts?: { render?: boolean; thinkingBinding?: ThinkingBinding },
   ): PreviewResult {
     this.requireLoadedBranch('previewContext');
     if (this._previewInFlight) {
@@ -2428,7 +2465,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       let rendered: ContextEntry[] | undefined;
       try {
-        const out = this.select(store, log, budget, { dryRun: true });
+        const out = this.select(store, log, budget, { dryRun: true, thinkingBinding: opts?.thinkingBinding });
         // Only retained on request: these are full rendered entries and can be
         // megabytes on a large store.
         if (opts?.render) rendered = out;
@@ -2480,7 +2517,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return {
         ...preview,
         ...(opts?.render
-          ? { entries: rendered, stats: this._lastPreviewStats }
+          ? { entries: rendered, stats: this._lastSelectStats ?? undefined }
           : {}),
       };
     } finally {
@@ -2488,7 +2525,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._adaptivePicker = savedPicker;
       this._cachedHeadStartIndex = savedHeadCache;
       this._lastPreview = undefined;
-      this._lastPreviewStats = undefined;
       this._previewInFlight = false;
     }
   }
@@ -2652,7 +2688,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * lock while it stands: under the greedy solvers and kv-stable, the pinned
    * message renders raw, and its locked level stays stored and returns when
    * the pin is removed. kv-unified treats a pin and a lock as constraints and
-   * reports a conflict when they are incompatible.
+   * reports a conflict when they are incompatible. A pin on another part
+   * of a message stored in parts doesn't cover a locked part outside the span
+   * its ids name (`pinPositions`): there the lock holds, under every solver.
    * No-op when adaptiveResolution is false. Set-only programmatic API per
    * the design (no agent-facing tool in V1). Persisted to chronicle.
    */
@@ -2764,6 +2802,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Bind to the chronicle store + namespace for persistent strategy state.
     this.store = ctx.store;
     this.ns = ctx.namespace;
+    this.reportImageLimitsWarningOnce();
     // Its tools getter follows the host's declarations (compressionWorkQueued).
     this.hostContext = ctx;
     observeStoreBranch(ctx.store);
@@ -2954,6 +2993,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this.transitionBlocked = undefined;
     this._rs = null;
     this._lastRenderStats = null;
+    this._lastSelectStats = null;
     this._lastCompileEstimate = 0;
     this._storeView = null;
     // Prices memoized over the view just cleared: the next one may estimate otherwise.
@@ -3258,6 +3298,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const emptyIds: string[] = [];
     const unreadableIds: string[] = [];
     const rebuiltIds: string[] = [];
+    // Each dropped summary that holds text, as it was when dropped, with why:
+    // what the load-repair report names (loadRepairReport).
+    const textDrops = new Map<string, { summary: SummaryEntry; reason: LoadRepairDropReason }>();
     const namesParent = (copy: SummaryEntry, pointer: unknown): boolean =>
       typeof pointer === 'string' && (copiesById.get(pointer) ?? []).some(
         (parent) => parent.level > copy.level && Array.isArray(parent.sourceIds) && parent.sourceIds.includes(copy.id),
@@ -3270,7 +3313,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // An L1's own sources, else its compressed chunk record's, else a
         // copy's. Its range is their ends, which every L1 writer sets.
         const ids = [summary.sourceIds, chunkSources.get(id), ...copies.map((copy) => copy.sourceIds)].find(isIdList);
-        if (!ids) { unreadableIds.push(id); continue; }
+        if (!ids) { unreadableIds.push(id); textDrops.set(id, { summary, reason: 'unreadable' }); continue; }
         const range = summary.sourceRange as { first?: unknown; last?: unknown } | undefined;
         if (ids !== summary.sourceIds || range?.first !== ids[0] || range?.last !== ids[ids.length - 1]) {
           summary = { ...summary, sourceIds: [...ids], sourceRange: { first: ids[0]!, last: ids[ids.length - 1]! } };
@@ -3280,7 +3323,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // Above L1 a range's ends are message ids that the sources don't
         // name, so sources and range come together from one copy.
         const donor = copies.find((copy) => isIdList(copy.sourceIds) && isReadableRange(copy.sourceRange));
-        if (!donor) { unreadableIds.push(id); continue; }
+        if (!donor) { unreadableIds.push(id); textDrops.set(id, { summary, reason: 'unreadable' }); continue; }
         summary = { ...summary, sourceIds: [...donor.sourceIds], sourceRange: { ...donor.sourceRange } };
         rebuiltIds.push(id);
       }
@@ -3309,7 +3352,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         for (const [id, summary] of byId) {
           if (!(summary.level > 1) || (!notBelow(summary) && summary.sourceIds.every((sourceId) => byId.has(sourceId)))) continue;
           byId.delete(id);
-          (notBelow(summary) ? misplacedIds : ancestorIds).push(id);
+          const misplaced = notBelow(summary);
+          (misplaced ? misplacedIds : ancestorIds).push(id);
+          textDrops.set(id, { summary, reason: misplaced ? 'names-not-below' : 'names-missing' });
           changed = true;
         }
       }
@@ -3377,6 +3422,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (summary.level > 1 && summary.sourceIds.some((sourceId) => parentOf.get(sourceId) !== id)) {
         byId.delete(id);
         notParentIds.push(id);
+        textDrops.set(id, { summary, reason: 'names-non-child' });
       }
     }
     dropMissingAndMisplaced();
@@ -3406,6 +3452,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const keptRebuiltIds = rebuiltIds.filter((id) => byId.has(id));
     if (malformed > 0 || dupes > 0 || droppedIds.length > 0 || keptRebuiltIds.length > 0 ||
         reparentedIds.length > 0 || clearedIds.length > 0) {
+      // Read before the write, which moves the branch's sequence past the
+      // summaries as they were. A repair that dropped only empty summaries,
+      // or none, lost no text and has no report: its line below says it all.
+      const report = textDrops.size > 0
+        ? this.loadRepairReport(this.store, [...copiesById.keys()], textDrops, emptyIds.length)
+        : undefined;
       this.store.setStateJson(this.summariesStateId, this.summaries);
       this.diag.warn(
         `[autobiographical] repaired summary state: removed ${malformed} malformed entr(ies) and deduped ${dupes}; ` +
@@ -3416,6 +3468,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           `[${keptRebuiltIds.join(', ')}]; set the parent of [${reparentedIds.join(', ')}]; cleared ` +
           `the parent pointers of [${clearedIds.join(', ')}], which named no kept parent`,
       );
+      if (report) this.deliverLoadRepair(report);
     }
 
     // An invalid L1 may also be referenced by a persisted chunk record. Make
@@ -3610,7 +3663,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Pin a range of messages. A pin's bound is its `level`, or without one
    * its `maxLevel` (`normalizePinLevels`). A raw pin, with no bound or a
    * bound of 0, keeps the messages out of compression and renders them raw
-   * at their original position. A bound above 0 is read only under
+   * at their original position. A compile whose budget can't hold them
+   * beside the rest refuses with `OverBudgetError`; where the adaptive plan's
+   * middle is over the budget, it names each pin keeping raw tokens in that
+   * middle (`rawPinsDiagnostics`). Under adaptive resolution, a message
+   * stored in parts counts as one: a pin whose first or last id names one of its parts
+   * covers it from its first part to its last, less a part locked with
+   * `lockChunk` outside the span its ids name, for every reader of pins
+   * (`pinPositions`). A bound above 0 is read only under
    * `foldingStrategy: 'kv-stable'` and `'kv-unified'` with
    * `adaptiveResolution` (`readsPinBounds`): there the range is still
    * compressed, since only a summary can supply its level, and is held at
@@ -3642,6 +3702,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * with `kind: 'document'`, and `opts` reads as `pinRange`'s: without a
    * `level` or `maxLevel` the message is kept raw, while `{ maxLevel }` lets
    * it fold no deeper than that level where the selector reads level bounds.
+   * Under adaptive resolution, a mark on any part of a message stored in
+   * parts covers the whole message, as `pinRange` does (`pinPositions`).
+   * Under `kv-stable`, a mark with `level` (not `maxLevel`) holds whole each
+   * summary it reaches, so a locked part that shares a summary with a part
+   * the mark covers renders at the level the mark holds that summary at.
    */
   markDocument(messageId: string, opts?: PinLevelOptions): string {
     this.requireLoadedBranch('markDocument');
@@ -3859,21 +3924,50 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Build a set of message-store positions covered by any pin. O(N pins · K range).
-   * Returns positions for which the message exists; orphan pins (deleted
-   * messages) are silently skipped.
+   * The store positions a pin covers, in order. Without adaptive resolution,
+   * the messages from its first id to its last. Under adaptive resolution,
+   * the only ingress that stores a message in parts, such a message counts as
+   * one: the span runs from the first part of the message its first id is in
+   * to the last part of the message its last id is in (`bodyBoundsIn`), less
+   * a part locked with `lockChunk` outside the span its ids name. A lock is
+   * said of that part, while covering the rest of its message is what a pin
+   * on another part implies, so the lock holds there; a pin over its own
+   * locked messages keeps the rule `lockChunk` describes. Every reader of
+   * pins takes this: the selects, compression, the summarizer's prompt and
+   * the replay exporter. Undefined when either id is no longer in the store.
+   */
+  protected pinPositions(
+    pin: ProtectedRange,
+    positionOf: ReadonlyMap<MessageId, number>,
+    messages: readonly StoredMessage[],
+  ): number[] | undefined {
+    const first = positionOf.get(pin.firstMessageId);
+    const last = positionOf.get(pin.lastMessageId);
+    if (first === undefined || last === undefined) return undefined;
+    const lo = Math.min(first, last);
+    const hi = Math.max(first, last);
+    const whole = this.config.adaptiveResolution === true;
+    const from = whole ? bodyBoundsIn(messages, lo).from : lo;
+    const to = whole ? bodyBoundsIn(messages, hi).to : hi;
+    const out: number[] = [];
+    for (let i = from; i <= to; i++) {
+      if ((i < lo || i > hi) && this.locked.has(messages[i].id)) continue;
+      out.push(i);
+    }
+    return out;
+  }
+
+  /**
+   * Build a set of message-store positions covered by any pin
+   * (`pinPositions`). O(N pins · K range). Returns positions for which the
+   * message exists; orphan pins (deleted messages) are silently skipped.
    */
   protected pinnedPositions(messages: StoredMessage[]): Set<number> {
     if (this.pins.length === 0) return new Set();
     const positionOf = this.positionIndex(messages);
     const out = new Set<number>();
     for (const pin of this.pins) {
-      const first = positionOf.get(pin.firstMessageId);
-      const last = positionOf.get(pin.lastMessageId);
-      if (first === undefined || last === undefined) continue;
-      const lo = Math.min(first, last);
-      const hi = Math.max(first, last);
-      for (let i = lo; i <= hi; i++) out.add(i);
+      for (const i of this.pinPositions(pin, positionOf, messages) ?? []) out.add(i);
     }
     return out;
   }
@@ -3893,14 +3987,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected resolvedPinBounds(messages: StoredMessage[]): Map<number, ResolvedPinBound> {
     const out = new Map<number, ResolvedPinBound>();
     const pinned = this.pinnedPositions(messages);
-    if (pinned.size === 0) return out;
-    const bounds = this.readsPinBounds() ? this.pinLevelBounds(messages) : undefined;
-    for (const position of pinned) {
-      const bound = bounds?.get(position);
-      if (bound?.level !== undefined) out.set(position, { level: bound.level });
-      else if (bound?.maxLevel !== undefined) out.set(position, { maxLevel: bound.maxLevel });
-      else out.set(position, 'raw');
+    if (pinned.size > 0) {
+      const bounds = this.readsPinBounds() ? this.pinLevelBounds(messages) : undefined;
+      for (const position of pinned) {
+        const bound = bounds?.get(position);
+        if (bound?.level !== undefined) out.set(position, { level: bound.level });
+        else if (bound?.maxLevel !== undefined) out.set(position, { maxLevel: bound.maxLevel });
+        else out.set(position, 'raw');
+      }
     }
+    // A message of system changes is kept raw, as a pin keeps a message: a
+    // fold would take its change out of what follows it (holdsSystemChange).
+    for (const position of systemChangePositions(messages)) out.set(position, 'raw');
     return out;
   }
 
@@ -3931,8 +4029,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * The V2 dynamic-pin fold-depth bounds (`ProtectedRange.level` /
    * `maxLevel`) by message position. Only pins that carry a bound appear; a
    * classic raw pin (no bound) is absent here and handled by `pinnedPositions`.
-   * Where bounded pins overlap, the lowest fixed level and the lowest cap are
-   * kept; `resolvedPinBounds` decides between them and a classic pin.
+   * A pin covers what `pinPositions` says. Where bounded pins overlap, the
+   * lowest fixed level and the lowest cap are kept; `resolvedPinBounds`
+   * decides between them and a classic pin.
    */
   protected pinLevelBounds(messages: StoredMessage[]): Map<number, { level?: number; maxLevel?: number }> {
     const out = new Map<number, { level?: number; maxLevel?: number }>();
@@ -3941,12 +4040,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     for (const pin of this.pins) {
       if (pin.level === undefined && pin.maxLevel === undefined) continue;
-      const first = positionOf.get(pin.firstMessageId);
-      const last = positionOf.get(pin.lastMessageId);
-      if (first === undefined || last === undefined) continue;
-      const lo = Math.min(first, last);
-      const hi = Math.max(first, last);
-      for (let i = lo; i <= hi; i++) {
+      for (const i of this.pinPositions(pin, positionOf, messages) ?? []) {
         const prev = out.get(i) ?? {};
         // A fixed level is the strongest constraint; when two pins fix the same
         // position, the shallower (lower) level wins (finest requirement).
@@ -4113,12 +4207,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * Consecutive compression/merge requests share a long, append-mostly
    * prefix — head window + prior recall pairs (~60% of input on synthetic
    * workloads, ~93% on mature stores) — that previously went to the API
-   * with zero `cache_control` and was re-read cold on every call. Markers
+   * with zero `cache_control` and was re-read cold on every call. They share
+   * the head window only while they summarize one topic's history: after a
+   * head-window reset, requests for different topics' history each carry
+   * that topic's head (headAsOf). Markers
    * land at the three boundaries whose survival probability ranks highest
    * (measured optimum; `analysis/2026-08-20-cm37-cache-partition-experiments.md`
    * in the workspace root):
    *
-   *   1. end of head window        — survives everything short of identity edits
+   *   1. end of head window        — survives everything short of identity edits,
+   *                                  among requests for one topic's history
    *   2. last level>=2 recall pair — survives appends AND L1→L2 merges (a
    *      merge replaces the run at this boundary and extends it)
    *   3. last recall pair          — the append frontier
@@ -4182,7 +4280,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (frontierEnd === -1) return false; // no ladder yet — nothing stable to cache
     // A capped ladder front-evicts on every mint, so the pair seams shift and
     // writing them is waste. The head seam does not: tools, system prompt and
-    // head window precede the ladder and are the same request after request,
+    // head window precede the ladder and are the same request after request
+    // for one topic's history (headAsOf gives each topic its own head),
     // unless image shedding (one byte budget, spent newest-first) replaces a
     // head image for one payload and not for the next.
     let placed = false;
@@ -5236,6 +5335,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** When tick last swept ladder progress (sweepCompressionProgressIfDue). */
   private compressionProgressSweptAt = 0;
   private onQuarantineAlarm?: (status: CompressionQuarantineStatus) => void;
+  /** Where a load-repair report goes (setLoadRepairHandler); unset, reports are held. */
+  private onLoadRepair?: (report: LoadRepairReport) => unknown;
+  /** Load-repair reports not yet handed to a handler, oldest first: in memory only. */
+  private heldLoadRepairs: LoadRepairReport[] = [];
+  /** The newest load-repair report this instance has made (getLatestLoadRepairReport). */
+  private latestLoadRepair: LoadRepairReport | null = null;
 
   /**
    * Host wiring point: the framework maps this to its ops-alert channel
@@ -5256,6 +5361,140 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   setQuarantineAlarmHandler(fn: (status: CompressionQuarantineStatus) => void): void {
     this.onQuarantineAlarm = fn;
+  }
+
+  /**
+   * Host wiring point for telling whoever keeps the agent that a load's
+   * repair of the summary state dropped summaries holding text: memory that
+   * changed, which the repair's diagnostic line alone doesn't reach anyone
+   * with (context-manager#175). A load (loadPersistedState) runs at each
+   * initialization (an open, a branch switch, a fork, setStrategy) and at
+   * each take-up of what another instance on the store wrote. A repair that
+   * drops only empty summaries, or none, loses no text and makes no report.
+   *
+   * A host that sets this after the store's open, as one that wires its
+   * handlers once the manager is open does, has missed that load, so reports
+   * made while none is set are held, in memory only, and setting a handler
+   * hands it each of them at once, oldest first. A report made while one is
+   * set goes to it once its load's synchronous run has ended: a microtask
+   * later, or, for a load a handler runs itself, when that handler returns.
+   * So a handler that calls back into the manager, such as to switch
+   * branches, never meets a load partway. It can meet an operation that ran
+   * the load and is still going, as any caller between that operation's
+   * steps can: an initialization, which keeps the manager's operations
+   * fenced until it has finished, or a compression that took up the store's
+   * state (takeUpStoreState). Each strategy instance holds its own. A throw
+   * from `fn`, or a rejection of what it returns (a promise or any
+   * thenable), is logged, and stops neither the load nor the next report.
+   * The report isn't handed over again, and the getter gives it until a
+   * newer one.
+   */
+  setLoadRepairHandler(fn: (report: LoadRepairReport) => unknown): void {
+    this.onLoadRepair = fn;
+    this.handHeldLoadRepairs();
+  }
+
+  /**
+   * The newest load-repair report this instance has made, whether held or
+   * handed on, for a health surface to show; null until a load it ran makes
+   * one (setLoadRepairHandler). A load that drops summaries holding text
+   * makes none only where the store's branch or sequence can't be read,
+   * which is logged.
+   */
+  getLatestLoadRepairReport(): LoadRepairReport | null {
+    return this.latestLoadRepair;
+  }
+
+  /**
+   * A load-repair report, queued for the handler: one already set takes it
+   * a microtask later, once the load's synchronous run has ended, and one
+   * set later takes it when it's set (setLoadRepairHandler).
+   */
+  private deliverLoadRepair(report: LoadRepairReport): void {
+    this.latestLoadRepair = report;
+    this.heldLoadRepairs.push(report);
+    if (this.onLoadRepair) queueMicrotask(() => this.handHeldLoadRepairs());
+  }
+
+  /**
+   * Each queued report to the handler set when it's taken, oldest first,
+   * those queued meanwhile included.
+   */
+  private handHeldLoadRepairs(): void {
+    while (this.onLoadRepair && this.heldLoadRepairs.length > 0) {
+      this.handLoadRepair(this.onLoadRepair, this.heldLoadRepairs.shift()!);
+    }
+  }
+
+  private handLoadRepair(fn: (report: LoadRepairReport) => unknown, report: LoadRepairReport): void {
+    const failed = (error: unknown): void => this.diag.warn(
+      `[autobiographical] the load-repair handler failed on the report for ${report.stateId} on branch ${report.branch} at sequence ${report.sequenceBefore}:`, error,
+    );
+    try {
+      // Promise.resolve adopts a promise from another realm or a library's
+      // thenable as well as this realm's, and passes anything else through.
+      Promise.resolve(fn(report)).catch(failed);
+    } catch (error) {
+      failed(error);
+    }
+  }
+
+  /**
+   * The report of a load's repair that dropped summaries holding text
+   * (LoadRepairReport), read before the repair writes: `drops` in the order
+   * of `ids`, the summary ids as stored. Undefined where the store's branch
+   * or sequence can't be read, which is logged: the repair goes ahead either
+   * way. A range end whose time can't be read has a null time.
+   */
+  private loadRepairReport(
+    store: JsStore,
+    ids: readonly string[],
+    drops: ReadonlyMap<string, { summary: SummaryEntry; reason: LoadRepairDropReason }>,
+    emptyDropped: number,
+  ): LoadRepairReport | undefined {
+    try {
+      const messages = this.hostContext?.messageStore;
+      // A view that throws, or an invalid Date's toISOString, gives null.
+      const storedAt = (id: string): string | null => {
+        try {
+          return messages?.get(id)?.timestamp.toISOString() ?? null;
+        } catch {
+          return null;
+        }
+      };
+      // Loaded state is untyped: a number field that isn't one is null. (The
+      // store holds JSON, which refuses NaN and the infinities.)
+      const numberOrNull = (value: unknown): number | null => typeof value === 'number' ? value : null;
+      const dropped: LoadRepairDroppedSummary[] = [];
+      for (const id of ids) {
+        const drop = drops.get(id);
+        if (!drop) continue;
+        const { summary, reason } = drop;
+        // The range the repair held for it: its chosen copy's, or another
+        // copy's where the repair rebuilt it from one. A summary whose
+        // sources can't be read can still hold a readable range.
+        const range = isReadableRange(summary.sourceRange) ? summary.sourceRange : null;
+        dropped.push({
+          id: String(id),
+          level: numberOrNull(summary.level),
+          tokens: numberOrNull(summary.tokens),
+          reason,
+          sourceRange: range && { first: range.first, last: range.last, firstAt: storedAt(range.first), lastAt: storedAt(range.last) },
+        });
+      }
+      return {
+        namespace: this.ns,
+        branch: store.currentBranch().name,
+        stateId: this.summariesStateId,
+        sequenceBefore: store.currentSequence(),
+        dropped,
+        droppedTokens: dropped.reduce((sum, d) => sum + (d.tokens ?? 0), 0),
+        emptyDropped,
+      };
+    } catch (error) {
+      this.diag.warn('[autobiographical] a load\'s repair drops summaries holding text, and its report couldn\'t be read:', error);
+      return undefined;
+    }
   }
 
   /**
@@ -7826,9 +8065,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     budget: TokenBudget,
     opts?: SelectOptions
   ): ContextEntry[] {
+    // Only stats this select records are its own: on a throw before they're
+    // written, an earlier select's must not pose as this one's.
+    this._lastSelectStats = null;
     this.requireLoadedBranch('select');
     this._selectStartedAt = performance.now();
     this._selectMessages = store.length();
+    const lastRenderStats = this._lastRenderStats;
     const _diag = typeof process !== 'undefined' && !!process.env?.CM_CACHE_DIAG;
     const _t0 = _diag ? Date.now() : 0;
     if (opts?.dryRun !== true) {
@@ -7840,12 +8083,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the next compile's stable prefix and fold diff are measured against
       // the request before it.
       const prevCacheKeys = this._prevCacheKeys;
+      // What this select's strips record is what it reports. A dry select's
+      // strips, and a refused one's, record too; each live select starts by
+      // clearing what earlier ones left, so it reports its own render's.
+      this._ceilingNotes = { images: false, bytes: false };
+      let entries: ContextEntry[];
+      this.thinkingBound = opts?.thinkingBinding?.binds === true;
       try {
-        return this.withToolPruning(store, () => this.selectPath(store, budget, opts));
+        entries = this.withToolPruning(store, () => this.selectPath(store, budget, opts));
       } catch (err) {
         this._prevCacheKeys = prevCacheKeys;
         throw err;
+      } finally {
+        this.thinkingBound = false;
+        if (this._lastRenderStats !== lastRenderStats) this._lastSelectStats = this._lastRenderStats;
       }
+      // Only a render this select returns says the ceiling line: one it
+      // refused threw above, and a dry select never comes here. Every select
+      // path strips its render last (applyImageStripping, `returned`), and a
+      // strip with no limits records nothing, so the hits are this render's.
+      this.reportCeilingHits();
+      return entries;
     }
     // A dry run commits nothing, and that includes what a select leaves for
     // the next one and for observers: the cache-marker baseline the next
@@ -7864,8 +8122,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // than the one saved here (refreshStoreOrder). They are put back
     // here, on every path out, throws included; each select path gates its
     // own persistence and enqueueing. The dry run's own
-    // render stats are its output, as its plan is (_lastPreview), and
-    // previewContext reads them from _lastPreviewStats.
+    // render stats are its output, as its plan is (_lastPreview): they stay
+    // in _lastSelectStats, which previewContext and a compile read.
     // Chunking runs dry too: a chunk the dry run closes gets no record, and
     // the chunks, the compression queue and whether chunk records are trusted
     // (a dry rebuild at a preview's chunk size can read them as orphaned) go
@@ -7874,21 +8132,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // queue's generation: a call in flight must not read the dry rebuild as
     // one that re-queued its chunk (requeuePendingChunk).
     const restore = this.saveDryRunState(store);
-    const lastRenderStats = this._lastRenderStats;
-    this._lastPreviewStats = undefined;
     this._dryRunSelect = true;
+    this.thinkingBound = opts?.thinkingBinding?.binds === true;
     try {
       this.rebuildChunks(store);
       if (_diag) this.diag.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
       return this.withToolPruning(store, () => this.selectPath(store, budget, opts));
     } finally {
       this._dryRunSelect = false;
-      // Only stats this dry run produced are its preview's: on a throw before
-      // they're written, the previous select's must not pose as the preview's.
-      if (this._lastRenderStats !== lastRenderStats) {
-        this._lastPreviewStats = this._lastRenderStats ?? undefined;
-      }
+      if (this._lastRenderStats !== lastRenderStats) this._lastSelectStats = this._lastRenderStats;
       restore();
+      this.thinkingBound = false;
     }
   }
 
@@ -8454,9 +8708,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const pos = messages.findIndex(x => x.id === id);
         if (pos < 0) return 'not-in-window';
         // Before the LIVE head start (head-window reset moved the anchor):
-        // this is compressible middle history, not head — a distinct defect
-        // from a verbatim-head message going unrendered.
-        if (pos < regions.headStart) return 'before-head-start-not-rendered';
+        // this is middle history, not head — a distinct defect from a
+        // verbatim-head message going unrendered — compressible but for a
+        // system change, which stays raw there, except while the head window
+        // holds messages, which is where a reset leaves it (headPositions).
+        if (pos < regions.headStart) {
+          return holdsSystemChange(messages[pos].content) && Math.min(regions.headEnd, messages.length) > regions.headStart
+            ? 'in-head-not-rendered'
+            : 'before-head-start-not-rendered';
+        }
         if (pos < regions.headEnd) return 'in-head-not-rendered';
         if (pos >= regions.recentStart) return 'in-tail-not-rendered';
         return 'in-middle-not-rendered';
@@ -8698,11 +8958,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * depend on the budget a compile is given, which this read isn't, so nothing
    * stands in for them before one: the pyramid of live summaries this used to
    * return instead was neither the hierarchical cut nor the adaptive one (#304,
-   * connectome-host#425). A dry run or preview records none (see `select()`).
+   * connectome-host#425). A dry run or preview leaves them as they were (see
+   * `select()`); its own stats come back with it.
    */
   getRenderStats(_store: MessageStoreView): RenderStats | null {
     this.requireLoadedBranch('getRenderStats');
     return this._lastRenderStats;
+  }
+
+  /**
+   * The stats the most recent `select()` on this branch recorded, live or
+   * dry, or null when it recorded none (it was refused). A compile reads them
+   * right after its select, so a dry compile's result carries its own stats,
+   * which `getRenderStats()` never returns.
+   */
+  getLastSelectStats(): RenderStats | null {
+    return this._lastSelectStats;
   }
 
   /**
@@ -9056,9 +9327,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     //      ("Antra came to me to explore the transformation story
     //      again…"), compounding across merges into runaway false
     //      memories (the "68 initiations" incident). Chronological
-    //      order is also the KV-stable order — the head never changes.
-    //      (executeMerge always had head-first; this site was the odd
-    //      one out.)
+    //      order is also the KV-stable order: chunks of one topic after its
+    //      head share that head, so their requests share its prefix. The
+    //      head is the head as of the chunk (headAsOf): after a head-window
+    //      reset, the head that history followed, the opening or its own
+    //      topic's, never the later topic's. (executeMerge always had
+    //      head-first; this site was the odd one out.)
     //   2. Prior summaries — narrativized as CM-asks / agent-recalls
     //      pairs, in source order. The unmerged frontier of the
     //      summary forest: any summary that has not yet been merged
@@ -9076,10 +9350,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // future information into the model's KV state and corrupt the
     // as-of framing of memory formation.
     const allMessages = ctx.messageStore.getAll();
-    const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
-    // Compression holds: provisional content never enters a prompt, not even
-    // as head context (a reset head can sit past the hold boundary).
-    const headEndIdx = Math.min(this.getHeadWindowEnd(ctx.messageStore), this.holdBoundary(ctx.messageStore));
+    // Message IDs are opaque strings, not sortable sequence numbers. Chronicle's
+    // default IDs happen to be decimal text, where lexical order corrupts the
+    // timeline at the first width transition (`"103" < "15"`). Use the store's
+    // canonical order instead so recall pairs remain chronological for every ID
+    // representation and newly-created summaries extend rather than splice the
+    // provider-cache prefix.
+    const messageOrder = new Map<MessageId, number>(
+      allMessages.map((message, index) => [message.id, index]),
+    );
+    const chunkFirstId = chunk.messages[0]?.id;
+    // The chunk's start is its first message still in the store: a host can
+    // remove a stored message (agent-framework's Discord module does, on a
+    // delete) while the chunk holding it waits in the queue. -1 only when
+    // none of its messages is left (startInStore).
+    const chunkStartIdx = this.startInStore(chunk.messages.map((m) => m.id), messageOrder);
+    // The head as of the chunk (headAsOf): after a head-window reset, history
+    // from before it is given the head it followed, not the new topic's, which
+    // came after it. Clipped at a hold there, as before.
+    const { start: headStartIdx, end: headEndIdx } = this.headAsOf(ctx.messageStore, chunkStartIdx);
 
     // ---- Prior recall set (the unmerged frontier) ----
     // Computed BEFORE the head emission because the head loop needs the
@@ -9092,15 +9381,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // optimization that scales catastrophically: a 4000-message import
     // converged to ~500 L1s that never aged out, blowing the 200k
     // window around chunk 118.
-    // Message IDs are opaque strings, not sortable sequence numbers. Chronicle's
-    // default IDs happen to be decimal text, where lexical order corrupts the
-    // timeline at the first width transition (`"103" < "15"`). Use the store's
-    // canonical order instead so recall pairs remain chronological for every ID
-    // representation and newly-created summaries extend rather than splice the
-    // provider-cache prefix.
-    const messageOrder = new Map<MessageId, number>(
-      allMessages.map((message, index) => [message.id, index]),
-    );
     // Pins in the canonical L1 prompt. The live view shows a message that a
     // pin keeps raw (forceRawPinPositions) raw, so this prompt does too. A
     // frontier summary that can't be shown as a recall pair (it covers such a
@@ -9138,20 +9418,41 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // stay declared (reasoning_extraction guard). L1 only; merge/transition
     // paths do not consult this flag.
     const sourceOnly = this.config.compressionSourceOnly === true;
-    const chunkFirstId = chunk.messages[0]?.id;
-    const chunkStartIdx = chunkFirstId ? allMessages.findIndex((m) => m.id === chunkFirstId) : -1;
 
     // History before the chunk, laid out for the messages that pins keep raw.
     const layoutHistory = (forceRawMessageIds: ReadonlySet<MessageId>) => {
       // The recall frontier, the chunks pins open and the leaf coverage, as
       // compressionWorkQueued's count reads them too (recallCoverage).
       const { frontier, openedMessageIds, coveredMessageIds: priorSummaryMessageIds } = this.recallCoverage(forceRawMessageIds);
+      // Recall pairs only for history before the chunk: a summary whose
+      // source range starts before the chunk's first message, as a merge's
+      // prior recall set takes only what starts before its range (1a). A
+      // chunk compressed after later history already has summaries (the old
+      // head's chunk, which a head-window reset makes compressible after the
+      // chunks behind it; a pinned or quarantined chunk let go late) was
+      // given their recall pairs too, ahead of it: what came after it
+      // (#317). It now sees fewer pairs: only those that start before it.
+      // Coverage is the whole frontier's still, so a later summary's
+      // messages stay out of the raw middle (one-to-one). A summary that
+      // starts before the chunk and reaches past it (a sparse sweep
+      // artifact, issue #42) is still recalled, since the messages it covers
+      // before the chunk have no other form here; so its later part, what it
+      // says of history after the chunk, still reaches this request, and only
+      // where a summary straddles the chunk. A summary written before this
+      // rule may also carry what came after its own history, from the head or
+      // recall pairs it was written with; that stays in its text. Where a
+      // summary starts is summaryStartInStore's rule, the one
+      // a merge's prior recall set uses: a summary whose first message a host
+      // removed starts at its first message still there, and one with none
+      // left isn't recalled. A chunk with no message left (chunkStartIdx -1)
+      // recalls none.
+      const summariesById = new Map<string, SummaryEntry>();
+      for (const s of this.summaries) summariesById.set(s.id, s);
+      const startOf = new Map<string, number>();
+      for (const s of frontier) startOf.set(s.id, this.summaryStartInStore(s, messageOrder, summariesById));
       const priorSummaries = frontier
-        .sort((a, b) => {
-          const aOrder = messageOrder.get(a.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
-          const bOrder = messageOrder.get(b.sourceRange.first) ?? Number.MAX_SAFE_INTEGER;
-          return aOrder - bOrder || a.sourceRange.first.localeCompare(b.sourceRange.first);
-        });
+        .filter((s) => { const at = startOf.get(s.id)!; return at >= 0 && at < chunkStartIdx; })
+        .sort((a, b) => startOf.get(a.id)! - startOf.get(b.id)! || a.sourceRange.first.localeCompare(b.sourceRange.first));
 
       // Raw messages before the chunk outside the head window, by position.
       // From the head window's end on, any message no summary represents yet
@@ -9195,7 +9496,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           rawMiddle.push({ position: i, message: m });
         }
       }
-      return { priorSummaries, priorSummaryMessageIds, rawMiddle, pinnedRaw, pinnedRawTokens };
+      return { priorSummaries, startOf, priorSummaryMessageIds, rawMiddle, pinnedRaw, pinnedRawTokens };
     };
 
     // When the chunk is a portion of a substantially larger sharded message
@@ -9221,7 +9522,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Pins count only before the chunk being compressed: this prompt is the
     // history the chunk follows. A summary after it (a chunk compressed out of
-    // order, after a head-window reset or an unpin) is recalled as on main.
+    // order, after a head-window reset or an unpin) isn't recalled at all
+    // (layoutHistory), and its messages stay covered.
     const forceRawMessageIds = new Set<MessageId>();
     for (const i of this.forceRawPinPositions(allMessages)) {
       if (i < chunkStartIdx) forceRawMessageIds.add(allMessages[i].id);
@@ -9231,7 +9533,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // The canonical request's messages for one layout of history, sections 1
     // to 6, shaped as they are sent. Admitting the pins prices this list.
     const assemble = (
-      { priorSummaryMessageIds, rawMiddle }: ReturnType<typeof layoutHistory>,
+      { startOf, priorSummaryMessageIds, rawMiddle }: ReturnType<typeof layoutHistory>,
       keptSummaries: readonly SummaryEntry[],
     ) => {
       const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
@@ -9250,7 +9552,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // the chunk." For doc-heavy chronicles, "everything before" would
       // be hundreds of thousands of tokens; the recall pairs below
       // represent that intermediate content. The head is just the
-      // permanent prefix that the original instance always saw.
+      // prefix the original instance saw ahead of this history: the head
+      // window as of the chunk (headAsOf), which after a head-window reset
+      // is the opening, or the transition and opening of the chunk's topic.
       //
       // ONE-TO-ONE INVARIANT: chunk records (and the summaries over them)
       // are the persistent authority over how a message is represented.
@@ -9269,26 +9573,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           headCoveredSkipped++;
           continue;
         }
-        llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+        llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
       }
 
       // ---- 2. Prior recall pairs (budget-capped, above) and the raw middle ----
 
       // One sequence by source position after the head window, which always
-      // comes first, so the summarizer never reads an older raw turn as coming
-      // after a later memory. Where the raw middle follows every recall pair,
-      // as it does when chunking runs contiguously, this is the order the
-      // prompt always had: recall pairs, then raw.
+      // comes first, so the summarizer never reads an older raw turn, or an
+      // older memory, as coming after a later memory. A recall pair sits at
+      // its summary's start as the recall filter read it (layoutHistory's
+      // startOf, summaryStartInStore): a summary whose first message a host
+      // removed sits at its first message still in the store, not last.
+      // Where the raw middle follows every recall pair, as it does when
+      // chunking runs contiguously, this is the order the prompt always had:
+      // recall pairs, then raw.
       const middle: Array<{ position: number; summary?: SummaryEntry; message?: StoredMessage }> = [
         ...keptSummaries.map((summary) => ({
-          position: messageOrder.get(summary.sourceRange.first) ?? Number.MAX_SAFE_INTEGER,
+          position: startOf.get(summary.id) ?? Number.MAX_SAFE_INTEGER,
           summary,
         })),
         ...rawMiddle,
       ].sort((a, b) => a.position - b.position);
       for (const { summary: s, message: m } of middle) {
         if (m) {
-          llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+          llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
           continue;
         }
         llmMessages.push({
@@ -9321,7 +9629,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       // ---- 5. Chunk messages raw ----
       for (const m of chunk.messages) {
-        llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+        llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
       }
 
       // ---- 6. Instruction (reading-mode aware; worked out above) ----
@@ -9739,10 +10047,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const own: ResolvedPinBound = pin.level !== undefined ? { level: pin.level }
           : pin.maxLevel !== undefined ? { maxLevel: pin.maxLevel } : 'raw';
         if (readsBounds && !AutobiographicalStrategy.isRawPinBound(own)) return false;
-        const first = positionOf.get(pin.firstMessageId);
-        const last = positionOf.get(pin.lastMessageId);
-        if (first === undefined || last === undefined) return false;
-        for (let i = Math.min(first, last); i <= Math.max(first, last); i++) {
+        for (const i of this.pinPositions(pin, positionOf, allMessages) ?? []) {
           if (pinnedRawSet.has(i) && forceRawPositions.has(i)) return true;
         }
         return false;
@@ -9754,7 +10059,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         `autobio: L1 compression of ${chunk.messages.length} message(s) from ${chunkFirstId} recalls the summaries ` +
           `its pins override: the pinned history it would show raw (~${pinned.pinnedRawTokens} tokens in ` +
           `${pinned.pinnedRaw.length} message(s); pins: ${pins.join(', ') || 'none found'}) ${limit}. ` +
-          `Narrow the pins or raise that budget to show them raw here.`,
+          `Unpin them, or narrow a range pin to fewer messages (a pin on any part of a message stored in parts covers the ` +
+          `rest of that message too, less a part locked with lockChunk outside the pin's ids), or raise that budget to ` +
+          `show them raw here.`,
       );
       logCompressionCall({
         event: 'compression:pinned-raw-over-budget',
@@ -10687,7 +10994,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const buildSub = (subset: typeof chunk.messages, target: number): NormalizedRequest => {
             const msgs = [
               { participant: 'Context Manager', content: [{ type: 'text', text: COMPRESSION_MARKER }] as ContentBlock[] },
-              ...subset.map((m) => ({ participant: m.participant, content: stripThinkingBlocks(m.content) })),
+              ...subset.map((m) => ({ participant: m.participant, content: compressionInputContent(m.content) })),
               { participant: 'Context Manager', content: [{ type: 'text', text: this.applyIdentityReminder(this.getCompressionInstruction(chunk, target), this.chunkIsWitnessed(chunk)) }] as ContentBlock[] },
             ];
             const cleaned = stripUnpairedToolBlocks(this.collapseConsecutiveMessages(splitMixedToolMessages(msgs)));
@@ -11740,7 +12047,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     //
     // No tail-after-merge: same as-of principle as L1 compression. The
     // consolidation is being formed at the moment the last source was
-    // ready, so nothing after that is visible.
+    // ready, so nothing after that is visible, except what a recalled
+    // summary's own text carries: one written before this as-of rule may
+    // say what came after its history.
     const llmMessages: Array<{ participant: string; content: ContentBlock[] }> = [];
 
     // Build lookup maps
@@ -11766,9 +12075,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
     for (const src of sources) collectLeaves(src);
 
-    // Find the start of the merge range in the message store.
-    const mergeFirstMsgId = sources[0].sourceRange.first;
-    const mergeStartIdx = allMessages.findIndex((m) => m.id === mergeFirstMsgId);
+    // The merge range's start in the store: its first leaf still there
+    // (startInStore), as a summary's start is read (summaryStartInStore). -1
+    // only when none is: nothing in the store says when that history
+    // happened, so the merge gets no head (headAsOf) and recalls no summary
+    // (1a), as a compression chunk in that state does.
+    const positionOf = this.positionIndex(allMessages);
+    const mergeStartIdx = this.startInStore(sourceLeafIds, positionOf);
 
     // ---- 1a. PRIOR RECALL SET (chronologically before merge range) ----
     // Computed BEFORE the head emission because the head loop needs the
@@ -11782,20 +12095,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // (`!mergedInto`) lets a merged L1 drop out in favour of its L2/L3
     // parent — the same rule used everywhere else and now in
     // `compressChunkHierarchical`. The cap below is the defense-in-depth.
+    const priorStart = new Map<string, number>();
     const priorSummariesAll = this.summaries
       // Skip empty-content summaries (see compressChunkHierarchical): an empty
       // text block in the merge recall header 400s and stalls compression.
       .filter((s) => !s.mergedInto && !!s.content && s.content.trim().length > 0)
       .filter((s) => {
         for (const lid of s.sourceIds) if (sourceLeafIds.has(lid)) return false;
-        const firstIdx = allMessages.findIndex((m) => m.id === s.sourceRange.first);
-        return firstIdx >= 0 && (mergeStartIdx < 0 || firstIdx < mergeStartIdx);
+        // Where it starts (summaryStartInStore): a summary whose first message
+        // a host removed starts at its first message still in the store, so
+        // it's recalled and its other messages, which its coverage holds out
+        // of the raw middle, keep a form here. One with none left isn't.
+        const firstIdx = this.summaryStartInStore(s, positionOf, summariesById);
+        priorStart.set(s.id, firstIdx);
+        return firstIdx >= 0 && firstIdx < mergeStartIdx;
       })
-      .sort((a, b) => {
-        const ai = allMessages.findIndex((m) => m.id === a.sourceRange.first);
-        const bi = allMessages.findIndex((m) => m.id === b.sourceRange.first);
-        return ai - bi;
-      });
+      .sort((a, b) => priorStart.get(a.id)! - priorStart.get(b.id)!);
 
     // Leaf coverage of every live summary — the rendering authority
     // (one-to-one invariant; see compressChunkHierarchical). Uses the
@@ -11818,9 +12133,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // ---- 1b. HEAD WINDOW (raw, FIRST, ownership-capped) ----
     //
-    // The head window is the foundational identity anchor — the actual
-    // opening of the chronicle. It establishes who is speaking to whom.
-    // Without it, when the merge target's content is heavily first-person
+    // The head window is the foundational identity anchor — the opening
+    // the merged history followed (headAsOf: the chronicle's opening, or
+    // after a head-window reset the opening of its topic). It establishes
+    // who is speaking to whom. Without it, when the merge target's content
+    // is heavily first-person
     // from someone other than the agent, the agent loses its first-person
     // grounding and drifts into the content author's voice.
     //
@@ -11828,10 +12145,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // wins over the token-derived head boundary. A head-range message
     // covered by a live summary renders via its recall pair; one inside
     // the merge tree renders in the TARGET expansion. Never raw here too.
-    const headStartIdx = this.getHeadWindowStartIndex(ctx.messageStore);
-    // Compression holds: provisional content never enters a prompt, not even
-    // as head context (a reset head can sit past the hold boundary).
-    const headEndIdx = Math.min(this.getHeadWindowEnd(ctx.messageStore), this.holdBoundary(ctx.messageStore));
+    // The head as of the merge's first message (headAsOf), as for an L1: a
+    // merge over history from before a head-window reset is given the head
+    // that history followed. Clipped at a hold there, as before.
+    const { start: headStartIdx, end: headEndIdx } = this.headAsOf(ctx.messageStore, mergeStartIdx);
     let headCoveredSkipped = 0;
     for (let i = headStartIdx; !mergeSourceOnly && i < headEndIdx && i < allMessages.length; i++) {
       const m = allMessages[i];
@@ -11839,7 +12156,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         headCoveredSkipped++;
         continue;
       }
-      llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+      llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
     }
     if (headCoveredSkipped > 0) {
       this.diag.warn(
@@ -11923,7 +12240,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const m = allMessages[i];
         if (priorSummaryMessageIds.has(m.id)) continue;
         if (sourceLeafIds.has(m.id)) continue;
-        llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+        llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
       }
     }
 
@@ -11979,7 +12296,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         for (const messageId of src.sourceIds) {
           const m = messageById.get(messageId);
           if (m) {
-            llmMessages.push({ participant: m.participant, content: stripThinkingBlocks(m.content) });
+            llmMessages.push({ participant: m.participant, content: compressionInputContent(m.content) });
           }
         }
       } else {
@@ -12750,48 +13067,58 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * the chunk's own messages, and, unless compressionSourceOnly, each message
    * the request carries raw ahead of the chunk, by the coverage tick's request
    * reads with the pins before the chunk (recallCoverage). From the lower of
-   * the head window's start and headEnd (headEnd clipped at a hold as tick
-   * clips it, and 0 with the head window off, headWindowTokens <= 0), that's
-   * every message the coverage leaves uncovered, up to the chunk or to
-   * headEnd, whichever is later. Before it, only what pins keep raw: the
+   * the start and end of the head that request gives (headAsOf, the head as
+   * of the chunk, its end clipped at a hold as tick clips it, and 0 with the
+   * head window off, headWindowTokens <= 0), that's every message the coverage
+   * leaves uncovered, up to the chunk or to that head's end, whichever is
+   * later. Before it, only what pins keep raw: the
    * messages of an L1 a pin opens, and a pinned message. Tick lays its
    * history out without the pins when the raw they add doesn't fit, so the
    * pins can only add raw here that tick leaves out; and tick strips unpaired
    * tool blocks first. So this can say yes where tick's request has none,
    * never the reverse. The test it returns takes one chunk. Chunks with the
-   * same pins before them read the same coverage, so each coverage is read
-   * once, for the first message its request carries raw with a tool block,
-   * and a chunk's answer is whether that message comes before the later of
-   * the chunk's start and headEnd.
+   * same pins before them, and the same head start, read the same coverage
+   * from the same place, so each is read once, for the first message its
+   * request carries raw with a tool block, and a chunk's answer is whether
+   * that message comes before the later of the chunk's start and its head's
+   * end.
    */
   private requestCarriesToolBlocks(store: MessageStoreView): (chunk: Chunk) => boolean {
     const all = store.getAll();
     const sourceOnly = this.config.compressionSourceOnly === true;
-    const headEnd = Math.min(this.getHeadWindowEnd(store), this.holdBoundary(store));
-    const from = Math.min(this.getHeadWindowStartIndex(store), headEnd);
     const position = new Map(all.map((message, i) => [message.id, i]));
     const pins = sourceOnly ? [] : [...this.forceRawPinPositions(all)].sort((a, b) => a - b);
-    // For each count of pins before a chunk, the index of the first message
-    // that request carries raw with a tool block, or all.length for none.
-    const firstToolBlock = new Map<number, number>();
+    // Built at the first head read, so a count that reads none (source-only,
+    // or each chunk holding a tool block itself) scans no holds.
+    let heads: ((pos: number) => { start: number; end: number }) | undefined;
+    // For each count of pins before a chunk and the start its head's raw
+    // reading takes, the index of the first message that request carries raw
+    // with a tool block, or all.length for none.
+    const firstToolBlock = new Map<string, number>();
     return (chunk) => {
       if (chunk.messages.some((m) => hasToolBlocks(m.content))) return true;
       if (sourceOnly) return false;
-      const start = position.get(chunk.messages[0]?.id ?? '') ?? -1;
+      // The chunk's start as tick's request takes it (startInStore).
+      const start = this.startInStore(chunk.messages.map((m) => m.id), position);
+      heads ??= this.headsAsOf(store);
+      const head = heads(start);
+      const headEnd = head.end;
+      const from = Math.min(head.start, headEnd);
       const pinned = pins.filter((i) => i < start);
-      let first = firstToolBlock.get(pinned.length);
+      const key = `${pinned.length}:${from}`;
+      let first = firstToolBlock.get(key);
       if (first === undefined) {
         const pinnedIds = new Set(pinned.map((i) => all[i].id));
         const seen = this.recallCoverage(pinnedIds);
         // Before `from`, the request carries only what pins keep raw: an L1 a
-        // pin opens, and a pinned message (which lies before headEnd, since
-        // from is at most headEnd).
+        // pin opens, and a pinned message. (Either lies before headEnd there,
+        // since from is at most headEnd.)
         const carried = (message: StoredMessage, i: number): boolean =>
           !seen.coveredMessageIds.has(message.id)
           && (i >= from || seen.openedMessageIds.has(message.id) || pinnedIds.has(message.id));
         const found = all.findIndex((message, i) => carried(message, i) && hasToolBlocks(message.content));
         first = found === -1 ? all.length : found;
-        firstToolBlock.set(pinned.length, first);
+        firstToolBlock.set(key, first);
       }
       return first < Math.max(headEnd, start);
     };
@@ -12844,6 +13171,59 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     });
   }
 
+  /**
+   * The pins that keep messages raw in the adaptive plan's middle, for its
+   * refusal to name (`OverBudgetDiagnostics.rawPins`): the positions the plan
+   * folds history in (before the tail's start, which is the recent window's
+   * start or the head's end where the recent window reaches back into the
+   * head, and outside the head window; with the head window disabled after a
+   * reset, the plan's tail holds the recent messages before the head) that
+   * pins keep raw
+   * (`forceRawPinPositions`), less the messages of system changes, which
+   * stay raw whatever the pins, each priced by `price`, the plan's own raw
+   * price. Every such position counts, a part locked with `lockChunk` among
+   * them, so the tokens are what unpinning frees at most: a pin that keeps no
+   * part raw alone is still named. Where bounds are read, a pin whose own
+   * bound isn't raw keeps nothing raw, so it isn't named even where it
+   * overlaps a raw pin; where they aren't, every pin renders raw. Undefined
+   * when no pin keeps any.
+   */
+  private rawPinsDiagnostics(store: MessageStoreView, price: (position: number) => number): OverBudgetDiagnostics['rawPins'] {
+    if (this.pins.length === 0) return undefined;
+    const messages = store.getAll();
+    const raw = this.forceRawPinPositions(messages);
+    // A message of system changes stays raw whatever the pins (resolvedPinBounds), so unpinning frees none of it.
+    const changes = new Set(systemChangePositions(messages));
+    const headStart = this.getHeadWindowStartIndex(store);
+    const headEnd = this.getHeadWindowEnd(store);
+    const tailStart = Math.max(this.getRecentWindowStart(store), headEnd);
+    const kept = (i: number): boolean => raw.has(i) && !changes.has(i) && i < tailStart && !(i >= headStart && i < headEnd);
+
+    let tokens = 0;
+    for (const i of raw) if (kept(i)) tokens += price(i);
+    if (tokens === 0) return undefined;
+    const positionOf = this.positionIndex(messages);
+    const readsBounds = this.readsPinBounds();
+    const pins: OverBudgetRawPin[] = [];
+    for (const pin of this.pins) {
+      const bound: ResolvedPinBound = pin.level !== undefined ? { level: pin.level }
+        : pin.maxLevel !== undefined ? { maxLevel: pin.maxLevel } : 'raw';
+      if (readsBounds && !AutobiographicalStrategy.isRawPinBound(bound)) continue;
+      const at = this.pinPositions(pin, positionOf, messages);
+      if (!at) continue;
+      let own = 0;
+      for (const i of at) if (kept(i)) own += price(i);
+      if (own === 0) continue;
+      const named = Math.abs(positionOf.get(pin.lastMessageId)! - positionOf.get(pin.firstMessageId)!) + 1;
+      pins.push({
+        pinId: pin.id, kind: pin.kind, ...(pin.name === undefined ? {} : { name: pin.name }),
+        firstMessageId: pin.firstMessageId, lastMessageId: pin.lastMessageId,
+        ...(at.length > named ? { parts: at.length } : {}), tokens: own,
+      });
+    }
+    return { tokens, pins };
+  }
+
   // ============================================================================
   // Adaptive resolution (picker-driven) path
   // ============================================================================
@@ -12884,6 +13264,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // apart from the exceptions applyImageStripping's asEstimated names.
     const pse = this.postStripEstimates(store);
     if (_diag) { this.diag.error(`[cm-cache] selectAdaptive: pse ${Date.now() - _t}ms`); _t = Date.now(); }
+    // A middle message's raw price, as the plan prices it and its refusal
+    // prices the pins that keep it raw (rawPinsDiagnostics). The shard path
+    // in step 5 sends a run of a body's raw shards as one entry, their text
+    // joined and uncut, so a shard takes no extra.
+    const middlePrice = (i: number): number => {
+      const msg = messages[i]!;
+      return msg.bodyGroupId ? pse[i]! : pse[i]! + this.cappedForSend(store, msg, msgCap).extra;
+    };
 
     // ----- 1. Build head/tail sets and reserve the tail before emitting -----
     const headStart = this.getHeadWindowStartIndex(store);
@@ -12898,13 +13286,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Compute the fixed raw windows first. They are hard reservations, not
     // best-effort phases: foldable history may use only the space left after
     // every head and tail message has been accounted for.
-    for (let i = headStart; i < headEnd && i < messages.length; i++) {
+    // The head's positions: after a reset, the system changes stored before
+    // the head window, then the window (headPositions).
+    const head = this.headPositions(messages, headStart, headEnd);
+    for (const i of head) {
       const msg = messages[i];
       const tokens = pse[i] + this.cappedForSend(store, msg, msgCap).extra;
       headMessageIds.add(msg.id);
       headTokens += tokens;
     }
     const effectiveRecentStart = Math.max(recentStart, headEnd);
+    // System changes stay raw wherever they are (resolvedPinBounds), and
+    // nothing a refusal can name shrinks them: the ones outside the head and
+    // the tail are sent raw in the middle, beside what compression folds.
+    let middleChangeTokens = 0;
+    for (const i of systemChangePositions(messages)) {
+      if (i >= effectiveRecentStart || headMessageIds.has(messages[i].id)) continue;
+      middleChangeTokens += pse[i] + this.cappedForSend(store, messages[i], msgCap).extra;
+    }
     for (let i = effectiveRecentStart; i < messages.length; i++) {
       const msg = messages[i];
       const tokens = pse[i] + this.cappedForSend(store, msg, msgCap).extra;
@@ -12935,13 +13334,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // does a newest turn that starts inside the head.
       let floorTokens = 0;
       if (messages.length > 0) {
-        const newestBody = bodyStart((k) => messages[k], messages.length - 1);
+        // A system change is no conversation message, so the newest one is
+        // the newest that isn't one, and the changes after it stay raw with
+        // it (counted from floorStart below).
+        let newest = messages.length - 1;
+        while (newest > 0 && holdsSystemChange(messages[newest].content)) newest--;
+        const newestBody = bodyStart((k) => messages[k], newest);
         const newestTurn = newestBody > 0 && this.hasToolResult(messages[newestBody])
           ? bodyStart((k) => messages[k], newestBody - 1)
-          : messages.length - 1;
+          : newest;
         const floorStart = Math.min(newestTurn, this.holdBoundary(store));
         for (let i = floorStart; i < messages.length; i++) {
           floorTokens += pse[i] + this.cappedForSend(store, messages[i], msgCap).extra;
+        }
+        // A system change outside the head stays raw wherever the recent
+        // window starts, so the floor holds every one before it too, and
+        // when the changes alone exceed the budget nothing is named.
+        for (const i of systemChangePositions(messages)) {
+          if (i >= floorStart) break;
+          if (!headMessageIds.has(messages[i].id)) floorTokens += pse[i] + this.cappedForSend(store, messages[i], msgCap).extra;
         }
       }
       throw this.overBudgetError(budget, {
@@ -12967,7 +13378,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Emit the already-reserved head entries raw, each cut at the cap as any
     // raw message is.
-    for (let i = headStart; i < headEnd && i < messages.length; i++) {
+    for (const i of head) {
       const msg = messages[i];
       const { content, extra } = this.cappedForSend(store, msg, msgCap);
       const tokens = pse[i] + extra;
@@ -13036,25 +13447,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Excluding that zone made pre-transition history invisible to the picker
     // (never planned, never rendered): the adaptive variant of the frontier
     // gap the coverage invariant exists to refuse.
-    const middleSegments: ReadonlyArray<readonly [number, number]> = headStart > 0
-      ? [[0, headStart], [headEnd, effectiveRecentStart]]
-      : [[headEnd, effectiveRecentStart]];
+    // A system change before a reset head is in the head (headPositions), so
+    // the middle walks pass over it.
+    const middleSegments = AutobiographicalStrategy.middleRanges(headStart, headEnd, effectiveRecentStart);
 
     const pickerChunks: PickerChunk[] = [];
     const salience = this.salienceByPosition(messages);
     for (const [segStart, segEnd] of middleSegments)
     for (let i = segStart; i < segEnd && i < messages.length; i++) {
       const msg = messages[i];
+      if (headMessageIds.has(msg.id)) continue;
       const ch = chunkAtPosition ? chunkAtPosition[i] : chunksByMessageId.get(msg.id);
-      // This is the chunk's raw price. The shard path in step 5 sends a run
-      // of a body's raw shards as one entry, their text joined and uncut, so
-      // a shard takes no extra here. It prices that entry as the shards'
-      // text it joins, each by estimateTokens, the store's price, so a shard
-      // of text alone is counted there as here; a shard's other blocks are
-      // priced here, and the shard path leaves them out. A shard the plan
-      // folds is priced as its summary. The head and recent windows cut a
-      // shard as they emit it.
-      const tokens = msg.bodyGroupId ? pse[i] : pse[i] + this.cappedForSend(store, msg, msgCap).extra;
+      // This is the chunk's raw price (middlePrice). The shard path in step 5
+      // prices its joined entry as the shards' text it joins, each by
+      // estimateTokens, the store's price, so a shard of text alone is
+      // counted there as here; a shard's other blocks are priced here, and
+      // the shard path leaves them out. A shard the plan folds is priced as
+      // its summary. The head and recent windows cut a shard as they emit it.
+      const tokens = middlePrice(i);
       const bound = pinBounds.size > 0 ? pinBounds.get(i) : undefined;
       const l1Id = ch?.summaryId ?? l1ByMessage.get(msg.id);
       pickerChunks.push({
@@ -13073,7 +13483,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // Also include head and tail in PickerChunks (so token accounting matches)
     // — but mark them as in-head/in-tail so the picker won't fold them.
-    for (let i = headStart; i < headEnd && i < messages.length; i++) {
+    for (const i of head) {
       const msg = messages[i];
       const tokens = pse[i] + this.cappedForSend(store, msg, msgCap).extra;
       pickerChunks.push({
@@ -13387,8 +13797,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Taken at a refusal of this select (the plan check's, or a later
     // stage's), or for a dry run's preview of a plan over the budget, since a
     // plan that fits and renders needs no list.
+    // Compression shrinks neither the head and the tail nor a system change
+    // between them: when those alone exceed the budget, nothing the list
+    // names clears it.
     const planClearedBy = (): OverBudgetClearedBy[] =>
-      result.produced.length > 0 && this.compressionWorkQueued(store, 'adaptive') ? ['compression'] : [];
+      headTokens + tailTokens + middleChangeTokens <= rejectionBudget && result.produced.length > 0 && this.compressionWorkQueued(store, 'adaptive') ? ['compression'] : [];
     const planFits = result.finalTokens <= rejectionBudget;
 
     // Record what a dry run needs (select() puts back the transition
@@ -13427,6 +13840,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // real compile will do. If the retry at 1 is still over, it reports.
     const dryFallback = dryRun && this._calibrationProvisional !== null && this._calibration > 1;
     if (!planFits && (!dryRun || dryFallback)) {
+      // The plan's middle is what's over, priced as the plan priced it, so
+      // the pins keeping raw tokens there are named. The refusals after the
+      // plan count other things (an emitted prefix, a shard's text alone)
+      // and don't name pins.
+      const rawPins = this.rawPinsDiagnostics(store, middlePrice);
       throw this.overBudgetError(budget, {
         budget: rejectionBudget,
         actual: result.finalTokens,
@@ -13439,6 +13857,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           middleTokens: Math.max(0, result.finalTokens - headTokens - tailTokens),
           middleChunkCount: pickerChunks.length - headMessageIds.size - tailMessageIds.size,
           deepestLevel,
+          ...(rawPins === undefined ? {} : { rawPins }),
         },
       });
     }
@@ -13480,6 +13899,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let i = segStart;
     while (i < segEnd && i < messages.length) {
       const msg = messages[i];
+      if (headMessageIds.has(msg.id)) {
+        i++; // sent in the head (headPositions)
+        continue;
+      }
 
       if (msg.bodyGroupId) {
         // Collect this body's consecutive shards. Another ingestion of the
@@ -13701,7 +14124,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // post-strip context the agent actually receives. This selection budgets
     // by postStripEstimates, so the strip counts as they do (see
     // applyImageStripping's asEstimated, which names where it doesn't).
-    this.applyImageStripping(merged, store, { asEstimated: true });
+    this.applyImageStripping(merged, store, { asEstimated: true, returned: true });
 
     // The newest stored message is the triggering turn for this compile. A
     // structural repair may rewrite tool blocks, but it must never erase that
@@ -13713,9 +14136,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // newest shard alone outgrows the recent window. Only that body's shards
     // count: an earlier ingestion of the same text shares the group id, and its
     // survival proves nothing about the newest turn.
-    const newest = messages[messages.length - 1];
+    // A system change is no turn and always stays raw, so the newest turn is
+    // the newest message that isn't one, as for the floor above.
+    let newestAt = messages.length - 1;
+    while (newestAt > 0 && holdsSystemChange(messages[newestAt].content)) newestAt--;
+    const newest = messages[newestAt];
     if (newest) {
-      const newestBody = bodyBoundsIn(messages, messages.length - 1);
+      const newestBody = bodyBoundsIn(messages, newestAt);
       const newestBodyIds = new Set(messages.slice(newestBody.from, newestBody.to + 1).map(m => m.id));
       const newestRetained = merged.some(
         entry => (entry.sourceMessageId !== undefined && newestBodyIds.has(entry.sourceMessageId)) ||
@@ -13726,10 +14153,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           stage: 'Structural repair did not retain the newest turn',
           budget: rejectionBudget,
           actual: totalTokens + tailTokens,
-          // The newest turn is what's missing, and only room for it brings it
-          // back. A newer message makes a different turn the newest, and this
-          // one then sits in the middle raw until its chunk closes and
-          // compression summarizes it, so the next compile is no smaller.
+          // The newest turn is what's missing: the repair trimmed it as an
+          // unanswered call, which no budget brings back. A newer message
+          // makes a different turn the newest, and this one then sits in the
+          // middle raw until its chunk closes and compression summarizes it,
+          // so the next compile is no smaller.
           clearedBy: [],
           diagnostics: {
             middleCountUnit: 'picker-chunks',
@@ -13807,6 +14235,32 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private _lastCompileEstimate = 0;
   private _storeView: MessageStoreView | null = null;
+
+  /** Thinking the context manager left out after this strategy's committing
+   *  select priced it isn't sent, so the calibration sample's estimate leaves
+   *  out what this strategy priced it at: each block at the store's estimate.
+   *  The select priced each raw message's thinking blocks at just that: the
+   *  image strip and the cap that also enter a message's price never change
+   *  a thinking block's. */
+  noteThinkingLeftOut(blocks: readonly ContentBlock[]): void {
+    if (blocks.length === 0) return;
+    const tokens = this.estimateTokens([...blocks]);
+    if (Number.isFinite(tokens) && tokens > 0) this._lastCompileEstimate = Math.max(0, this._lastCompileEstimate - tokens);
+  }
+
+  /** Whether the select in progress is for a model that binds thinking
+   *  (`SelectOptions.thinkingBinding`): set from the select's own option for
+   *  the run of its select path, and false outside it. A summary's carriers
+   *  were minted in its summarizer's request, so such a model never takes
+   *  them in the live window, and the live window renders and prices them as
+   *  under `carrierPolicy: 'live-strip'`. */
+  private thinkingBound = false;
+
+  /** The carrier policy the live window renders and prices under: the
+   *  configured one, or `'live-strip'` while thinking is bound. */
+  private liveCarrierPolicy(): CarrierPolicy {
+    return this.thinkingBound || this.config.carrierPolicy === 'live-strip' ? 'live-strip' : 'full';
+  }
 
   /**
    * Closed-loop estimator calibration (2026-07-12). Feed the REAL input total
@@ -15017,14 +15471,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       pending = [];
     };
-    for (let i = window.headStart; i < window.headEnd && i < messages.length; i++) pushRaw(messages[i]!);
-    const segments: ReadonlyArray<readonly [number, number]> = window.headStart > 0
-      ? [[0, window.headStart], [window.headEnd, window.recentStart]]
-      : [[window.headEnd, window.recentStart]];
-    for (const [segStart, segEnd] of segments) {
+    const head = this.headPositions(messages, window.headStart, window.headEnd);
+    for (const i of head) pushRaw(messages[i]!);
+    const inHead = new Set(head);
+    for (const [segStart, segEnd] of AutobiographicalStrategy.middleRanges(window.headStart, window.headEnd, window.recentStart)) {
       let i = segStart;
       while (i < segEnd && i < messages.length) {
         const msg = messages[i]!;
+        if (inHead.has(i)) {
+          i++;
+          continue;
+        }
         if (msg.bodyGroupId) {
           const groupStart = i;
           i = bodyEnd(Math.min(segEnd, messages.length), (k) => messages[k]!, groupStart) + 1;
@@ -15462,7 +15919,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Memoized price of a summary's recall answer as the LIVE WINDOW renders
    *  it (carriers included under `carrierPolicy: 'full'`, omitted under
-   *  `'live-strip'`, because this price feeds the fold planner for that same
+   *  `'live-strip'` or while thinking is bound, as liveCarrierPolicy says,
+   *  because this price feeds the fold planner for that same
    *  emission): `estimate` is the estimate of that content, and `cost` is
    *  what it's priced at, the estimate floored at the provider's measurement
    *  where that measurement counts what's sent. Keyed by the summary identity
@@ -15474,7 +15932,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   protected recallAnswerCost(s: SummaryEntry): { estimate: number; cost: number } {
     const recallEnvelope = this.config.recallEnvelope === 'xml' ? 'xml' : 'none';
-    const carrierPolicy = this.config.carrierPolicy === 'live-strip' ? 'live-strip' : 'full';
+    const carrierPolicy = this.liveCarrierPolicy();
     const calibration = this._storeView?.getTokenCalibration?.() ?? 1;
     const key = JSON.stringify([s.id, s.tokens, recallEnvelope, carrierPolicy, calibration]);
     const cached = this._answerCostCache.get(key);
@@ -15720,7 +16178,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const maxTokens = budget.maxTokens - budget.reserveForResponse;
     const messages = store.getAll();
     const msgCap = this.config.maxMessageTokens;
-
     // Emission grace (coverage invariant, 76e95a0): selection below still
     // TARGETS maxTokens, but emission never silently drops content to fit —
     // it may overshoot up to the grace window, and beyond that the select
@@ -15736,7 +16193,38 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // any raw message is (from headStart, not necessarily 0)
     const headStart = this.getHeadWindowStartIndex(store);
     const headEnd = this.getHeadWindowEnd(store);
-    for (let i = headStart; i < headEnd && i < messages.length; i++) {
+    // System changes stay raw wherever they are (resolvedPinBounds), and no
+    // newer message or compression shrinks them, so when they alone exceed
+    // the grace limit only the caller, consolidating them, clears it. That
+    // refusal comes first, as every strategy gives it; an eviction from the
+    // recent window while the changes fit stays a loss the coverage
+    // invariant refuses, as any there is.
+    let changeTokens = 0;
+    for (const i of systemChangePositions(messages)) {
+      const msg = messages[i];
+      changeTokens += store.estimateTokens(this.prunedForSend(store, msg)) + this.cappedForSend(store, msg, msgCap).extra;
+    }
+    if (changeTokens > graceLimit) {
+      throw this.overBudgetError(budget, {
+        stage: 'Hierarchical: its system changes alone exceed the budget',
+        budget: graceLimit,
+        actual: changeTokens,
+        clearedBy: [],
+        diagnostics: {
+          middleCountUnit: 'selection-items',
+          deepestLevelKind: 'attempted',
+          headTokens: changeTokens,
+          tailTokens: 0,
+          middleTokens: 0,
+          middleChunkCount: 0,
+          deepestLevel: 0,
+        },
+      });
+    }
+    // After a reset, the system changes stored before the head window go
+    // first, in the head (headPositions).
+    const head = this.headPositions(messages, headStart, headEnd);
+    for (const i of head) {
       const msg = messages[i];
       const { content, extra } = this.cappedForSend(store, msg, msgCap);
       // The pruned form's price with its images whole: this selection's
@@ -15753,12 +16241,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           actual: totalTokens + tokens,
           // The head is sent whole by definition, and its size is cold
           // configuration (headWindowTokens isn't a hot setting). Besides a
-          // larger budget, a head-window reset clears it, which starts a new
-          // topic and isn't a lever the list names (OverBudgetClearedBy).
+          // larger budget, a head-window reset clears the window's share of
+          // it, though not the system changes stored before the new head,
+          // which go in it; a reset starts a new topic and isn't a lever the
+          // list names (OverBudgetClearedBy).
           // Newer messages can shrink a head that holds images, since the
           // image strip takes the oldest images first (maxLiveImages,
-          // maxLiveImageBytes, imageStripDepthTokens), but whether they'd
-          // strip enough isn't known, so nothing is named for that either.
+          // maxLiveImageBytes, each within its image ceiling, and
+          // imageStripDepthTokens), but whether they'd strip enough isn't
+          // known, so nothing is named for that either.
           clearedBy: [],
           diagnostics: {
             middleCountUnit: 'selection-items',
@@ -15969,7 +16460,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // The middle is everything before the recent window that is not the LIVE
     // head window — including [0, headStart) after a head-window reset, which
     // is compressible-but-often-unsummarized history, not head.
-    const inLiveHead = (i: number): boolean => i >= headStart && i < headEnd;
+    // The head, as Phase 0 sent it: the live window, and after a reset the
+    // system changes before it (headPositions).
+    const inHead = new Set(head);
+    const inLiveHead = (i: number): boolean => inHead.has(i);
     for (let i = 0; i < effectiveRecentStart && i < messages.length; i++) {
       if (inLiveHead(i)) continue;
       if (pinnedPositionsSet.has(i)) {
@@ -16061,7 +16555,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const covered = new Set<string>();
       for (const s of selectedSummaries) for (const leaf of leavesOf(s)) covered.add(leaf);
       const rawPlanned = new Set<string>();
-      for (let i = headStart; i < headEnd && i < messages.length; i++) rawPlanned.add(messages[i].id);
+      for (const i of head) rawPlanned.add(messages[i].id);
       for (let i = effectiveRecentStart; i < messages.length; i++) rawPlanned.add(messages[i].id);
       for (const p of middleRaw) rawPlanned.add(p.msg.id);
       const selectedIdSet = new Set(selectedSummaries.map(s => s.id));
@@ -16303,7 +16797,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // applies the rule's verdicts (see applyImageStripping's asEstimated).
     // The render stats keep each message at the price emission
     // gave it, a stripped image included.
-    this.applyImageStripping(entries, store);
+    this.applyImageStripping(entries, store, { returned: true });
     this.rsEnd();
     return entries;
   }
@@ -16407,13 +16901,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * A stored message's content priced as a compression request sends it: its
-   * thinking stripped, as a request's messages are built from raw messages,
-   * then priced as prepared (preparedTokensOf). Images count at the store's
+   * thinking stripped and its system changes left out, as a request's messages
+   * are built from raw messages (compressionInputContent), then priced as
+   * prepared (preparedTokensOf). Images count at the store's
    * estimate, though a request's inline image cap can replace some with
    * placeholders.
    */
   protected sentTokensOf(content: ContentBlock[], ctx: StrategyContext): number {
-    return this.preparedTokensOf(stripThinkingBlocks(content), ctx);
+    return this.preparedTokensOf(compressionInputContent(content), ctx);
   }
 
   /**
@@ -16639,6 +17134,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     let headContent = '';
     let headReplacements = 0;
     for (const m of headMessages) {
+      // A message of system changes has no text: it adds no entry.
+      if (holdsSystemChange(m.content)) continue;
       // Counted as the request sends it: only the message's text blocks
       // reach it, with their serialized media replaced on a copy, so a
       // payload doesn't spend the cap. The request carries the markers, so
@@ -16943,6 +17440,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // distant chronological regions and poisoned every ancestor merge.
         // Close even a thin run at the ownership seam. A short summary (or
         // raw fallback while it is pending) is cheaper than a non-tree span.
+        // A system change, which stays raw, is such a seam. The store refuses
+        // a change between a call and its result where a write can see it
+        // (MessageStore.refuseToolPairSplit), so this close parts a pair only
+        // in a shape that refusal leaves alone.
         closeCurrent(i);
       }
       let msgTokens = store.estimateTokens(msg);
@@ -17118,13 +17619,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  the count, byte and depth limits (the byte rule is greedy, so a large
    *  newest image can be replaced while smaller older ones stay), the
    *  hysteresis rule, which trims to a fraction of them, and the compression
-   *  request's own image byte cap. Windowed passthrough uses the same text. */
+   *  request's own image byte and count caps. Windowed passthrough uses the
+   *  same text. */
   private static readonly IMAGE_PLACEHOLDER = '[image not shown: this context keeps only some images]';
 
   /** Post-pass over compiled entries: replace image blocks with a text
    *  placeholder once they fall outside the live-image window — either deeper
    *  than `imageStripDepthTokens` from the newest message, or beyond the
-   *  `maxLiveImages` most-recent images (counted newest-first). Summaries are
+   *  `maxLiveImages` most-recent images (counted newest-first), or past
+   *  `maxLiveImageBytes`, the count and bytes each within its image ceiling
+   *  (resolvedImageLimits). Summaries are
    *  already text, so they're naturally unaffected. The adjacent
    *  "[image attachment: <name>]" text added at ingest preserves the filename,
    *  so the placeholder itself stays terse. Reduces tokens, so it never pushes
@@ -17179,15 +17683,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  prices by the estimates asks too. With `imageStripHysteresisRatio`,
    *  every caller gets the verdicts: the rule's set is per stored message,
    *  so counting what the entries send has nothing to add, and a tool result
-   *  pairing repair moved keeps its own message's count. */
-  protected applyImageStripping(entries: ContextEntry[], store: MessageStoreView, opts: { asEstimated?: boolean } = {}): void {
-    const maxLive = this.config.maxLiveImages ?? 0;             // 0 = unlimited count
+   *  pairing repair moved keeps its own message's count.
+   *
+   *  `returned`: select returns this render, so where it replaces an image
+   *  the strip notes which ceiling-set limits were over, for select to
+   *  report once it has returned it (reportCeilingHits): under the limits,
+   *  those a replaced image is over, and with `imageStripHysteresisRatio`,
+   *  where the rule's set replaces an image, those that brought a trim on
+   *  anywhere in the rule's replay.
+   *  A layout rendered only to compare against, such as kv-unified's kept
+   *  one, and any other caller's render, leave it unset. */
+  protected applyImageStripping(
+    entries: ContextEntry[],
+    store: MessageStoreView,
+    opts: { asEstimated?: boolean; returned?: boolean } = {},
+  ): void {
+    // Count and bytes within the image ceilings; 0 = unlimited.
+    const { images: maxLive, bytes: maxLiveBytes } = this.resolvedImageLimits().target;
     const depthTokens = this.config.imageStripDepthTokens ?? 0; // 0 = no depth strip
-    const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
     // Policy disabled: no limit is positive, as postStripEstimates decides it,
     // which then gives no verdicts.
     if (!(maxLive > 0) && !(depthTokens > 0) && !(maxLiveBytes > 0)) return;
-
     const messages = store.getAll();
     const posById = this.positionIndex(messages);
     // Image-bearing entries, newest-first by source position. Entries with no
@@ -17200,19 +17716,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       .filter(({ idx }) => this.hasImageBlock(entries[idx].content))
       .sort((a, b) => b.pos - a.pos);
 
+    // For the ceiling line: which limits a ceiling sets were over where this
+    // strip replaces an image. Under the limits, those the image is over,
+    // whatever else strips it too; where the rule's set replaces an image,
+    // those that brought a trim on anywhere in its replay
+    // (stripReplayAtLimits). An image replaced for want of a verdict isn't
+    // the set's strip, and notes nothing.
+    const ceilingSet = ceilingSetLimits(this.configuredImageLimits());
+    const notes: CeilingKinds = { images: false, bytes: false };
+    const noteCeilings = (over: Readonly<CeilingKinds>): void => {
+      if (over.images && ceilingSet.images) notes.images = true;
+      if (over.bytes && ceilingSet.bytes) notes.bytes = true;
+    };
+
     if (opts.asEstimated || this.imageHysteresisRatio() !== undefined) {
       const verdicts = this.postStripVerdicts(store);
       const taken = new Map<number, Map<unknown, number>>();
       /** The verdict of the next image of `group` in the message at `home`,
        *  if that image has this image's payload. */
-      const verdictOf = (image: ContentBlock, home: number, group: unknown): boolean => {
+      const verdictOf = (image: ContentBlock, home: number, group: unknown): ImageVerdict | undefined => {
         let byGroup = taken.get(home);
         if (!byGroup) taken.set(home, byGroup = new Map());
         const n = byGroup.get(group) ?? 0;
         byGroup.set(group, n + 1);
         const judged = verdicts.get(home)?.get(group)?.[n];
-        return judged !== undefined && judged.key === imagePayload(image) && judged.keep;
+        return judged !== undefined && judged.key === imagePayload(image) ? judged : undefined;
       };
+      const rule = this.imageHysteresisRatio() !== undefined;
+      let ruleReplaced = false;
       for (const { idx, pos } of ordered) {
         const keeps: boolean[] = [];
         for (const block of entries[idx].content) {
@@ -17221,13 +17752,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // where pairing repair moved it here, the one it was moved from.
           const from = this._movedFrom.get(block);
           const home = from === undefined ? pos : posById.get(from) ?? -1;
-          for (const image of imagesIn([block])) keeps.push(verdictOf(image, home, group));
+          for (const image of imagesIn([block])) {
+            const judged = verdictOf(image, home, group);
+            if (judged && !judged.keep) {
+              if (rule) ruleReplaced = true;
+              else noteCeilings(judged.over);
+            }
+            keeps.push(judged?.keep ?? false);
+          }
         }
         // replaceImages asks about each image once, in imagesIn's order.
         let next = 0;
         entries[idx].content = replaceImages(entries[idx].content, () => !keeps[next++],
           AutobiographicalStrategy.IMAGE_PLACEHOLDER);
       }
+      if (ruleReplaced) {
+        const replay = this.stripReplayAtLimits(store);
+        if (replay) noteCeilings(replay.over);
+      }
+      if (opts.returned) this._ceilingNotes = notes;
       return;
     }
 
@@ -17260,7 +17803,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const blockBytes = inlineImageBytes(image);
       const overCount = maxLive > 0 && keptImages >= maxLive;
       const overBytes = maxLiveBytes > 0 && keptImageBytes + blockBytes > maxLiveBytes;
-      if (tooDeep || overCount || overBytes) return false;
+      if (tooDeep || overCount || overBytes) {
+        noteCeilings({ images: overCount, bytes: overBytes });
+        return false;
+      }
       keptImages++;
       keptImageBytes += blockBytes;
       return true;
@@ -17282,6 +17828,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return true;
       }, AutobiographicalStrategy.IMAGE_PLACEHOLDER);
     }
+    // A render select returns (`returned`) leaves which ceiling-set limits
+    // were over for select to report once it has returned it; the last such
+    // strip is the render it returns. Any other strip, such as
+    // renderAsNewest's, leaves nothing.
+    if (opts.returned) this._ceilingNotes = notes;
   }
 
   /** Hysteresis ratio in (0, 1), or undefined when the option is off. */
@@ -17293,8 +17844,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * imageStripHysteresisRatio's set, from the stored messages and the limits
    * alone: replay the messages oldest first, admitting each one's images in
-   * order, and whenever a limit binds (`maxLiveImages`, `maxLiveImageBytes`,
-   * or the oldest live image deeper than `imageStripDepthTokens`), strip the
+   * order, and whenever a limit binds (`maxLiveImages` and
+   * `maxLiveImageBytes`, each within its image ceiling, or the oldest live
+   * image deeper than `imageStripDepthTokens`), strip the
    * oldest live images one at a time until every limit fits ratio × itself.
    * A target that rounds to 0 is 0, but the newest image stays while it fits
    * the full limits, and so do the other images of its message while only
@@ -17314,11 +17866,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * prices them.
    */
   protected imageStripReplay(store: MessageStoreView): ReadonlyMap<MessageId, number> | undefined {
+    return this.stripReplayAtLimits(store)?.out;
+  }
+
+  /** The rule's set at the window's limits (imageStripReplay), memoized,
+   *  with the count and byte limits that brought a trim on (applyImageStripping
+   *  notes them for the ceiling line). */
+  private stripReplayAtLimits(store: MessageStoreView): StripReplay | undefined {
     const ratio = this.imageHysteresisRatio();
     if (ratio === undefined) return undefined;
     const depthCap = this.config.imageStripDepthTokens ?? 0;
-    const countCap = this.config.maxLiveImages ?? 0;
-    const bytesCap = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
+    // The count and bytes within the image ceilings, as the limits apply them.
+    const { images: countCap, bytes: bytesCap } = this.resolvedImageLimits().target;
     if (!(depthCap > 0) && !(countCap > 0) && !(bytesCap > 0)) return undefined;
     return this.withToolPruning(store, () => {
       // Keyed as the post-strip memo is: the store's cached listing, its
@@ -17333,7 +17892,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         memo && memo.messages === messages && memo.calibration === calibration && memo.depthCap === depthCap &&
         memo.countCap === countCap && memo.bytesCap === bytesCap && memo.ratio === ratio &&
         memo.pruning === pruning && memo.msgCap === msgCap
-      ) return memo.out;
+      ) return memo.replay;
       // tokensBefore[i]: the tokens of every message before i, so the depth of
       // an image in message j, with message i the newest, is
       // tokensBefore[i + 1] - tokensBefore[j].
@@ -17344,29 +17903,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let first = 0;
       let liveBytes = 0;
       const out = new Map<MessageId, number>();
+      const brought: CeilingKinds = { images: false, bytes: false };
       for (let i = 0; i < messages.length; i++) {
         for (const image of imagesIn(this.cappedForSend(store, messages[i]!, msgCap).content)) {
           const bytes = inlineImageBytes(image);
           live.push({ at: i, bytes });
           liveBytes += bytes;
         }
-        const overCountOrBytes = (count: number, size: number): boolean =>
-          (countCap > 0 && live.length - first > count) || (bytesCap > 0 && liveBytes > size);
+        const overCount = (count: number): boolean => countCap > 0 && live.length - first > count;
+        const overBytes = (size: number): boolean => bytesCap > 0 && liveBytes > size;
+        const overDepth = (depth: number): boolean =>
+          depthCap > 0 && first < live.length && tokensBefore[i + 1]! - tokensBefore[live[first]!.at]! > depth;
+        const overCountOrBytes = (count: number, size: number): boolean => overCount(count) || overBytes(size);
         const over = (depth: number, count: number, size: number): boolean =>
-          overCountOrBytes(count, size) ||
-          (depthCap > 0 && first < live.length && tokensBefore[i + 1]! - tokensBefore[live[first]!.at]! > depth);
+          overCountOrBytes(count, size) || overDepth(depth);
         if (!over(depthCap, countCap, bytesCap)) continue;
+        if (overCount(countCap)) brought.images = true;
+        if (overBytes(bytesCap)) brought.bytes = true;
         const depth = Math.floor(depthCap * ratio);
-        const count = Math.floor(countCap * ratio);
-        const size = Math.floor(bytesCap * ratio);
-        while (first < live.length && over(depth, count, size)) {
+        const countTarget = Math.floor(countCap * ratio);
+        const sizeTarget = Math.floor(bytesCap * ratio);
+        while (first < live.length && over(depth, countTarget, sizeTarget)) {
           // The images left are one message's and within the full limits: the
           // newest of them stays, and the rest stay too while only depth is over
           // its target, since stripping images of one message can't lower the
           // depth it's at.
           if (
             live[first]!.at === live[live.length - 1]!.at && !over(depthCap, countCap, bytesCap) &&
-            (live.length - first === 1 || !overCountOrBytes(count, size))
+            (live.length - first === 1 || !overCountOrBytes(countTarget, sizeTarget))
           ) break;
           const oldest = live[first++]!;
           liveBytes -= oldest.bytes;
@@ -17374,20 +17938,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           out.set(id, (out.get(id) ?? 0) + 1);
         }
       }
-      this._imageStripReplayMemo = { messages, calibration, depthCap, countCap, bytesCap, ratio, pruning, msgCap, out };
-      return out;
+      const replay: StripReplay = { out, over: brought };
+      this._imageStripReplayMemo = { messages, calibration, depthCap, countCap, bytesCap, ratio, pruning, msgCap, replay };
+      return replay;
     });
   }
 
   private _imageStripReplayMemo: {
     messages: readonly StoredMessage[]; calibration: number; depthCap: number; countCap: number; bytesCap: number; ratio: number;
-    pruning: object; msgCap: number | undefined; out: ReadonlyMap<MessageId, number>;
+    pruning: object; msgCap: number | undefined; replay: StripReplay;
   } | null = null;
 
   /**
    * Post-strip token estimate per message index (2026-07-12 tail-starvation
    * fix). Mirrors `applyImageStripping` as `selectAdaptive` asks for it
-   * (`asEstimated`): an image beyond the `maxLiveImages`
+   * (`asEstimated`), with the same limits from resolvedImageLimits(), the
+   * count and bytes within their image ceilings: an image beyond the `maxLiveImages`
    * newest (counted newest-first) or deeper than `imageStripDepthTokens` of
    * the store's (calibrated) estimate from the live end renders as a placeholder — so every place
    * that BUDGETS messages (recent-window walk-back, head/tail sums, middle
@@ -17431,8 +17997,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   ): number[] {
     const messages = store.getAll();
     const stripDepth = this.config.imageStripDepthTokens ?? 0;
-    const maxLive = this.config.maxLiveImages ?? 0;
-    const maxLiveBytes = this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES;
+    const { images: maxLive, bytes: maxLiveBytes } = this.resolvedImageLimits().target;
     // A compile asks for this pass more than once (recent-window scan, then
     // the picker inputs). The listing array is the store's own cached view,
     // so its identity, calibration and the knobs key the memo, the
@@ -17455,7 +18020,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // each block's images (a tool result's by its call's id, the top-level
     // images together), each with its payload (imagePayload) and whether the
     // strip keeps it, in order.
-    const verdicts = new Map<number, Map<unknown, Array<{ key: unknown; keep: boolean }>>>();
+    const verdicts = new Map<number, Map<unknown, ImageVerdict[]>>();
     const stripActive = stripDepth > 0 || maxLive > 0 || maxLiveBytes > 0;
     // With imageStripHysteresisRatio, the rule's set decides in place of the
     // limits, which it already fits: a message's first images, as many as
@@ -17493,7 +18058,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // price, through the cut's extra, rather than here.
         // Block by block, which walks the cut's images in imagesIn's order.
         const cut = this.cappedForSend(store, messages[i]!, msgCap).content;
-        const groups = new Map<unknown, Array<{ key: unknown; keep: boolean }>>();
+        const groups = new Map<unknown, ImageVerdict[]>();
         let ruleLeft = replay !== undefined ? replay.get(messages[i]!.id) ?? 0 : undefined;
         for (const block of cut) {
           const group = imageGroup(block);
@@ -17517,7 +18082,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             }
             let judged = groups.get(group);
             if (!judged) groups.set(group, judged = []);
-            judged.push({ key: imagePayload(b), keep });
+            judged.push({ key: imagePayload(b), keep, over: { images: beyondCount, bytes: beyondBytes } });
           }
         }
         if (groups.size > 0) verdicts.set(i, groups);
@@ -17531,11 +18096,112 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private _postStripMemo: {
     messages: readonly StoredMessage[]; calibration: number; stripDepth: number; maxLive: number; maxLiveBytes: number; ratio: number | undefined; pruning: object; msgCap: number | undefined; out: number[];
-    verdicts: ReadonlyMap<number, ReadonlyMap<unknown, ReadonlyArray<{ key: unknown; keep: boolean }>>>;
+    verdicts: ReadonlyMap<number, ReadonlyMap<unknown, ReadonlyArray<ImageVerdict>>>;
   } | null = null;
 
-  /** Byte wall default: 20MB of base64 (API total-request cap is 32MB). */
+  /** Byte wall default: 20 MiB of base64, under the default image byte
+   *  ceiling (24 MiB), which leaves room under membrane's 28 MiB cap. */
   protected static readonly DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
+
+  /** Which ceilings have been said to strip the live window (once each per instance). */
+  private readonly ceilingBoundReported = { images: false, bytes: false };
+  /** Which ceiling-set limits were over where the last render select
+   *  returned replaced an image (applyImageStripping, `returned`). */
+  private _ceilingNotes: CeilingKinds = { images: false, bytes: false };
+
+  /** Say once for each ceiling, when a select returns a render in which
+   *  images are shown as placeholders and a limit that ceiling sets was over
+   *  (applyImageStripping's notes): under the limits, at an image the render
+   *  replaces, and with imageStripHysteresisRatio, at a trim anywhere in the
+   *  rule's replay. The depth limit or a limit the host set may be stripping
+   *  too. While the rule is off, the line adds the cost of a window held at
+   *  the ceiling and names the option that spaces it, except under a count
+   *  ceiling of 1, which leaves the option no room. The rule's set is this
+   *  class's; a subclass's override of imageStripReplay isn't consulted for
+   *  the line. A dry select, a preview, an observer's reconstruction or a
+   *  refused select says nothing, and the line waits for the first render
+   *  returned. */
+  private reportCeilingHits(): void {
+    const said = this.ceilingBoundReported;
+    const notes = this._ceilingNotes;
+    for (const kind of ['images', 'bytes'] as const) {
+      if (!notes[kind] || said[kind]) continue;
+      said[kind] = true;
+      const line = ceilingBoundLine(this.name, kind, this.configuredImageLimits(), this.imageLimitsDefaulted());
+      // The option can space the trims only where the ceiling leaves it room:
+      // under a count ceiling of 1 the newest image stays at every trim.
+      const spaces = kind === 'bytes' || this.resolvedImageLimits().ceiling.images > 1;
+      this.diag.warn(this.imageHysteresisRatio() === undefined && spaces ? line + AutobiographicalStrategy.CEILING_BATCH_CLAUSE : line);
+    }
+  }
+
+  /** What the ceiling line adds while imageStripHysteresisRatio is off: the
+   *  cost of a window held at a ceiling, and the option that spaces it. */
+  private static readonly CEILING_BATCH_CLAUSE =
+    '; at the ceiling each new image turns the oldest live ones into placeholders, which rewrites the prompt ' +
+    'cache from there, and imageStripHysteresisRatio does that in batches instead';
+
+  /** The image limits whose values are defaults: those the library's default
+   *  layer gave or no layer gave, and those the host gave as undefined or
+   *  null where configuredImageLimits then applies a default. For
+   *  maxLiveImages it applies none: an explicit undefined erases the default
+   *  6 and reads as no limit, which is the host's doing. */
+  private imageLimitsDefaulted(): ReadonlySet<string> {
+    const keys = ['maxLiveImages', 'maxLiveImageBytes', 'imageCeiling', 'imageByteCeiling', 'maxCompressionImageBytes'] as const;
+    return new Set(keys.filter((key) => {
+      const source = this.configProvenance[key];
+      if (source === undefined || source === 'library-default') return true;
+      return key !== 'maxLiveImages' && this.config[key] == null;
+    }));
+  }
+
+  /** The live-image limits as configured, with the defaults where unset. */
+  private configuredImageLimits(): {
+    maxLiveImages: number; maxLiveImageBytes: number; imageCeiling: number; imageByteCeiling: number;
+  } {
+    return {
+      maxLiveImages: this.config.maxLiveImages ?? 0,
+      maxLiveImageBytes: this.config.maxLiveImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES,
+      imageCeiling: this.config.imageCeiling ?? DEFAULT_IMAGE_CEILING,
+      imageByteCeiling: this.config.imageByteCeiling ?? DEFAULT_IMAGE_BYTE_CEILING,
+    };
+  }
+
+  /**
+   * The live window's count and byte limits, kept within the image
+   * ceilings, and the ceilings themselves. The strip, the hysteresis rule's
+   * set, the post-strip estimates and a compression prompt all read their
+   * limits here, so they can't disagree about them.
+   */
+  private resolvedImageLimits(): ResolvedImageLimits {
+    return resolveLiveImageLimits(this.configuredImageLimits());
+  }
+
+  /**
+   * The image ceilings (see ContextStrategy.imageCeilings), as the window
+   * applies them: a malformed one at its default, a fraction floored.
+   */
+  imageCeilings(): ImageCeilings {
+    const { ceiling } = this.resolvedImageLimits();
+    return { imageCeiling: ceiling.images, imageByteCeiling: ceiling.bytes };
+  }
+
+  /** Whether the image limits' warning has been said (once per instance). */
+  private imageLimitsWarningReported = false;
+
+  /** One line when a configured image limit sits above its image ceiling,
+   *  or a ceiling is malformed and takes its default, so an operator sees why
+   *  the window or a compression prompt keeps fewer images than they set. */
+  private reportImageLimitsWarningOnce(): void {
+    if (this.imageLimitsWarningReported) return;
+    this.imageLimitsWarningReported = true;
+    const line = liveImageLimitsWarning(this.name, {
+      ...this.configuredImageLimits(),
+      maxCompressionImageBytes:
+        this.config.maxCompressionImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
+    }, this.imageLimitsDefaulted());
+    if (line) this.diag.warn(line);
+  }
 
   /** Compression prompts carry head + recall frontier + raw chunk alongside
    *  their images, so they get a tighter image budget than the live window. */
@@ -17573,12 +18239,18 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected prepareCompressionRequest(request: NormalizedRequest): CompressionPreparation {
     const prepared = { ...request, messages: request.messages.map(message => ({ ...message })) };
     const serializedMediaReplacements = this.stripSerializedCompressionMedia(prepared.messages);
-    const imageBudgetBytes =
-      this.config.maxCompressionImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES;
-    const cap = { keptBytes: 0 };
-    const imageReplacements = this.capCompressionImageBytes(prepared.messages, imageBudgetBytes, cap);
+    // A compression prompt carries at most the image ceilings.
+    const { ceiling } = this.resolvedImageLimits();
+    const imageBudgetBytes = clampToCeiling(
+      this.config.maxCompressionImageBytes ?? AutobiographicalStrategy.DEFAULT_MAX_COMPRESSION_IMAGE_BYTES,
+      ceiling.bytes,
+    );
+    const imageCountCap = ceiling.images;
+    const cap = { keptBytes: 0, keptImages: 0 };
+    const imageReplacements = this.capCompressionImageBytes(prepared.messages, imageBudgetBytes, cap, imageCountCap);
     return {
       request: prepared, serializedMediaReplacements, imageReplacements, imageBudgetBytes, imageBytesKept: cap.keptBytes,
+      imageCountCap, imagesKept: cap.keptImages,
     };
   }
 
@@ -17620,10 +18292,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     if (counts.imageReplacements > 0) {
       const mib = (bytes: number) => `${(bytes / (1024 * 1024)).toFixed(1)}MiB`;
+      const limits = [
+        ...(counts.imageBudgetBytes > 0 ? [`the ${mib(counts.imageBudgetBytes)} inline image budget`] : []),
+        ...(counts.imageCountCap > 0 ? [`the ${counts.imageCountCap}-image ceiling`] : []),
+      ].join(' and ');
       this.diag.error(
         `[autobiographical] compression prompt: replaced ${counts.imageReplacements} image(s) with placeholders ` +
-          `to stay under the ${mib(counts.imageBudgetBytes)} inline image budget ` +
-          `(kept ${mib(counts.imageBytesKept)}, newest messages first) [${label}]`,
+          `to stay under ${limits} ` +
+          `(kept ${counts.imagesKept} image(s), ${mib(counts.imageBytesKept)}, newest messages first) [${label}]`,
       );
     }
   }
@@ -17844,26 +18520,30 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Cap inline image bytes in a COMPRESSION prompt (2026-07-12). The main
+   * Cap inline image bytes in a COMPRESSION prompt (2026-07-12), and with
+   * `capImages` their number (2026-10-19, `imageCeiling`). The main
    * window enforces `maxLiveImageBytes` through the strip policy; the
    * summarizer's raw-chunk replay had no such wall and leaned on membrane's
    * byte shed instead — which is a transport backstop, not a policy owner
    * (it fired at 27MB on a live merge). Every inline image counts, whatever
    * its shape (see inlineImageBytes), generated images included.
    * Messages are walked newest-first, and the blocks within a message in
-   * order; each image is kept if it fits in what's left of the budget, and
-   * the others become the same loud placeholder the window uses, so the
-   * summarizer is told plainly that it is not seeing them.
+   * order; each image is kept if it fits in what's left of the budget and
+   * of the count, and the others become the same loud placeholder the window
+   * uses, so the summarizer is told plainly that it is not seeing them.
+   * A cap of 0 or less is none.
    * Returns the number of images replaced; `stats`, when given, receives the
-   * bytes kept.
+   * bytes and the images kept, every image's where neither cap is set.
    */
   protected capCompressionImageBytes(
     messages: Array<{ content: ContentBlock[] }>,
     capBytes: number,
-    stats?: { keptBytes: number },
+    stats?: { keptBytes: number; keptImages?: number },
+    capImages = 0,
   ): number {
-    if (capBytes <= 0) return 0;
+    const countCap = capImages > 0 ? capImages : 0;
     let kept = 0;
+    let keptImages = 0;
     let dropped = 0;
     // Images nested in tool_result content count too: an agent that drives a
     // shell/plotter/browser carries most of its image bytes NESTED in tool
@@ -17876,15 +18556,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!Array.isArray(m.content)) continue;
       m.content = replaceImages(m.content, (image) => {
         const bytes = inlineImageBytes(image);
-        if (kept + bytes <= capBytes) {
+        if ((capBytes <= 0 || kept + bytes <= capBytes) && (countCap === 0 || keptImages < countCap)) {
           kept += bytes;
+          keptImages++;
           return false;
         }
         dropped++;
         return true;
       }, AutobiographicalStrategy.IMAGE_PLACEHOLDER);
     }
-    if (stats) stats.keptBytes = kept;
+    if (stats) {
+      stats.keptBytes = kept;
+      stats.keptImages = keptImages;
+    }
     return dropped;
   }
 
@@ -18030,6 +18714,137 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Where history starts in the store: the position of the first of `ids`
+   * still there (store order), or -1 when none is. A host can remove stored
+   * messages (agent-framework's Discord module does, on a delete or a history
+   * sync) while a summary over them, or a queued chunk holding them, lives
+   * on; -1 means nothing in the store says when that history happened.
+   */
+  protected startInStore(ids: Iterable<MessageId>, position: ReadonlyMap<MessageId, number>): number {
+    let start = -1;
+    for (const id of ids) {
+      const at = position.get(id);
+      if (at !== undefined && (start < 0 || at < start)) start = at;
+    }
+    return start;
+  }
+
+  /**
+   * Where a summary starts in the store: its first leaf message still there
+   * (expandSummaryToLeafMessageIds, startInStore), whether or not that is
+   * sourceRange.first; -1 when none is. The one rule for both recall sets, a
+   * compression request's and a merge's (1a), and for where a recall pair
+   * sits among them: a summary starting before the history being summarized
+   * is recalled, at its start. A summary with no message left isn't: its
+   * place is unknown, and its coverage holds no message out of the request.
+   */
+  protected summaryStartInStore(
+    summary: SummaryEntry,
+    position: ReadonlyMap<MessageId, number>,
+    summariesById: ReadonlyMap<string, SummaryEntry>,
+  ): number {
+    const leaves = new Set<MessageId>();
+    this.expandSummaryToLeafMessageIds(summary, summariesById, leaves);
+    return this.startInStore(leaves, position);
+  }
+
+  /**
+   * The head window a compression or merge request gives as context for the
+   * history it summarizes from `pos` on: the head in force when the message at
+   * `pos` was the newest, cut at `pos` and at the compression holds
+   * (holdBoundary). From the live head's start on, that is the live head,
+   * cut at `pos`, so a chunk inside the live head window (one a widened
+   * window grew over) no longer gets the head's messages after its start.
+   * A `pos` that's unknown (-1: none of the history's messages is left in
+   * the store, startInStore) gets no head: nothing in the store says when
+   * that history happened, and the live head may have come after it. Before
+   * the live head's start, it is the head starting at the latest topic
+   * transition message at or before `pos` (isTopicTransitionMessage, the test
+   * that restores the live head's start at a restart), or at the opening when
+   * there is none, ending by the walk the live head takes from its start
+   * (headWindowEndFrom). So history from before a head-window reset gets the
+   * head it followed: the opening, or the transition and opening of the topic
+   * it was in. There, a chunk that starts at a transition, or at the
+   * store's first message (the opening's own chunk, which a reset releases),
+   * gets none: nothing came before it.
+   *
+   * After a reset, these requests gave the new topic's opening ahead of the
+   * older history they summarize (#317), where section 1 of
+   * compressChunkHierarchical places the chronicle's opening "exactly where
+   * the original instance saw it" and keeps later events out.
+   *
+   * Three things it is, by choice:
+   * - Before the live head's start, where a head starts comes from the store
+   *   alone, as a restart reads it. A strategy-level resetHeadWindow to a
+   *   message that isn't a transition isn't in the store: history before that
+   *   message gets the latest transition before it, or the opening, as after a
+   *   restart. History from that message on gets the live head, which a
+   *   restart moves to the last transition in the store. So a restart gives
+   *   the same heads while the live head starts at the last transition in the
+   *   store.
+   * - A past head is priced with today's headWindowTokens and calibration, as
+   *   the live head is, and the ratchet guard (anchorHeadToCoverage) extends
+   *   it by today's chunk ownership, not by those in force when it was the
+   *   head.
+   * - Before the live head's start, any Context Manager message whose text
+   *   starts with "[Topic Transition]" starts a head, as the restart reads
+   *   one, whether or not resetHeadWindow wrote it.
+   */
+  protected headAsOf(store: MessageStoreView, pos: number): { start: number; end: number } {
+    return this.headsAsOf(store)(pos);
+  }
+
+  /**
+   * headAsOf for many positions in one store state, such as each queued chunk
+   * a count of queued work reads (requestCarriesToolBlocks): the live head's
+   * start, the holds and the live head's end are read once, the transitions
+   * before the live head's start once when a position before it is asked
+   * for, and each past head's end once per start. Tick's requests (through
+   * headAsOf) and the count both read heads here, so a subclass that changes
+   * heads overrides this.
+   */
+  protected headsAsOf(store: MessageStoreView): (pos: number) => { start: number; end: number } {
+    const liveStart = this.getHeadWindowStartIndex(store);
+    const hold = this.holdBoundary(store);
+    let liveEnd: number | undefined;
+    let messages: StoredMessage[] | undefined;
+    let transitions: number[] | undefined;
+    const pastEnds = new Map<number, number>();
+    return (pos) => {
+      if (pos < 0) return { start: liveStart, end: liveStart };
+      if (pos >= liveStart) {
+        liveEnd ??= this.getHeadWindowEnd(store);
+        return { start: liveStart, end: Math.min(liveEnd, hold, pos) };
+      }
+      messages ??= store.getAll();
+      if (!transitions) {
+        const found: number[] = [];
+        for (let i = 1; i < liveStart && i < messages.length; i++) {
+          if (this.isTopicTransitionMessage(messages[i])) found.push(i);
+        }
+        transitions = found;
+      }
+      // The latest transition at or before pos, or the opening.
+      let start = 0;
+      for (let lo = 0, hi = transitions.length - 1; lo <= hi;) {
+        const mid = (lo + hi) >> 1;
+        if (transitions[mid]! <= pos) {
+          start = transitions[mid]!;
+          lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
+      }
+      let end = pastEnds.get(start);
+      if (end === undefined) {
+        end = this.headWindowEndFrom(store, messages, start);
+        pastEnds.set(start, end);
+      }
+      return { start, end: Math.min(end, hold, pos) };
+    };
+  }
+
+  /**
    * Index of the first message AFTER the head window.
    * Messages [headStart, headEnd) are sent raw, never summarized.
    *
@@ -18045,10 +18860,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * material (issue #122). See anchorHeadToCoverage.
    */
   protected getHeadWindowEnd(store: MessageStoreView): number {
-    if (this.config.headWindowTokens <= 0) return 0;
+    return this.headWindowEndFrom(store, store.getAll(), this.getHeadWindowStartIndex(store));
+  }
 
-    const messages = store.getAll();
-    const startIdx = this.getHeadWindowStartIndex(store);
+  /**
+   * Where a head window starting at `startIdx` ends, by the walk the live head
+   * window takes (getHeadWindowEnd): the live head's start, or a past head's
+   * (headAsOf).
+   */
+  protected headWindowEndFrom(store: MessageStoreView, messages: StoredMessage[], startIdx: number): number {
+    if (this.config.headWindowTokens <= 0) return 0;
     let tokens = 0;
 
     for (let i = startIdx; i < messages.length; i++) {
@@ -18122,6 +18943,46 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   protected hasToolResult(message: StoredMessage): boolean {
     return message.content.some(block => block.type === 'tool_result');
+  }
+
+  /**
+   * The head's positions, in the order they're sent: after a head-window
+   * reset, the system changes stored before the head window, then the window
+   * [headStart, headEnd). Every selector sends the head first and the
+   * history before it later, with the middle, so a change left in that
+   * history would follow the head's own changes and apply after them: a
+   * removal could run before the definition it removes. In the head, every
+   * change keeps its order, and the solved layout, the emission, the cache
+   * check's rebuild and the markers read one head. The history before the
+   * head, which the reset already sends after the head, then reads them too,
+   * which the provider takes: it doesn't check a past tool call against the
+   * tools offered where the call sits. With nothing in the window (the head
+   * window disabled, or a window that ends where it starts), nothing is sent
+   * ahead of that history, and the changes stay where they are.
+   */
+  protected headPositions(messages: readonly StoredMessage[], headStart: number, headEnd: number): number[] {
+    const end = Math.min(headEnd, messages.length);
+    const out: number[] = [];
+    if (headStart > 0 && end > headStart) {
+      for (const i of systemChangePositions(messages)) {
+        if (i >= headStart) break;
+        out.push(i);
+      }
+    }
+    for (let i = headStart; i < end; i++) out.push(i);
+    return out;
+  }
+
+  /**
+   * The middle's position ranges, in order: what comes before the tail
+   * outside the live head window, [0, headStart) after a head-window reset
+   * included. With the head window disabled, headEnd is 0 under a positive
+   * headStart, so the live window ends at the later of the two, and no
+   * position is in two ranges or in a range and the tail. A walk over them
+   * passes over the head's other positions (headPositions).
+   */
+  protected static middleRanges(headStart: number, headEnd: number, tailStart: number): ReadonlyArray<readonly [number, number]> {
+    return [[0, Math.min(headStart, tailStart)], [Math.max(headStart, headEnd), tailStart]];
   }
 
   /**
@@ -18586,19 +19447,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Collapse consecutive messages from the same participant into single messages.
    * Required because Claude API rejects consecutive same-role messages.
+   * A message left empty, as compression input leaves one of thinking or
+   * system changes alone (compressionInputContent), is passed over, so its
+   * neighbours join as they would without it and no separator marks it.
    */
   protected collapseConsecutiveMessages(
     messages: Array<{ participant: string; content: ContentBlock[] }>
   ): Array<{ participant: string; content: ContentBlock[] }> {
-    if (messages.length === 0) return [];
+    const result: Array<{ participant: string; content: ContentBlock[] }> = [];
 
-    const result: Array<{ participant: string; content: ContentBlock[] }> = [
-      { participant: messages[0].participant, content: [...messages[0].content] },
-    ];
-
-    for (let i = 1; i < messages.length; i++) {
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].content.length === 0) continue;
       const last = result[result.length - 1];
-      if (messages[i].participant === last.participant) {
+      if (!last) {
+        result.push({ participant: messages[i].participant, content: [...messages[i].content] });
+      } else if (messages[i].participant === last.participant) {
         // Merge: add separator then content
         last.content.push({ type: 'text', text: '\n\n---\n\n' } as ContentBlock);
         last.content.push(...messages[i].content);
@@ -18739,7 +19602,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * The answer body for the LIVE WINDOW — the surface the agent whose memory
-   * this is reads back — under `carrierPolicy`.
+   * this is reads back — under `carrierPolicy`, or under `'live-strip'`
+   * while thinking is bound (liveCarrierPolicy).
    *
    * Under `'full'` (default) this IS `summaryAnswerProse`, block for block.
    * Under `'live-strip'` the captured reasoning carriers are omitted from the
@@ -18748,8 +19612,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * here would break the signature that the mint surface depends on — hence
    * omission, never rewriting. Every surviving block is passed through by
    * reference, except a Responses item a stripped reasoning item led to: every
-   * block that shares it is copied without its raw item, and so without its id
-   * (see raw-forms.ts).
+   * block that shares it, other than an opaque carrier, is copied without its
+   * raw item, and so without its id (see raw-forms.ts).
    *
    * A carrier-only entry (reasoning captured, no prose block — degenerate, and
    * guarded against at mint time) would strip to an empty assistant turn,
@@ -18759,7 +19623,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected liveWindowAnswerProse(summary: SummaryEntry): ContentBlock[] {
     const prose = this.summaryAnswerProse(summary);
-    if (this.config.carrierPolicy !== 'live-strip') return prose;
+    if (this.liveCarrierPolicy() !== 'live-strip') return prose;
     const stripped = stripThinkingBlocks(prose);
     const carriesProse = stripped.some(
       (block) => block.type === 'text' && block.text.trim().length > 0,
@@ -19215,7 +20079,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * select sends each shard as its own message), then `applyImageStripping`,
    * so a message stored after the batch counts toward the images as in a
    * compile. The tool pass that comes between them (postProcessToolEntries)
-   * is left out: it pairs and prunes by the window around these messages.
+   * is left out: it pairs by the window around these messages. What sending
+   * prunes from a message's tool blocks reaches it through `cappedForSend`.
    *
    * Those messages are the recent window's, and the head window's too when
    * no message comes between the two: a compile places the middle's
