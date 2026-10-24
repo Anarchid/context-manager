@@ -268,6 +268,35 @@ class TokenLedger {
 }
 
 /**
+ * Counts by position over 0..n-1 (a Fenwick tree), for phase C's walk list:
+ * `count(i, d)` adds d at position i, and `olderThan(i)` returns the largest
+ * position below i whose count is positive, or -1 when there's none. Each
+ * takes O(log n) steps, and `olderThan` calls `step` once for each of its
+ * steps (#156 R6-1).
+ */
+export function listedCounts(n: number, step: () => void = () => {}): { count(i: number, d: number): void; olderThan(i: number): number } {
+  const counts = new Int32Array(n + 1);
+  let top = 1;
+  while (top * 2 <= n) top *= 2;
+  return {
+    count(i: number, d: number): void {
+      for (let x = i + 1; x <= n; x += x & -x) counts[x] += d;
+    },
+    olderThan(i: number): number {
+      let k = 0; // counted positions before i
+      for (let x = i; x > 0; x -= x & -x) { k += counts[x]; step(); }
+      if (k === 0) return -1;
+      let pos = 0; // the k-th counted position
+      for (let half = top; half > 0; half >>= 1) {
+        step();
+        if (pos + half <= n && counts[pos + half] < k) { pos += half; k -= counts[pos]; }
+      }
+      return pos;
+    },
+  };
+}
+
+/**
  * Build the IDEAL CUT from `base` — pure relevance, no P anywhere (§13.4).
  * `base` is the carried frontier when seeded (the default), and raw on
  * bootstrap, with `seedFromCarried: false` and for the release's from-scratch
@@ -501,21 +530,7 @@ function relevanceCut(
     // Each step of that search counts as a visit (KV_TIMING's `visits`), so
     // the tests that bound phase C's visits bound relist's search too (#156
     // R6-1).
-    const counts = new Int32Array(n + 1);
-    const count = (i: number, d: number): void => { for (let x = i + 1; x <= n; x += x & -x) counts[x] += d; };
-    let top = 1;
-    while (top * 2 <= n) top *= 2;
-    const olderThan = (i: number): number => {
-      let k = 0; // listed positions before i
-      for (let x = i; x > 0; x -= x & -x) { k += counts[x]; visits++; }
-      if (k === 0) return -1;
-      let pos = 0; // the k-th listed position
-      for (let step = top; step > 0; step >>= 1) {
-        visits++;
-        if (pos + step <= n && counts[pos + step] < k) { pos += step; k -= counts[pos]; }
-      }
-      return pos;
-    };
+    const { count, olderThan } = listedCounts(n, () => { visits++; });
     let youngestListed = -1;
     let oldestListed = n;
     for (let i = 0; i < n; i++) {

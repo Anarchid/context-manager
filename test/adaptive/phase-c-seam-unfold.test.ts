@@ -15,7 +15,7 @@ import type { PickerInputs } from '../../src/adaptive/picker.js';
 import type { ChunkId } from '../../src/adaptive/folding-strategy.js';
 import { SummaryTree } from '../../src/adaptive/summary-tree.js';
 import { renderLayout, kvCost } from '../../src/adaptive/render-offsets.js';
-import { planControlledFrontier } from '../../src/adaptive/kv-control.js';
+import { listedCounts, planControlledFrontier } from '../../src/adaptive/kv-control.js';
 import { buildChronicleWithChain, MockChronicle } from './harness.js';
 
 // 216 chunks = 1 L3 / 6 L2 / 36 L1 (groups of 6, harness chain). 50 raw
@@ -559,4 +559,36 @@ test('phase C: a cleared key relists its parked chunks in O(log n) steps each, n
   assert.ok(runs[0] && runs[0].visits > chunks.length, `premise: the relists' search steps are counted (${JSON.stringify(runs)})`);
   const bound = 3 * chunks.length * Math.ceil(Math.log2(chunks.length));
   for (const r of runs) assert.ok(r.visits <= bound, `phase C took ${r.visits} steps over ${r.passes} passes, past ${bound}`);
+});
+
+/**
+ * R6-1's other half: where relist puts a chunk back. Its predecessor query,
+ * `listedCounts(n).olderThan(i)`, must give the largest listed position below
+ * i, or -1 when there's none, as the scan back did, in O(log n) steps. No
+ * plan test sees a wrong answer here, since the walk only reorders which
+ * group it tries first; this one checks the query against the scan over
+ * random lists and unlists.
+ */
+test('phase C: the walk list\'s predecessor query gives the next older listed position, as scanning back would, in O(log n) steps (R6-1)', () => {
+  let seed = 156;
+  const random = (m: number): number => { seed = (Math.imul(seed, 1103515245) + 12345) >>> 0; return (seed >>> 8) % m; };
+  let checked = 0, none = 0;
+  for (const n of [1, 2, 3, 7, 8, 9, 64, 300]) {
+    let steps = 0;
+    const { count, olderThan } = listedCounts(n, () => { steps++; });
+    const listed = new Uint8Array(n);
+    for (let op = 0; op < 20 * n; op++) {
+      const i = random(n);
+      if (random(2) === 1) { if (!listed[i]) { listed[i] = 1; count(i, 1); } } else if (listed[i]) { listed[i] = 0; count(i, -1); }
+      const at = random(n);
+      let older = at - 1;
+      while (older >= 0 && !listed[older]) older--;
+      steps = 0;
+      assert.equal(olderThan(at), older, `n=${n}: the listed position before ${at}`);
+      assert.ok(steps <= 2 * (Math.floor(Math.log2(n)) + 1), `n=${n}: ${steps} steps before ${at}`);
+      checked++;
+      if (older === -1) none++;
+    }
+  }
+  assert.ok(none > 0 && none < checked, `premise: some queries have no older listed position and some do (${none} of ${checked})`);
 });
