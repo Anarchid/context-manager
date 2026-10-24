@@ -1563,13 +1563,14 @@ export interface AutobiographicalConfig {
    * placeholders because of this ceiling, rather than because of a limit
    * the host set: an image past it that the host's own limits, the depth
    * limit included, don't strip anyway, or, with
-   * `imageStripHysteresisRatio`, an image the rule's set strips where this
-   * ceiling's limit took part in that set, and that the set without the
-   * ceilings keeps and the set with this ceiling alone over the host's own
-   * limits strips. Working that out replays the set: while the line is
-   * unsaid and this ceiling's limit takes part, a compile whose render the
-   * set stripped replays it once or twice more, and three times when both
-   * ceilings' limits take part and neither line is said.
+   * `imageStripHysteresisRatio`, an image the rule's set strips in a trim
+   * this ceiling's limit brought on, where neither the depth limit nor a
+   * limit the host set was over too. That's judged at the trim alone, with
+   * two consequences: a trim that a limit the host set, or the depth limit,
+   * also brought on says nothing, though this ceiling's lower target there
+   * can strip an image the host's own limits keep; and the line is said for
+   * an image this ceiling's trim stripped even where a later trim would have
+   * stripped it anyway.
    */
   imageCeiling?: number;
 

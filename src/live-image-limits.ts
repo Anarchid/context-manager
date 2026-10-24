@@ -165,11 +165,9 @@ export function ceilingSetLimits(configured: ConfiguredImageLimits): { images: b
  * warning at initialize says so. Only a ceiling that decides changes what
  * the window keeps, so only that one says its line. With the memory
  * strategy's `imageStripHysteresisRatio`, whose set decides in place of the
- * limits, the strategy credits the set's images itself, not here: a ceiling
- * decides an image the set strips when its limit took part in that set, the
- * set without the ceilings keeps the image, and the set with that ceiling
- * alone over the host's own limits strips it (the memory strategy's
- * ruleCeilingHits).
+ * limits, the strategy applies this to each trim of its set: the limits over
+ * where the trim began, and the depth limit's, decide every image the trim
+ * strips (the memory strategy's ruleCeilingHits).
  */
 export function ceilingsDeciding(
   over: { images: boolean; bytes: boolean },

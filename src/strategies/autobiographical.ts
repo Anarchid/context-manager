@@ -649,13 +649,17 @@ type CeilingNotes = {
   ruleStripped: Array<{ id: MessageId; nth: number }>;
 };
 
-/** imageStripHysteresisRatio's set for some limits (stripReplayHeld): how
- *  many of each message's images it strips, and whether the count limit,
- *  and the byte limit, took part in it. */
+/** imageStripHysteresisRatio's set at the window's limits
+ *  (stripReplayAtLimits): how many of each message's images it strips, and
+ *  for each stripped image, by its place among its message's images, which
+ *  full limits were over where the trim that stripped it began. */
 type StripReplay = {
   out: ReadonlyMap<MessageId, number>;
-  involved: { images: boolean; bytes: boolean };
+  trims: ReadonlyMap<MessageId, ReadonlyArray<TrimOver>>;
 };
+
+/** Which of the window's full limits were over where a trim began. */
+type TrimOver = { readonly images: boolean; readonly bytes: boolean; readonly depth: boolean };
 
 /** A tool call the conversation answers: its message's place in the listing,
  *  the place of the result that first answered it, and every result that
@@ -17653,8 +17657,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return this.stripReplayAtLimits(store)?.out;
   }
 
-  /** The rule's set at the window's limits (imageStripReplay), memoized, with
-   *  which of the count and byte limits took part in it (stripReplayHeld). */
+  /** The rule's set at the window's limits (imageStripReplay), memoized,
+   *  with the limits that were over where the trim that stripped each image
+   *  began (ruleCeilingHits reads them). */
   private stripReplayAtLimits(store: MessageStoreView): StripReplay | undefined {
     const ratio = this.imageHysteresisRatio();
     if (ratio === undefined) return undefined;
@@ -17676,74 +17681,60 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         memo.countCap === countCap && memo.bytesCap === bytesCap && memo.ratio === ratio &&
         memo.pruning === pruning && memo.msgCap === msgCap
       ) return memo.replay;
-      const replay = this.stripReplayHeld(store, messages, depthCap, countCap, bytesCap, ratio);
+      // tokensBefore[i]: the tokens of every message before i, so the depth of
+      // an image in message j, with message i the newest, is
+      // tokensBefore[i + 1] - tokensBefore[j].
+      const tokensBefore = new Array<number>(messages.length + 1);
+      tokensBefore[0] = 0;
+      for (let i = 0; i < messages.length; i++) tokensBefore[i + 1] = tokensBefore[i]! + store.estimateTokens(messages[i]!);
+      const live: Array<{ at: number; bytes: number }> = []; // oldest first; live[first..] are live
+      let first = 0;
+      let liveBytes = 0;
+      const out = new Map<MessageId, number>();
+      const trims = new Map<MessageId, TrimOver[]>();
+      for (let i = 0; i < messages.length; i++) {
+        for (const image of imagesIn(this.cappedForSend(store, messages[i]!, msgCap).content)) {
+          const bytes = inlineImageBytes(image);
+          live.push({ at: i, bytes });
+          liveBytes += bytes;
+        }
+        const overCount = (count: number): boolean => countCap > 0 && live.length - first > count;
+        const overBytes = (size: number): boolean => bytesCap > 0 && liveBytes > size;
+        const overDepth = (depth: number): boolean =>
+          depthCap > 0 && first < live.length && tokensBefore[i + 1]! - tokensBefore[live[first]!.at]! > depth;
+        const overCountOrBytes = (count: number, size: number): boolean => overCount(count) || overBytes(size);
+        const over = (depth: number, count: number, size: number): boolean =>
+          overCountOrBytes(count, size) || overDepth(depth);
+        if (!over(depthCap, countCap, bytesCap)) continue;
+        // What brought this trim on, at the full limits.
+        const trim: TrimOver = { images: overCount(countCap), bytes: overBytes(bytesCap), depth: overDepth(depthCap) };
+        const depth = Math.floor(depthCap * ratio);
+        const countTarget = Math.floor(countCap * ratio);
+        const sizeTarget = Math.floor(bytesCap * ratio);
+        while (first < live.length && over(depth, countTarget, sizeTarget)) {
+          // The images left are one message's and within the full limits: the
+          // newest of them stays, and the rest stay too while only depth is over
+          // its target, since stripping images of one message can't lower the
+          // depth it's at.
+          if (
+            live[first]!.at === live[live.length - 1]!.at && !over(depthCap, countCap, bytesCap) &&
+            (live.length - first === 1 || !overCountOrBytes(countTarget, sizeTarget))
+          ) break;
+          const oldest = live[first++]!;
+          liveBytes -= oldest.bytes;
+          const id = messages[oldest.at]!.id;
+          out.set(id, (out.get(id) ?? 0) + 1);
+          // Stripped oldest first, so its place in this list is its place
+          // among its message's images.
+          const ofMessage = trims.get(id);
+          if (ofMessage) ofMessage.push(trim);
+          else trims.set(id, [trim]);
+        }
+      }
+      const replay: StripReplay = { out, trims };
       this._imageStripReplayMemo = { messages, calibration, depthCap, countCap, bytesCap, ratio, pruning, msgCap, replay };
       return replay;
     });
-  }
-
-  /** The rule's set for these limits, as imageStripReplay describes it, under
-   *  the tool pruning in use (withToolPruning). 0 is no limit; with none, it
-   *  strips nothing. `involved` says whether the count limit, and the byte
-   *  limit, was ever over its full or trimmed value where the replay asked:
-   *  one that never was decided nothing, so lifting only such limits gives
-   *  this same set (ruleCeilingHits). */
-  private stripReplayHeld(
-    store: MessageStoreView,
-    messages: readonly StoredMessage[],
-    depthCap: number,
-    countCap: number,
-    bytesCap: number,
-    ratio: number,
-  ): StripReplay {
-    const msgCap = this.config.maxMessageTokens;
-    // tokensBefore[i]: the tokens of every message before i, so the depth of
-    // an image in message j, with message i the newest, is
-    // tokensBefore[i + 1] - tokensBefore[j].
-    const tokensBefore = new Array<number>(messages.length + 1);
-    tokensBefore[0] = 0;
-    for (let i = 0; i < messages.length; i++) tokensBefore[i + 1] = tokensBefore[i]! + store.estimateTokens(messages[i]!);
-    const live: Array<{ at: number; bytes: number }> = []; // oldest first; live[first..] are live
-    let first = 0;
-    let liveBytes = 0;
-    const out = new Map<MessageId, number>();
-    const involved = { images: false, bytes: false };
-    for (let i = 0; i < messages.length; i++) {
-      for (const image of imagesIn(this.cappedForSend(store, messages[i]!, msgCap).content)) {
-        const bytes = inlineImageBytes(image);
-        live.push({ at: i, bytes });
-        liveBytes += bytes;
-      }
-      const overCountOrBytes = (count: number, size: number): boolean => {
-        const overCount = countCap > 0 && live.length - first > count;
-        const overBytes = bytesCap > 0 && liveBytes > size;
-        if (overCount) involved.images = true;
-        if (overBytes) involved.bytes = true;
-        return overCount || overBytes;
-      };
-      const over = (depth: number, count: number, size: number): boolean =>
-        overCountOrBytes(count, size) ||
-        (depthCap > 0 && first < live.length && tokensBefore[i + 1]! - tokensBefore[live[first]!.at]! > depth);
-      if (!over(depthCap, countCap, bytesCap)) continue;
-      const depth = Math.floor(depthCap * ratio);
-      const count = Math.floor(countCap * ratio);
-      const size = Math.floor(bytesCap * ratio);
-      while (first < live.length && over(depth, count, size)) {
-        // The images left are one message's and within the full limits: the
-        // newest of them stays, and the rest stay too while only depth is over
-        // its target, since stripping images of one message can't lower the
-        // depth it's at.
-        if (
-          live[first]!.at === live[live.length - 1]!.at && !over(depthCap, countCap, bytesCap) &&
-          (live.length - first === 1 || !overCountOrBytes(count, size))
-        ) break;
-        const oldest = live[first++]!;
-        liveBytes -= oldest.bytes;
-        const id = messages[oldest.at]!.id;
-        out.set(id, (out.get(id) ?? 0) + 1);
-      }
-    }
-    return { out, involved };
   }
 
   private _imageStripReplayMemo: {
@@ -17923,13 +17914,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  an image past the ceiling that nothing else strips (see
    *  ceilingsDeciding). With imageStripHysteresisRatio, the rule's set
    *  decides in place of the limits, so an image it replaces is credited
-   *  by replaying the rule without the ceilings (ruleCeilingHits). A dry
+   *  to the ceiling whose limit brought on the trim that stripped it, with
+   *  no limit the host set, and not the depth limit, over there
+   *  (ruleCeilingHits). A dry
    *  select, a preview, an observer's reconstruction or a refused select
    *  says nothing, and the line waits for the first render returned. */
   private reportCeilingHits(store: MessageStoreView): void {
     const said = this.ceilingBoundReported;
     const notes = this._ceilingNotes;
-    const rule = this.ruleCeilingHits(store, notes.ruleStripped, { images: !said.images, bytes: !said.bytes });
+    const rule = this.ruleCeilingHits(store, notes.ruleStripped);
     for (const kind of ['images', 'bytes'] as const) {
       if (!(notes[kind] || rule[kind]) || said[kind]) continue;
       said[kind] = true;
@@ -17938,53 +17931,31 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
-   * Which of the ceilings in `wanted` decided an image the rule's set
-   * replaced (`stripped`, by message and place among its images), as
-   * ceilingsDeciding decides it under the limits: the ceiling sets a limit
-   * (ceilingSetLimits) that took part in the set at the window's limits
-   * (stripReplayHeld's `involved`), the set at the host's own limits, with
-   * every ceiling that sets a limit lifted and the depth limit kept, keeps
-   * the image, and the set with that ceiling alone over the host's limits
-   * strips it. Each lifted limit is none, since a limit the host gave above
-   * its ceiling isn't in force. A limit that took no part decided nothing,
-   * and lifting only such limits gives that same set, so the credit replays
-   * only for a ceiling that sets a limit, took part, is wanted and has an
-   * image to credit: once each line is said, or where no ceiling's limit
-   * takes part, it replays nothing. The replays are this class's rule; a
-   * subclass's override of imageStripReplay isn't consulted for them.
+   * Which of the ceilings decided an image the rule's set replaced
+   * (`stripped`, by message and place among its images): the ceiling whose
+   * limit brought on the trim that stripped it, with neither the depth limit
+   * nor a limit the host set over there. That's ceilingsDeciding's rule,
+   * given what was over where the trim began. It reads the set's own replay,
+   * memoized for the listing the render was made from (stripReplayAtLimits),
+   * and replays nothing. The set is this class's rule; a subclass's override
+   * of imageStripReplay isn't consulted for it.
    */
   private ruleCeilingHits(
     store: MessageStoreView,
     stripped: ReadonlyArray<{ id: MessageId; nth: number }>,
-    wanted: { images: boolean; bytes: boolean },
   ): { images: boolean; bytes: boolean } {
     const hits = { images: false, bytes: false };
-    const ratio = this.imageHysteresisRatio();
-    if (ratio === undefined || stripped.length === 0 || (!wanted.images && !wanted.bytes)) return hits;
-    const atLimits = this.stripReplayAtLimits(store);
-    if (!atLimits) return hits;
+    const replay = this.stripReplayAtLimits(store);
+    if (!replay) return hits;
     const set = ceilingSetLimits(this.configuredImageLimits());
-    const kinds = (['images', 'bytes'] as const).filter((kind) => set[kind] && atLimits.involved[kind] && wanted[kind]);
-    if (kinds.length === 0) return hits;
-    const depthCap = this.config.imageStripDepthTokens ?? 0;
-    const { target } = this.resolvedImageLimits();
-    return this.withToolPruning(store, () => {
-      const messages = store.getAll();
-      /** The rule's set with each limit a ceiling sets lifted, unless kept. */
-      const replay = (keep: { images: boolean; bytes: boolean }): ReadonlyMap<MessageId, number> => {
-        const lift = { images: set.images && !keep.images, bytes: set.bytes && !keep.bytes };
-        if (!(lift.images && atLimits.involved.images) && !(lift.bytes && atLimits.involved.bytes)) return atLimits.out;
-        return this.stripReplayHeld(
-          store, messages, depthCap, lift.images ? 0 : target.images, lift.bytes ? 0 : target.bytes, ratio,
-        ).out;
-      };
-      const own = replay({ images: false, bytes: false });
-      for (const kind of kinds) {
-        const alone = replay({ images: kind === 'images', bytes: kind === 'bytes' });
-        hits[kind] = stripped.some(({ id, nth }) => nth >= (own.get(id) ?? 0) && nth < (alone.get(id) ?? 0));
-      }
-      return hits;
-    });
+    for (const { id, nth } of stripped) {
+      const trim = replay.trims.get(id)?.[nth];
+      if (!trim) continue;
+      const decided = ceilingsDeciding(trim, trim.depth, set);
+      if (decided.images) hits.images = true;
+      if (decided.bytes) hits.bytes = true;
+    }
+    return hits;
   }
 
   /** The image limits whose values are defaults: those the library's default
