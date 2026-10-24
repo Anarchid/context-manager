@@ -2007,7 +2007,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected chunkRecordsOrphaned = false;
   private _orphanWarned = false;
-  /** Record ids whose compression was refused by the L1 overlap guard. */
+  /** Chunks the L1 overlap guard refused: a chunk's record id, or its message-id key (chunkKey) when it has none. */
   private _overlapBlocked = new Set<string>();
 
   /**

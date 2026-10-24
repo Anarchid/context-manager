@@ -148,9 +148,9 @@ interface ContextManagerBaseConfig {
    * `ContextObserver`). The manager hands it to its strategy in
    * `StrategyContext`. It's called synchronously, and what it throws or
    * rejects never reaches the work: the manager logs a callback's first
-   * failure through its diagnostics and drops the rest. (A returned native
-   * promise whose `constructor` or species getter throws can't be handled
-   * from JavaScript; see `ContextObserver`.) A record's error and render
+   * failure through its diagnostics and drops the rest. (A returned promise
+   * no JavaScript can give a handler is outside that; see
+   * `ContextObserver`.) A record's error and render
    * stats are the objects the caller gets, so treat them as read-only.
    */
   observer?: ContextObserver;

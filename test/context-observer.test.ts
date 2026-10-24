@@ -2,9 +2,10 @@
  * ContextManagerConfig.observer: what a host is told as it happens. Each
  * compile, refused and failed ones included; each refusal context-manager
  * itself makes of compression, and none of a provider's; each calibration
- * sample. Nothing an observer throws or rejects reaches the work it observes,
- * so a compile's result is the same with one, with none, and with one that
- * throws or rejects, under each strategy.
+ * sample. Nothing an observer throws or rejects reaches the work it observes
+ * (but for a returned promise no JavaScript can give a handler), so a
+ * compile's result is the same with one, with none, and with one that throws
+ * or rejects, under each strategy.
  */
 
 import { after, describe, it } from 'node:test';
@@ -384,6 +385,29 @@ describe('compile records', () => {
     assert.equal(lines.length, 4, lines.join(' | '));
   });
 
+  it('a proxy around a promise, which no JavaScript can give a handler, is told, and the compile goes on', async () => {
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try {
+      let inner: Promise<never> | undefined;
+      const manager = await ContextManager.open({ path: freshPath(), strategy: new PassthroughStrategy(), observer: {
+        compile: () => { inner = Promise.reject(new Error('the proxied promise rejected')); return new Proxy(inner, {}) as never; },
+      } });
+      manager.addMessage('User', [text('hello')]);
+      const pending = manager.compile();
+      // The limit the docs name: nothing reaches the proxied promise, so the
+      // test handles it, as only the observer could.
+      inner!.catch(() => {});
+      assert.equal((await pending).messages.length, 1, 'the compile is unchanged');
+      for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+      manager.close();
+    } finally {
+      console.error = original;
+    }
+    assert.equal(lines.filter((line) => line.includes("the observer's compile callback threw or rejected")).length, 1, lines.join(' | '));
+  });
+
   it('a log that throws as it tells of a failure changes nothing either', async () => {
     const original = console.error;
     let entered = 0;
@@ -418,6 +442,7 @@ describe('compile records', () => {
       'a native promise with a no-op then of its own': () => Object.assign(Promise.reject(new Error('own-then promise rejected')), { then() {} }),
       'a native promise with a then of its own that isn\'t callable': () => Object.assign(Promise.reject(new Error('uncallable-then promise rejected')), { then: 42 }),
       'a resolved native promise whose constructor getter throws': () => Object.defineProperty(Promise.resolve(), 'constructor', { get(): never { throw new Error('constructor getter threw'); } }),
+      'a rejecting subclass promise with a then of its own': () => { class Sub extends Promise<unknown> {} return Object.assign(Sub.reject(new Error('subclass promise rejected')), { then: undefined }); },
       'a thenable that fulfils': () => fulfilling,
       'an object whose then getter throws only when read again': () => { let reads = 0; return { get then() { if (reads++ > 0) throw new Error('read again'); return undefined; } }; },
     };
@@ -437,7 +462,7 @@ describe('compile records', () => {
     }
     assert.deepEqual(stray, []);
     const told = lines.filter((line) => line.includes("the observer's compile callback threw or rejected"));
-    const expected = ['then threw', 'then getter threw', 'callable rejected', 'own-then promise rejected', 'uncallable-then promise rejected', 'constructor getter threw'];
+    const expected = ['then threw', 'then getter threw', 'callable rejected', 'own-then promise rejected', 'uncallable-then promise rejected', 'constructor getter threw', 'subclass promise rejected'];
     assert.equal(told.length, expected.length, `each failing shape told once, the others not: ${told.join(' | ')}`);
     expected.forEach((words, i) => assert.ok(told[i]!.includes(words), `${words}: ${told[i]}`));
 
@@ -740,7 +765,7 @@ async function ladder(membrane: unknown, options: Record<string, unknown>, path 
 const HOIST = { compressionToolProseFallback: { intoTool: 'journal', fromTools: ['skip_reply'] } };
 
 describe('compression refusals: an L1 ladder', () => {
-  it('a provider\'s refusal is membrane\'s to report, not one of these', async () => {
+  it('a provider\'s refusal is the provider\'s decision, not one of these', async () => {
     const { calls, membrane } = scripted([REFUSAL()]);
     const fx = await ladder(membrane, {});
     await fx.strategy.run(fx.target(), strategyContext(fx.manager));
@@ -749,7 +774,7 @@ describe('compression refusals: an L1 ladder', () => {
     fx.manager.close();
   });
 
-  it('a provider\'s rejection of the request is membrane\'s to report too', async () => {
+  it('a provider\'s rejection of the request is the provider\'s decision too', async () => {
     const rejected = Object.assign(new Error('invalid request'), { type: 'invalid_request', httpStatus: 400, retryable: false });
     const { calls, membrane } = scripted([{ error: rejected }]);
     const fx = await ladder(membrane, {});
@@ -853,10 +878,12 @@ describe('compression refusals: an L1 ladder', () => {
       fx.manager.close();
     });
 
-    it('a chunk an existing L1 partly covers is refused by the overlap guard, reported once', async () => {
+    it('a chunk an existing L1 partly covers is refused by the overlap guard, reported once until the strategy loads its state again', async () => {
+      // The chunk has no record, so the guard keys it by its messages.
       const { calls, membrane } = scripted([ANSWER('never asked')]);
       const fx = await ladder(membrane, SPLIT);
       const chunk = fx.target();
+      assert.equal(chunk.recordId, undefined);
       const first = chunk.messages[0]!.id;
       fx.strategy.seed({ id: 'L1-200', level: 1, content: 'covers raw-10 alone', tokens: 20, sourceLevel: 0, sourceIds: [first], sourceRange: { first, last: first }, created: 200 });
       await fx.strategy.run(chunk, strategyContext(fx.manager));
@@ -864,6 +891,24 @@ describe('compression refusals: an L1 ladder', () => {
       assert.equal(calls.length, 0, 'nothing is asked');
       assert.equal(chunk.compressed, false);
       assert.deepEqual(fx.rec.compressions, [{ reason: 'overlap-guard' }], 'refused twice, reported once');
+      (fx.strategy as unknown as { loadPersistedState(): void }).loadPersistedState();
+      fx.strategy.seed({ id: 'L1-201', level: 1, content: 'covers raw-10 alone', tokens: 20, sourceLevel: 0, sourceIds: [first], sourceRange: { first, last: first }, created: 201 });
+      await fx.strategy.run(chunk, strategyContext(fx.manager));
+      assert.equal(calls.length, 0);
+      assert.deepEqual(fx.rec.compressions, [{ reason: 'overlap-guard' }, { reason: 'overlap-guard' }], 'reported again after the load');
+      fx.manager.close();
+    });
+
+    it('a chunk an existing L1 covers whole is dropped, with no report', async () => {
+      const { calls, membrane } = scripted([ANSWER('never asked')]);
+      const fx = await ladder(membrane, SPLIT);
+      const chunk = fx.target();
+      const ids = chunk.messages.map((m) => m.id);
+      fx.strategy.seed({ id: 'L1-200', level: 1, content: 'covers the whole chunk', tokens: 20, sourceLevel: 0, sourceIds: ids, sourceRange: { first: ids[0]!, last: ids.at(-1)! }, created: 200 });
+      await fx.strategy.run(chunk, strategyContext(fx.manager));
+      assert.equal(calls.length, 0);
+      assert.equal(chunk.compressed, true, 'dropped as covered');
+      assert.deepEqual(fx.rec.compressions, []);
       fx.manager.close();
     });
 

@@ -145,7 +145,8 @@ export interface StrategyContext {
  * Result of readiness check.
  */
 export interface ReadinessState {
-  /** Whether compile() can proceed immediately */
+  /** Whether the strategy has no background work pending. compile() doesn't
+   *  wait for that work either way: it compiles from what's there. */
   ready: boolean;
   /** Promise that resolves when ready (if not ready) */
   pendingWork?: Promise<void>;
@@ -255,8 +256,8 @@ export interface ContextStrategy {
   onCompressionHoldsReleased?(ctx: StrategyContext): void;
 
   /**
-   * Check if strategy is ready to compile.
-   * Returns pending work info if not ready.
+   * Whether the strategy has background work pending, with its info if so.
+   * compile() doesn't wait for it.
    */
   checkReadiness(): ReadinessState;
 

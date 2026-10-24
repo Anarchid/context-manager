@@ -48,11 +48,16 @@ export type CompileRefusal = typeof COMPILE_REFUSALS[number];
  *   ten-minute window allows (`compressionSplitMaxCallsPer10Min`), so it ended
  *   before another call.
  * - `'overlap-guard'`: a chunk's messages are partly covered by an L1 that
- *   already exists, which only damaged bookkeeping or store surgery leaves,
- *   so the strategy refuses to compress it rather than mint a duplicate
- *   memory. It's refused on every attempt while the overlap stands, and
- *   reported once per chunk until the strategy loads its state again (an
- *   open, a branch switch), as its log line is.
+ *   already exists, so the strategy refuses to compress it rather than mint
+ *   a duplicate memory. In the autobiographical strategy's own chunking only
+ *   damaged bookkeeping or store surgery leaves that; `KnowledgeStrategy`
+ *   leaves it when a summary ends at a tool call whose result comes after
+ *   it. A chunk with a record isn't queued again while it's refused, and
+ *   one without is refused again each time it's queued. Either way it's
+ *   reported once per chunk (its record id, or else its messages), as the
+ *   guard's log line is, until the strategy loads its state again: an open,
+ *   a branch switch, a branch's state set up again, or taking up what
+ *   another instance sharing the store wrote.
  *
  * The rest are reported once per decision. A verdict on an answer the L1 ladder
  * keeps in its saved progress isn't decided again when the ladder resumes,
@@ -140,12 +145,12 @@ export interface CalibrationSampleRecord {
  * Called synchronously as each fact happens, each callback optional. What
  * it throws, or a promise it returns that rejects, never reaches the work it
  * observes: the manager logs a callback's first failure through its
- * diagnostics, and drops the rest. The one exception is a returned native
- * promise whose `constructor` or species getter throws: no JavaScript can
- * attach a handler to it, so that throw is logged and the promise's own
- * rejection, if it rejects, goes unhandled. A record's error and render
- * stats are the objects the caller gets, so an observer treats them as
- * read-only.
+ * diagnostics, and drops the rest. Outside that is a returned promise no
+ * JavaScript can give a handler, such as one whose `constructor` or species
+ * can't be used, or a proxy around one: what's thrown on the way is logged,
+ * and the promise's own rejection goes unhandled, which ends a Node process
+ * by default. A record's error and render stats are the objects the caller
+ * gets, so an observer treats them as read-only.
  */
 export interface ContextObserver {
   compile?(record: CompileRecord): void;
@@ -155,9 +160,10 @@ export interface ContextObserver {
 
 /**
  * `observer` with each callback it has wrapped, so that nothing it throws or
- * rejects reaches the caller. `failed` hears of a callback's first throw or
- * rejection, once per callback, so a broken observer shows without a line per
- * record. Each callback is read once, here, and that function is the one
+ * rejects reaches the caller, but for a returned promise no JavaScript can
+ * give a handler (see {@link ContextObserver}). `failed` hears of a
+ * callback's first throw or rejection, once per callback, so a broken
+ * observer shows without a line per record. Each callback is read once, here, and that function is the one
  * called, so replacing or removing it later changes nothing; one that can't
  * even be read is treated as absent, and told of the same way.
  */
@@ -188,20 +194,32 @@ export function isolateObserver(
     isolated[name] = (record: never) => {
       try {
         const returned: unknown = Reflect.apply(method, observer, [record]);
-        // Any object or function may be a thenable. Promise.resolve returns a
-        // native promise as it is, and adopts anything else with resolve
-        // functions of its own: it reads its `then` at once and calls it in a
-        // job of its own, so a `then` getter that throws, or a `then` that
-        // throws before it settles, rejects the promise handled here. The
-        // handler goes on through the intrinsic `then`, so a promise's own
-        // `then` can't skip it, and the fulfilment handler returns nothing,
-        // so nothing returned is read again. (A native promise whose own
-        // `constructor` getter throws can't be given a handler from
-        // JavaScript at all: every way reads it first. That throw is caught
-        // below and told, and if that promise rejects, its rejection is
-        // unhandled, as the host's `unhandledRejection` handling decides.)
         if ((typeof returned === 'object' && returned !== null) || typeof returned === 'function') {
-          Reflect.apply(Promise.prototype.then, Promise.resolve(returned), [() => undefined, (error: unknown) => fail(name, error)]);
+          // The fulfilment handler returns nothing, so nothing returned is
+          // read again.
+          const handlers = [() => undefined, (error: unknown) => fail(name, error)];
+          let handled = false;
+          try {
+            // A native promise, a subclass's included, takes the handler on
+            // itself through the intrinsic `then`, so a `then` of its own
+            // can't skip it. The intrinsic `then` refuses anything else
+            // before reading it.
+            Reflect.apply(Promise.prototype.then, returned, handlers);
+            handled = true;
+          } catch {
+            // Not a native promise, or one whose constructor or species
+            // can't be used; the adoption below tells of the latter.
+          }
+          if (!handled) {
+            // Anything else may be a thenable. Promise.resolve reads its
+            // `then` at once and calls it in a job of its own, so a `then`
+            // getter that throws, or a `then` that throws before it settles,
+            // rejects the promise handled here. (A promise no JavaScript can
+            // give a handler, such as one whose constructor or species can't
+            // be used, or a proxy around one, is told of here or below, and
+            // its own rejection goes unhandled.)
+            Reflect.apply(Promise.prototype.then, Promise.resolve(returned), handlers);
+          }
         }
       } catch (error) {
         // An observer can't end a compile, a compression or a sample.
