@@ -168,12 +168,12 @@ export interface ContextStrategy {
    * every image decision the strategy makes there: its count, depth and byte
    * limits, counted newest-first over the view from the oldest of these
    * messages to its newest, as a compile counts them. It's for a caller that
-   * adds to a compiled request without recompiling. One appends messages it
-   * has just stored, such as a turn's mid-turn injections, so that what it
+   * works from a compiled request without recompiling. One appends messages
+   * it has just stored, such as a turn's mid-turn injections, so that what it
    * appends is what the next compile sends. Another renders messages its
    * stream has already sent, such as the rows `ContextManager.noteRequestSent`
-   * digests over a whole turn, so that it can tell whether the next compile
-   * sends them as they were sent. A later compile can still strip
+   * digests over a whole turn, so that the next compile can tell which of
+   * them it sends as they were sent. A later compile can still strip
    * an image of theirs as newer ones arrive, and their images can strip
    * older images the request already carried, so the request they're
    * appended to can still differ from the next compile before them.
