@@ -27,7 +27,6 @@ import {
   liveImageLimitsWarning,
   ceilingBoundLine,
   ceilingSetLimits,
-  ceilingsDeciding,
   resolveLiveImageLimits,
   type ResolvedImageLimits,
 } from '../live-image-limits.js';
@@ -226,9 +225,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     return resolveLiveImageLimits(this.configuredImageLimits);
   }
 
-  /** Say once that an image ceiling, rather than a limit the options set,
-   *  has decided that an image is stripped from the live window (see
-   *  ceilingsDeciding). */
+  /** Say once that an image ceiling holds a limit the options set as none
+   *  or above it, once a limit it sets was over where the window strips an
+   *  image (liveImagePolicy's `ceilings`). */
   private reportCeilingBoundOnce(kind: 'images' | 'bytes'): void {
     if (this.ceilingBoundReported[kind]) return;
     this.ceilingBoundReported[kind] = true;
@@ -522,9 +521,10 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * each message's estimate gives back for the images it loses (`saved`).
    * `select` prices the window by `saved` and applies `strips` to what it
    * emits (stripImages), so the verdicts it prices are the ones the strip
-   * applies. `ceilings` names, for each message, the image ceilings that
-   * decided one of its images is stripped (ceilingsDeciding), for the line
-   * a returned render says (reportCeilings).
+   * applies. `ceilings` names, for each message, the limits an image
+   * ceiling sets (ceilingSetLimits) that were over where one of its images
+   * is stripped, whatever else strips it too, for the line a returned
+   * render says (reportCeilings).
    *
    * That holds wherever the window starts, and the re-anchor walk reads them
    * as they are, as `renderAsNewest` does from the batch's oldest message:
@@ -580,10 +580,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         const overCount = maxLive > 0 && keptImages >= maxLive;
         const overBytes = maxLiveBytes > 0 && keptImageBytes + bytes > maxLiveBytes;
         const strip = tooDeep || overCount || overBytes;
-        const deciding = ceilingsDeciding({ images: overCount, bytes: overBytes }, tooDeep, ceilingSet);
         const decided = (ceilings[i] ??= { images: false, bytes: false });
-        decided.images ||= deciding.images;
-        decided.bytes ||= deciding.bytes;
+        decided.images ||= overCount && ceilingSet.images;
+        decided.bytes ||= overBytes && ceilingSet.bytes;
         if (strip) {
           tokens += strippedImageSaving(image, placeholderPrice, calibration);
         } else {

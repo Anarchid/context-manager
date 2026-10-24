@@ -158,36 +158,11 @@ export function ceilingSetLimits(configured: ConfiguredImageLimits): { images: b
 }
 
 /**
- * Which ceilings decide that an image is stripped: those whose limit it
- * passes (`over`) where the ceiling sets the window's limit (`ceilingSet`,
- * see ceilingSetLimits), when nothing else strips it. An image passes the
- * count limit when the window already keeps that many, and the byte limit
- * when it doesn't fit with what's kept, a single image bigger than the limit
- * included. Something else strips it when `strippedOtherwise` says so, as
- * the host's depth limit does, or when it also passes a count or byte limit
- * the host set itself and has in force, under its ceiling. A limit the host
- * set above its ceiling isn't in force: the ceiling holds it, and the
- * warning at initialize says so. Only a ceiling that decides changes what
- * the window keeps, so only that one says its line. With the memory
- * strategy's `imageStripHysteresisRatio`, whose set decides in place of the
- * limits, the strategy applies this to each trim of its set: the limits over
- * where the trim began, and the depth limit's, decide every image the trim
- * strips (the memory strategy's ruleCeilingHits).
- */
-export function ceilingsDeciding(
-  over: { images: boolean; bytes: boolean },
-  strippedOtherwise: boolean,
-  ceilingSet: { images: boolean; bytes: boolean },
-): { images: boolean; bytes: boolean } {
-  const otherwise = strippedOtherwise || (over.images && !ceilingSet.images) || (over.bytes && !ceilingSet.bytes);
-  return otherwise ? { images: false, bytes: false } : { images: over.images, bytes: over.bytes };
-}
-
-/**
- * The line a strategy says once for each ceiling, the first time that
- * ceiling decides that an image is stripped (see ceilingsDeciding): which
- * ceiling, at what value, and the window limit of 0 or above it that the
- * ceiling holds, so an operator who set no limit sees where one now applies.
+ * The line a strategy says once for each ceiling, at the first render a
+ * select returns where images are shown as placeholders and a limit that
+ * ceiling sets (ceilingSetLimits) was over: which ceiling, at what value,
+ * and the window limit of 0 or above it that the ceiling holds, so an
+ * operator who set no limit sees where one now applies.
  */
 export function ceilingBoundLine(
   strategy: string,

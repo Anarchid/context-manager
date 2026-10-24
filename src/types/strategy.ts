@@ -1558,19 +1558,19 @@ export interface AutobiographicalConfig {
    * for what this doesn't count. 0 = no ceiling. A value that isn't 0 or a
    * finite number above it takes the default, and the strategy's warning at
    * initialize names it. A fraction is floored, to at least 1. Under a
-   * window limit of 0 or above this ceiling, the strategy says so once, at
-   * the first render a select returns where images are shown as
-   * placeholders because of this ceiling, rather than because of a limit
-   * the host set: an image past it that the host's own limits, the depth
-   * limit included, don't strip anyway, or, with
-   * `imageStripHysteresisRatio`, an image the rule's set strips in a trim
-   * this ceiling's limit brought on, where neither the depth limit nor a
-   * limit the host set was over too. That's judged at the trim alone, with
-   * two consequences: a trim that a limit the host set, or the depth limit,
-   * also brought on says nothing, though this ceiling's lower target there
-   * can strip an image the host's own limits keep; and the line is said for
-   * an image this ceiling's trim stripped even where a later trim would have
-   * stripped it anyway.
+   * window limit of 0 or above this ceiling, the strategy says once that
+   * this ceiling holds it, at the first render a select returns where images
+   * are shown as placeholders and the limit this ceiling sets was over: at
+   * an image the render replaces, or, with `imageStripHysteresisRatio`,
+   * where it brought a trim on anywhere in the rule's replay of the history.
+   * The depth limit or a limit the host set may be stripping images there
+   * too.
+   *
+   * A window held at a ceiling strips its oldest images as new ones come,
+   * as under any limit, but from deep in the request, so the prompt cache is
+   * rewritten from there at every new image. The memory strategy's
+   * `imageStripHysteresisRatio` strips in batches instead, so the cache is
+   * rewritten once a batch, and while that option is off the line names it.
    */
   imageCeiling?: number;
 
@@ -1604,7 +1604,9 @@ export interface AutobiographicalConfig {
    * `imageCeilings()` reports it, as for `imageCeiling`. 0 = no ceiling. A
    * value that isn't 0 or a finite number above it takes the default, and a
    * fraction is floored, to at least 1. Under a window limit of 0 or above
-   * this ceiling, the strategy says so once, as for `imageCeiling`.
+   * this ceiling, the strategy says so once, and a window held at it rewrites
+   * the prompt cache from deep in the request at every new image, both as
+   * for `imageCeiling`.
    */
   imageByteCeiling?: number;
 

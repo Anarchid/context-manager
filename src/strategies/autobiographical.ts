@@ -92,7 +92,6 @@ import {
   liveImageLimitsWarning,
   ceilingBoundLine,
   ceilingSetLimits,
-  ceilingsDeciding,
   resolveLiveImageLimits,
   type ResolvedImageLimits,
 } from '../live-image-limits.js';
@@ -625,41 +624,25 @@ type ToolPruningDecision = {
 
 /** The verdict postStripEstimates gives one image, which the strip applies
  *  (applyImageStripping's asEstimated): the image's payload (imagePayload),
- *  whether it's kept, and what decided it, for the ceiling line: the count
- *  and byte limits it passes and the depth limit (noteCeilings), or, with
- *  imageStripHysteresisRatio, whose set decides in place of the limits, its
- *  place among its message's images as the cut sends them (`nth`, from 0),
- *  which reportCeilingHits credits. */
+ *  whether it's kept, and, for the ceiling line, the count and byte limits
+ *  it passes. */
 type ImageVerdict = {
   key: unknown;
   keep: boolean;
-  over: { images: boolean; bytes: boolean };
-  beyondDepth: boolean;
-  nth?: number;
+  over: CeilingKinds;
 };
 
-/** What decided the images the strip of a render select returns replaced,
- *  for the ceiling line (reportCeilingHits): the ceilings that decided one
- *  under the limits (ceilingsDeciding), and, with imageStripHysteresisRatio,
- *  each image the rule's set replaced, by its message and its place among
- *  that message's images. */
-type CeilingNotes = {
-  images: boolean;
-  bytes: boolean;
-  ruleStripped: Array<{ id: MessageId; nth: number }>;
-};
+/** The count limit and the byte limit, by the ceiling that can set each. */
+type CeilingKinds = { images: boolean; bytes: boolean };
 
 /** imageStripHysteresisRatio's set at the window's limits
  *  (stripReplayAtLimits): how many of each message's images it strips, and
- *  for each stripped image, by its place among its message's images, which
- *  full limits were over where the trim that stripped it began. */
+ *  which of the count and byte limits brought a trim on anywhere in the
+ *  history it replays, for the ceiling line. */
 type StripReplay = {
   out: ReadonlyMap<MessageId, number>;
-  trims: ReadonlyMap<MessageId, ReadonlyArray<TrimOver>>;
+  over: Readonly<CeilingKinds>;
 };
-
-/** Which of the window's full limits were over where a trim began. */
-type TrimOver = { readonly images: boolean; readonly bytes: boolean; readonly depth: boolean };
 
 /** A tool call the conversation answers: its message's place in the listing,
  *  the place of the result that first answered it, and every result that
@@ -7971,7 +7954,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // What this select's strips record is what it reports. A dry select's
       // strips, and a refused one's, record too; each live select starts by
       // clearing what earlier ones left, so it reports its own render's.
-      this._ceilingNotes = { images: false, bytes: false, ruleStripped: [] };
+      this._ceilingNotes = { images: false, bytes: false };
       let entries: ContextEntry[];
       this.thinkingBound = opts?.thinkingBinding?.binds === true;
       try {
@@ -7987,7 +7970,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // refused threw above, and a dry select never comes here. Every select
       // path strips its render last (applyImageStripping, `returned`), and a
       // strip with no limits records nothing, so the hits are this render's.
-      this.reportCeilingHits(store);
+      this.reportCeilingHits();
       return entries;
     }
     // A dry run commits nothing, and that includes what a select leaves for
@@ -17479,11 +17462,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  so counting what the entries send has nothing to add, and a tool result
    *  pairing repair moved keeps its own message's count.
    *
-   *  `returned`: select returns this render, so the strip leaves what
-   *  decided the images it replaces for select to report once it has
-   *  returned it (reportCeilingHits): the ceilings that decided an image
-   *  under the limits (noteCeilings), or, with `imageStripHysteresisRatio`,
-   *  each image the rule's set replaces, which reportCeilingHits credits.
+   *  `returned`: select returns this render, so where it replaces an image
+   *  the strip notes which ceiling-set limits were over, for select to
+   *  report once it has returned it (reportCeilingHits): under the limits,
+   *  those the replaced images pass, and with `imageStripHysteresisRatio`,
+   *  those that brought a trim on anywhere in the rule's replay.
    *  A layout rendered only to compare against, such as kv-unified's kept
    *  one, and any other caller's render, leave it unset. */
   protected applyImageStripping(
@@ -17509,17 +17492,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       .filter(({ idx }) => this.hasImageBlock(entries[idx].content))
       .sort((a, b) => b.pos - a.pos);
 
-    // What decided the images this strip replaces, for the ceiling line:
-    // under the limits, a ceiling whose limit an image passes, where that
-    // ceiling sets the limit and nothing else strips the image
-    // (ceilingsDeciding); under the rule's set, each image it replaces, which
-    // reportCeilingHits credits once select has returned the render.
+    // For the ceiling line: which limits a ceiling sets were over where this
+    // strip replaces an image. Under the limits, those the image passes,
+    // whatever else strips it too; under the rule's set, those that brought
+    // a trim on anywhere in its replay (stripReplayAtLimits).
     const ceilingSet = ceilingSetLimits(this.configuredImageLimits());
-    const notes: CeilingNotes = { images: false, bytes: false, ruleStripped: [] };
-    const noteCeilings = (over: { images: boolean; bytes: boolean }, tooDeep: boolean): void => {
-      const deciding = ceilingsDeciding(over, tooDeep, ceilingSet);
-      if (deciding.images) notes.images = true;
-      if (deciding.bytes) notes.bytes = true;
+    const notes: CeilingKinds = { images: false, bytes: false };
+    const noteCeilings = (over: Readonly<CeilingKinds>): void => {
+      if (over.images && ceilingSet.images) notes.images = true;
+      if (over.bytes && ceilingSet.bytes) notes.bytes = true;
     };
 
     if (opts.asEstimated || this.imageHysteresisRatio() !== undefined) {
@@ -17535,6 +17516,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const judged = verdicts.get(home)?.get(group)?.[n];
         return judged !== undefined && judged.key === imagePayload(image) ? judged : undefined;
       };
+      const rule = this.imageHysteresisRatio() !== undefined;
+      let ruleReplaced = false;
       for (const { idx, pos } of ordered) {
         const keeps: boolean[] = [];
         for (const block of entries[idx].content) {
@@ -17546,9 +17529,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           for (const image of imagesIn([block])) {
             const judged = verdictOf(image, home, group);
             if (judged && !judged.keep) {
-              // A verdict exists only for a message in the listing (home >= 0).
-              if (judged.nth !== undefined) notes.ruleStripped.push({ id: messages[home]!.id, nth: judged.nth });
-              else noteCeilings(judged.over, judged.beyondDepth);
+              if (rule) ruleReplaced = true;
+              else noteCeilings(judged.over);
             }
             keeps.push(judged?.keep ?? false);
           }
@@ -17557,6 +17539,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         let next = 0;
         entries[idx].content = replaceImages(entries[idx].content, () => !keeps[next++],
           AutobiographicalStrategy.IMAGE_PLACEHOLDER);
+      }
+      if (ruleReplaced) {
+        const replay = this.stripReplayAtLimits(store);
+        if (replay) noteCeilings(replay.over);
       }
       if (opts.returned) this._ceilingNotes = notes;
       return;
@@ -17592,7 +17578,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const overCount = maxLive > 0 && keptImages >= maxLive;
       const overBytes = maxLiveBytes > 0 && keptImageBytes + blockBytes > maxLiveBytes;
       if (tooDeep || overCount || overBytes) {
-        noteCeilings({ images: overCount, bytes: overBytes }, tooDeep);
+        noteCeilings({ images: overCount, bytes: overBytes });
         return false;
       }
       keptImages++;
@@ -17658,8 +17644,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /** The rule's set at the window's limits (imageStripReplay), memoized,
-   *  with the limits that were over where the trim that stripped each image
-   *  began (ruleCeilingHits reads them). */
+   *  with the count and byte limits that brought a trim on (applyImageStripping
+   *  notes them for the ceiling line). */
   private stripReplayAtLimits(store: MessageStoreView): StripReplay | undefined {
     const ratio = this.imageHysteresisRatio();
     if (ratio === undefined) return undefined;
@@ -17691,7 +17677,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let first = 0;
       let liveBytes = 0;
       const out = new Map<MessageId, number>();
-      const trims = new Map<MessageId, TrimOver[]>();
+      const brought: CeilingKinds = { images: false, bytes: false };
       for (let i = 0; i < messages.length; i++) {
         for (const image of imagesIn(this.cappedForSend(store, messages[i]!, msgCap).content)) {
           const bytes = inlineImageBytes(image);
@@ -17706,8 +17692,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const over = (depth: number, count: number, size: number): boolean =>
           overCountOrBytes(count, size) || overDepth(depth);
         if (!over(depthCap, countCap, bytesCap)) continue;
-        // What brought this trim on, at the full limits.
-        const trim: TrimOver = { images: overCount(countCap), bytes: overBytes(bytesCap), depth: overDepth(depthCap) };
+        if (overCount(countCap)) brought.images = true;
+        if (overBytes(bytesCap)) brought.bytes = true;
         const depth = Math.floor(depthCap * ratio);
         const countTarget = Math.floor(countCap * ratio);
         const sizeTarget = Math.floor(bytesCap * ratio);
@@ -17724,14 +17710,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           liveBytes -= oldest.bytes;
           const id = messages[oldest.at]!.id;
           out.set(id, (out.get(id) ?? 0) + 1);
-          // Stripped oldest first, so its place in this list is its place
-          // among its message's images.
-          const ofMessage = trims.get(id);
-          if (ofMessage) ofMessage.push(trim);
-          else trims.set(id, [trim]);
         }
       }
-      const replay: StripReplay = { out, trims };
+      const replay: StripReplay = { out, over: brought };
       this._imageStripReplayMemo = { messages, calibration, depthCap, countCap, bytesCap, ratio, pruning, msgCap, replay };
       return replay;
     });
@@ -17853,9 +17834,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         const cut = this.cappedForSend(store, messages[i]!, msgCap).content;
         const groups = new Map<unknown, ImageVerdict[]>();
         let ruleLeft = replay !== undefined ? replay.get(messages[i]!.id) ?? 0 : undefined;
-        // Each image's place among the message's images, for the ceiling
-        // line's credit of the rule's set (reportCeilingHits).
-        let nth = 0;
         for (const block of cut) {
           const group = imageGroup(block);
           for (const b of imagesIn([block])) {
@@ -17878,11 +17856,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             }
             let judged = groups.get(group);
             if (!judged) groups.set(group, judged = []);
-            judged.push({
-              key: imagePayload(b), keep, over: { images: beyondCount, bytes: beyondBytes }, beyondDepth,
-              nth: replay !== undefined ? nth : undefined,
-            });
-            nth++;
+            judged.push({ key: imagePayload(b), keep, over: { images: beyondCount, bytes: beyondBytes } });
           }
         }
         if (groups.size > 0) verdicts.set(i, groups);
@@ -17905,58 +17879,37 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Which ceilings have been said to strip the live window (once each per instance). */
   private readonly ceilingBoundReported = { images: false, bytes: false };
-  /** What decided the images in the last render select returned (applyImageStripping, `returned`). */
-  private _ceilingNotes: CeilingNotes = { images: false, bytes: false, ruleStripped: [] };
+  /** Which ceiling-set limits were over where the last render select
+   *  returned replaced an image (applyImageStripping, `returned`). */
+  private _ceilingNotes: CeilingKinds = { images: false, bytes: false };
 
   /** Say once for each ceiling, when a select returns a render in which
-   *  images are shown as placeholders because of that ceiling, rather than
-   *  because of a limit the host set. Under the limits, that's
-   *  an image past the ceiling that nothing else strips (see
-   *  ceilingsDeciding). With imageStripHysteresisRatio, the rule's set
-   *  decides in place of the limits, so an image it replaces is credited
-   *  to the ceiling whose limit brought on the trim that stripped it, with
-   *  no limit the host set, and not the depth limit, over there
-   *  (ruleCeilingHits). A dry
-   *  select, a preview, an observer's reconstruction or a refused select
-   *  says nothing, and the line waits for the first render returned. */
-  private reportCeilingHits(store: MessageStoreView): void {
+   *  images are shown as placeholders and a limit that ceiling sets was over
+   *  (applyImageStripping's notes): under the limits, at an image the render
+   *  replaces, and with imageStripHysteresisRatio, at a trim anywhere in the
+   *  rule's replay. The depth limit or a limit the host set may be stripping
+   *  too. While the rule is off, the line adds the cost of a window held at
+   *  the ceiling and names the option that spaces it. The rule's set is this
+   *  class's; a subclass's override of imageStripReplay isn't consulted for
+   *  the line. A dry select, a preview, an observer's reconstruction or a
+   *  refused select says nothing, and the line waits for the first render
+   *  returned. */
+  private reportCeilingHits(): void {
     const said = this.ceilingBoundReported;
     const notes = this._ceilingNotes;
-    const rule = this.ruleCeilingHits(store, notes.ruleStripped);
     for (const kind of ['images', 'bytes'] as const) {
-      if (!(notes[kind] || rule[kind]) || said[kind]) continue;
+      if (!notes[kind] || said[kind]) continue;
       said[kind] = true;
-      this.diag.warn(ceilingBoundLine(this.name, kind, this.configuredImageLimits(), this.imageLimitsDefaulted()));
+      const line = ceilingBoundLine(this.name, kind, this.configuredImageLimits(), this.imageLimitsDefaulted());
+      this.diag.warn(this.imageHysteresisRatio() === undefined ? line + AutobiographicalStrategy.CEILING_BATCH_CLAUSE : line);
     }
   }
 
-  /**
-   * Which of the ceilings decided an image the rule's set replaced
-   * (`stripped`, by message and place among its images): the ceiling whose
-   * limit brought on the trim that stripped it, with neither the depth limit
-   * nor a limit the host set over there. That's ceilingsDeciding's rule,
-   * given what was over where the trim began. It reads the set's own replay,
-   * memoized for the listing the render was made from (stripReplayAtLimits),
-   * and replays nothing. The set is this class's rule; a subclass's override
-   * of imageStripReplay isn't consulted for it.
-   */
-  private ruleCeilingHits(
-    store: MessageStoreView,
-    stripped: ReadonlyArray<{ id: MessageId; nth: number }>,
-  ): { images: boolean; bytes: boolean } {
-    const hits = { images: false, bytes: false };
-    const replay = this.stripReplayAtLimits(store);
-    if (!replay) return hits;
-    const set = ceilingSetLimits(this.configuredImageLimits());
-    for (const { id, nth } of stripped) {
-      const trim = replay.trims.get(id)?.[nth];
-      if (!trim) continue;
-      const decided = ceilingsDeciding(trim, trim.depth, set);
-      if (decided.images) hits.images = true;
-      if (decided.bytes) hits.bytes = true;
-    }
-    return hits;
-  }
+  /** What the ceiling line adds while imageStripHysteresisRatio is off: the
+   *  cost of a window held at a ceiling, and the option that spaces it. */
+  private static readonly CEILING_BATCH_CLAUSE =
+    '; at the ceiling each new image turns the oldest live ones into placeholders, which rewrites the prompt ' +
+    'cache from there, and imageStripHysteresisRatio does that in batches instead';
 
   /** The image limits whose values are defaults: those the library's default
    *  layer gave or no layer gave, and those the host gave as undefined or
