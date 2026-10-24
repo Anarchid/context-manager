@@ -160,17 +160,20 @@ export interface ContextStrategy {
   readonly maxMessageTokens?: number;
 
   /**
-   * What the next compile sends for each of `ids`, messages just stored, in
-   * the order given, before the manager leaves out any thinking under
+   * What the next compile sends for each of `ids`, in the order given,
+   * before the manager leaves out any thinking under
    * `SelectOptions.thinkingBinding`. Each comes back in the form the compile
    * sends it, wherever the compile places it: cut by the per-message cap, as
    * one message where the compile joins a body's shards into one, and with
    * every image decision the strategy makes there: its count, depth and byte
    * limits, counted newest-first over the view from the oldest of these
    * messages to its newest, as a compile counts them. It's for a caller that
-   * appends messages it has just stored to a compiled request without
-   * recompiling, such as a turn's mid-turn injections, so that what it
-   * appends is what the next compile sends. A later compile can still strip
+   * adds to a compiled request without recompiling. One appends messages it
+   * has just stored, such as a turn's mid-turn injections, so that what it
+   * appends is what the next compile sends. Another renders messages its
+   * stream has already sent, such as the rows `ContextManager.noteRequestSent`
+   * digests over a whole turn, so that it can tell whether the next compile
+   * sends them as they were sent. A later compile can still strip
    * an image of theirs as newer ones arrive, and their images can strip
    * older images the request already carried, so the request they're
    * appended to can still differ from the next compile before them.

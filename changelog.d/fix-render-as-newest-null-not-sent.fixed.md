@@ -26,3 +26,7 @@
   adaptive select refuses that compile, both drop a `tool_result` whose
   call isn't sent before it, and the manager splits a message other than a
   user's that holds a `tool_result` into several turns.
+- The doc says whom the render is for: a caller that appends messages it
+  has just stored to a compiled request, and one that renders messages its
+  stream has already sent, as `noteRequestSent` does over a whole turn's
+  rows.

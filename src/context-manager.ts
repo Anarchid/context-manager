@@ -1659,10 +1659,12 @@ export class ContextManager {
   }
 
   /**
-   * What the next compile sends for each of `ids`, messages this manager has
-   * just stored, in the form the compile sends each, wherever it places it
-   * (see `ContextStrategy.renderAsNewest`), before any thinking the thinking
-   * binding leaves out (`SelectOptions.thinkingBinding`). Give each message by the id
+   * What the next compile sends for each of `ids`, messages this manager
+   * stores, such as ones it has just stored or the rows a stream has sent
+   * (`noteRequestSent`), in the form the compile sends each, wherever it
+   * places it (see `ContextStrategy.renderAsNewest`), before any thinking
+   * the thinking binding leaves out (`SelectOptions.thinkingBinding`). Give
+   * each message by the id
    * `addMessage` returned. For a body stored as shards that's its first
    * shard's, which stands for the whole body where the compile joins its
    * shards; where the compile sends each shard on its own, an id gives back
@@ -1730,11 +1732,10 @@ export class ContextManager {
    * participant goes as the user's, and a bundled tool cycle as each of its
    * parts (`splitMixedToolMessages`). So one it renders as null, or that the
    * next compile renders otherwise, matches nothing there, and what follows
-   * goes without its thinking; a note that renders rows this way releases
-   * compression holds that have timed out, as `renderAsNewest` does.
-   * Without `renderAsNewest`, a row is its stored content, and a body stored
-   * as shards matches nothing, and so does an id the store doesn't hold, as
-   * after a removal.
+   * goes without its thinking. Rendering them releases no compression hold,
+   * as `renderAsNewest` releases none. Without `renderAsNewest`, a row is
+   * its stored content, and a body stored as shards matches nothing, and so
+   * does an id the store doesn't hold, as after a removal.
    *
    * Returns false and writes nothing when `compileId` isn't the compile that
    * wrote the branch's record, as for a stream whose note arrives after
