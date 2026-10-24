@@ -721,11 +721,8 @@ describe('the autobiographical strategy and a system change', () => {
     const cm = await open(strategy);
     const ids = [cm.addMessage('User', [text('a')]), cm.addMessage('Harness', [change()]), cm.addMessage('User', [text('b')])];
     cm.pinRange(ids[0]!, ids[2]!, { name: 'level-1', level: 1 });
-    // In both readings: the summarizer's prompt reads pins by their ids, the selects as whole messages.
-    for (const reading of ['ids', 'whole'] as const) {
-      const bounds = (strategy as unknown as { resolvedPinBounds(m: StoredMessage[], reading: 'ids' | 'whole'): Map<number, unknown> }).resolvedPinBounds(cm.getAllMessages(), reading);
-      assert.deepEqual([bounds.get(0), bounds.get(1), bounds.get(2)], [{ level: 1 }, 'raw', { level: 1 }], reading);
-    }
+    const bounds = (strategy as unknown as { resolvedPinBounds(m: StoredMessage[]): Map<number, unknown> }).resolvedPinBounds(cm.getAllMessages());
+    assert.deepEqual([bounds.get(0), bounds.get(1), bounds.get(2)], [{ level: 1 }, 'raw', { level: 1 }]);
   });
 
   it('compression input passes over a message it left empty: no separator where it sat, and its neighbours join', () => {
