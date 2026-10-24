@@ -524,6 +524,18 @@ describe('the line when an image ceiling first strips', () => {
       }
     });
 
+    it(`${name}: says both lines when both ceilings' limits are over at the same image`, async () => {
+      // Three 4-byte images under ceilings of 2 images and 8 bytes: the
+      // oldest is past both, so one strip notes both ceilings.
+      const { byStep, last } = await ceilingLines(
+        make({ maxLiveImages: 0, maxLiveImageBytes: 0, imageCeiling: 2, imageByteCeiling: 8 }), [3],
+      );
+      assert.equal(last, '.II');
+      assert.equal(byStep[0]!.length, 2, JSON.stringify(byStep));
+      assert.ok(byStep[0]!.some((line) => line.includes('imageCeiling 2 holds')), JSON.stringify(byStep));
+      assert.ok(byStep[0]!.some((line) => line.includes('imageByteCeiling 8 bytes holds')), JSON.stringify(byStep));
+    });
+
     it(`${name}: says it for a single image bigger than the byte ceiling`, async () => {
       const { byStep, patterns } = await ceilingLines(make({ maxLiveImageBytes: 0, imageByteCeiling: 8 }), [{ add: 1, bytes: 12 }]);
       assert.deepEqual(patterns, ['.'], 'the one image is past the ceiling on its own');
@@ -985,6 +997,40 @@ describe('the line when an image ceiling first strips', () => {
       await manager.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("the memory strategy's rule says both lines when both ceilings' limits bring the same trim on", async () => {
+    // Three 4-byte images under ceilings of 2 images and 8 bytes: at the
+    // third, the count (3) and the bytes (12) are both over, at one trim.
+    const { lines } = await ceilingLines(
+      memory({ maxLiveImages: 0, maxLiveImageBytes: 0, imageCeiling: 2, imageByteCeiling: 8, imageStripHysteresisRatio: 0.5 }), [3],
+    );
+    assert.equal(lines.length, 2, JSON.stringify(lines));
+    assert.ok(lines.some((line) => line.includes('imageCeiling 2 holds')), JSON.stringify(lines));
+    assert.ok(lines.some((line) => line.includes('imageByteCeiling 8 bytes holds')), JSON.stringify(lines));
+  });
+
+  it("the memory strategy's rule keeps a ceiling's trim in its record past a later trim only the host's limit brings on", async () => {
+    // A count ceiling of 4 and a host byte limit of 40, in force, compiled
+    // once, at the end. Five 4-byte images bring the count ceiling's trim
+    // on; a 36-byte image then brings a trim on that only the host's byte
+    // limit is over at. The replay's record of the first trim stands.
+    const { kept, lines } = await ruleRun(
+      { maxLiveImages: 0, imageCeiling: 4, maxLiveImageBytes: 40, imageStripHysteresisRatio: 0.5 },
+      [1, 2, 3, 4, 5].map((i) => imageMessage(`img-${i}`)).concat([imageMessage('img-6', 36)]),
+    );
+    assert.equal(kept, '.....I', 'premise: both trims strip');
+    assert.equal(lines.length, 1, JSON.stringify(lines));
+    assert.ok(lines[0]!.includes('imageCeiling 4 holds'), lines[0]);
+  });
+
+  it("the memory strategy's line doesn't name imageStripHysteresisRatio under a count ceiling of 1, which leaves it no room", async () => {
+    // Under a count ceiling of 1 the rule keeps the newest image at every
+    // trim, so it strips at every image as the limits do.
+    const { lines } = await ceilingLines(memory({ maxLiveImages: 0, imageCeiling: 1 }), [2]);
+    assert.equal(lines.length, 1, JSON.stringify(lines));
+    assert.ok(lines[0]!.includes('imageCeiling 1 holds maxLiveImages 0 (no limit) to it, so some images are now shown as placeholders'), lines[0]);
+    assert.ok(!lines[0]!.includes('imageStripHysteresisRatio'), lines[0]);
   });
 
   it("the memory strategy's line isn't read from a preview's set under ceilings that set no limit", async () => {

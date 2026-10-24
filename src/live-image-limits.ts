@@ -160,9 +160,11 @@ export function ceilingSetLimits(configured: ConfiguredImageLimits): { images: b
 /**
  * The line a strategy says once for each ceiling, at the first render a
  * select returns where images are shown as placeholders and a limit that
- * ceiling sets (ceilingSetLimits) was over: which ceiling, at what value,
- * and the window limit of 0 or above it that the ceiling holds, so an
- * operator who set no limit sees where one now applies.
+ * ceiling sets (ceilingSetLimits) was over: at an image the render
+ * replaces, or, under the memory strategy's `imageStripHysteresisRatio`, at
+ * the start of a trim anywhere in the rule's replay. It says which ceiling,
+ * at what value, and the window limit of 0 or above it that the ceiling
+ * holds, so an operator who set no limit sees where one now applies.
  */
 export function ceilingBoundLine(
   strategy: string,

@@ -610,7 +610,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     }
   }
 
-  /** Says a ceiling's line once, for a ceiling that decided an image of an entry the render holds. */
+  /** Says a ceiling's line once, for a ceiling whose limit was over where the window strips an image of an entry the render holds. */
   private reportCeilings(entries: ContextEntry[], policy: ImagePolicy): void {
     for (const entry of entries) {
       const decided = policy.ceilings[entry.index];

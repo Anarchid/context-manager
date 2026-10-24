@@ -17465,8 +17465,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  `returned`: select returns this render, so where it replaces an image
    *  the strip notes which ceiling-set limits were over, for select to
    *  report once it has returned it (reportCeilingHits): under the limits,
-   *  those the replaced images pass, and with `imageStripHysteresisRatio`,
-   *  those that brought a trim on anywhere in the rule's replay.
+   *  those a replaced image is over, and with `imageStripHysteresisRatio`,
+   *  where the rule's set replaces an image, those that brought a trim on
+   *  anywhere in the rule's replay.
    *  A layout rendered only to compare against, such as kv-unified's kept
    *  one, and any other caller's render, leave it unset. */
   protected applyImageStripping(
@@ -17493,9 +17494,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       .sort((a, b) => b.pos - a.pos);
 
     // For the ceiling line: which limits a ceiling sets were over where this
-    // strip replaces an image. Under the limits, those the image passes,
-    // whatever else strips it too; under the rule's set, those that brought
-    // a trim on anywhere in its replay (stripReplayAtLimits).
+    // strip replaces an image. Under the limits, those the image is over,
+    // whatever else strips it too; where the rule's set replaces an image,
+    // those that brought a trim on anywhere in its replay
+    // (stripReplayAtLimits). An image replaced for want of a verdict isn't
+    // the set's strip, and notes nothing.
     const ceilingSet = ceilingSetLimits(this.configuredImageLimits());
     const notes: CeilingKinds = { images: false, bytes: false };
     const noteCeilings = (over: Readonly<CeilingKinds>): void => {
@@ -17602,10 +17605,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         return true;
       }, AutobiographicalStrategy.IMAGE_PLACEHOLDER);
     }
-    // A render select returns (`returned`) leaves what its ceilings decided
-    // for select to report once it has returned it; the last such strip is
-    // the render it returns. Any other strip, such as renderAsNewest's,
-    // leaves nothing.
+    // A render select returns (`returned`) leaves which ceiling-set limits
+    // were over for select to report once it has returned it; the last such
+    // strip is the render it returns. Any other strip, such as
+    // renderAsNewest's, leaves nothing.
     if (opts.returned) this._ceilingNotes = notes;
   }
 
@@ -17889,7 +17892,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  replaces, and with imageStripHysteresisRatio, at a trim anywhere in the
    *  rule's replay. The depth limit or a limit the host set may be stripping
    *  too. While the rule is off, the line adds the cost of a window held at
-   *  the ceiling and names the option that spaces it. The rule's set is this
+   *  the ceiling and names the option that spaces it, except under a count
+   *  ceiling of 1, which leaves the option no room. The rule's set is this
    *  class's; a subclass's override of imageStripReplay isn't consulted for
    *  the line. A dry select, a preview, an observer's reconstruction or a
    *  refused select says nothing, and the line waits for the first render
@@ -17901,7 +17905,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (!notes[kind] || said[kind]) continue;
       said[kind] = true;
       const line = ceilingBoundLine(this.name, kind, this.configuredImageLimits(), this.imageLimitsDefaulted());
-      this.diag.warn(this.imageHysteresisRatio() === undefined ? line + AutobiographicalStrategy.CEILING_BATCH_CLAUSE : line);
+      // The option can space the trims only where the ceiling leaves it room:
+      // under a count ceiling of 1 the newest image stays at every trim.
+      const spaces = kind === 'bytes' || this.resolvedImageLimits().ceiling.images > 1;
+      this.diag.warn(this.imageHysteresisRatio() === undefined && spaces ? line + AutobiographicalStrategy.CEILING_BATCH_CLAUSE : line);
     }
   }
 

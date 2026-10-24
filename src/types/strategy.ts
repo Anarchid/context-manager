@@ -185,8 +185,9 @@ export interface ContextStrategy {
    *
    * What comes back is made of the stored arrays and blocks, as a compile's
    * messages are, so a caller that edits what comes back copies it first.
-   * Tool blocks come back as the cap leaves them, since how a compile pairs
-   * and prunes them depends on the window around them. Rendering doesn't
+   * Tool blocks come back as the cap leaves them, with what sending prunes
+   * from them, since how a compile pairs them depends on the window around
+   * them. Rendering doesn't
    * change what a later compile sends.
    */
   renderAsNewest?(store: MessageStoreView, ids: readonly MessageId[]): Array<ContentBlock[] | null>;
