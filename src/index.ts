@@ -110,6 +110,7 @@ export type {
   CompressionHoldOptions,
   CompressionHoldInfo,
   RenderedSummaryInfo,
+  ImageCeilings,
   ThinkingBinding,
   RequestIdentity,
 } from './types/index.js';

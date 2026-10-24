@@ -1,6 +1,7 @@
 import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 import type {
   ContextStrategy,
+  ImageCeilings,
   StrategyContext,
   ReadinessState,
   MessageStoreView,
@@ -20,6 +21,15 @@ import { OverBudgetError } from '../adaptive/picker.js';
 import { observeStoreBranch, type StoreBranchGeneration } from '../branch-generation.js';
 import { hasImage, imagesIn, inlineImageBytes, replaceImages, strippedImageSaving } from '../inline-images.js';
 import { capContent, cappedPriceExtra } from './message-cap.js';
+import {
+  DEFAULT_IMAGE_CEILING,
+  DEFAULT_IMAGE_BYTE_CEILING,
+  liveImageLimitsWarning,
+  ceilingBoundLine,
+  ceilingSetLimits,
+  resolveLiveImageLimits,
+  type ResolvedImageLimits,
+} from '../live-image-limits.js';
 import { holdsSystemChange, systemChangePositions } from '../system-changes.js';
 
 /**
@@ -72,19 +82,41 @@ export interface WindowedPassthroughOptions {
    * `imageStripDepthTokens` from the newest message, or past
    * `maxLiveImageBytes` of cumulative inline image bytes (newest-first).
    * Defaults follow `DEFAULT_AUTOBIOGRAPHICAL_CONFIG` (and the memory
-   * strategy's byte wall); 0 disables that dimension. A strip changes the
+   * strategy's byte wall). A count or byte limit of 0 means up to its
+   * image ceiling, below, and a depth of 0 means no depth strip. A strip changes the
    * bytes at that position, which the cache-marker placement absorbs by
    * measurement (the marker falls back to the deepest byte-stable entry).
    */
   maxLiveImages?: number;
   imageStripDepthTokens?: number;
   maxLiveImageBytes?: number;
+  /**
+   * The image ceilings, mirroring `AutobiographicalConfig.imageCeiling` and
+   * `imageByteCeiling`: the most images, and the most of their inline image
+   * bytes, the window keeps, counted as
+   * `AutobiographicalConfig.maxLiveImages` says, whatever `maxLiveImages` and
+   * `maxLiveImageBytes` say (0 there means up to these). They don't bound a
+   * whole request: what the window doesn't count, and what a caller injects
+   * or appends, isn't counted. `imageCeilings()` reports them.
+   * Defaults 500 images and 24 MiB; 0 = no ceiling, and a value that isn't 0
+   * or a finite number above it takes the default.
+   */
+  imageCeiling?: number;
+  imageByteCeiling?: number;
 }
 
 /** Text substituted for an image block once it leaves the live-image window
  *  (identical to the autobiographical strategy's placeholder, so a merged
  *  timeline reads the same in both agents' windows). */
 const IMAGE_PLACEHOLDER = '[image not shown: this context keeps only some images]';
+
+/** The live-image policy's verdicts, by message position (see liveImagePolicy). */
+interface ImagePolicy {
+  strips: (boolean[] | undefined)[];
+  saved: number[];
+  ceilings: ({ images: boolean; bytes: boolean } | undefined)[];
+}
+
 /** Mirrors `AutobiographicalStrategy.DEFAULT_MAX_LIVE_IMAGE_BYTES` (protected there). */
 const DEFAULT_MAX_LIVE_IMAGE_BYTES = 20 * 1024 * 1024;
 
@@ -137,9 +169,17 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
 
   private readonly reAnchorFraction: number;
   private readonly anchorStateIdOverride?: string;
-  private readonly maxLiveImages: number;
+  /** The image limits as configured, with the defaults where unset. */
+  private readonly configuredImageLimits: {
+    maxLiveImages: number; maxLiveImageBytes: number; imageCeiling: number; imageByteCeiling: number;
+  };
+  /** The image limits the options didn't give, whose values are defaults. */
+  private readonly imageLimitsDefaulted: ReadonlySet<string>;
   private readonly imageStripDepthTokens: number;
-  private readonly maxLiveImageBytes: number;
+  /** Whether the image limits' warning has been said (once per instance). */
+  private imageLimitsWarningReported = false;
+  /** Which ceilings have been said to strip the live window (once each per instance). */
+  private readonly ceilingBoundReported = { images: false, bytes: false };
 
   private anchor: Sequence = 0;
   private store: JsStore | null = null;
@@ -162,15 +202,51 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     this.reAnchorFraction = fraction;
     this.anchorStateIdOverride = options.anchorStateId;
     this.maxMessageTokens = options.maxMessageTokens;
-    this.maxLiveImages = options.maxLiveImages ?? DEFAULT_AUTOBIOGRAPHICAL_CONFIG.maxLiveImages ?? 0;
+    this.configuredImageLimits = {
+      maxLiveImages: options.maxLiveImages ?? DEFAULT_AUTOBIOGRAPHICAL_CONFIG.maxLiveImages ?? 0,
+      maxLiveImageBytes: options.maxLiveImageBytes ?? DEFAULT_MAX_LIVE_IMAGE_BYTES,
+      imageCeiling: options.imageCeiling ?? DEFAULT_IMAGE_CEILING,
+      imageByteCeiling: options.imageByteCeiling ?? DEFAULT_IMAGE_BYTE_CEILING,
+    };
+    this.imageLimitsDefaulted = new Set(
+      (['maxLiveImages', 'maxLiveImageBytes', 'imageCeiling', 'imageByteCeiling'] as const).filter((key) => options[key] == null),
+    );
     this.imageStripDepthTokens =
       options.imageStripDepthTokens ?? DEFAULT_AUTOBIOGRAPHICAL_CONFIG.imageStripDepthTokens ?? 0;
-    this.maxLiveImageBytes = options.maxLiveImageBytes ?? DEFAULT_MAX_LIVE_IMAGE_BYTES;
+  }
+
+  /**
+   * The image ceilings (see ContextStrategy.imageCeilings), as the window
+   * applies them: a malformed one at its default, a fraction floored.
+   */
+  imageCeilings(): ImageCeilings {
+    const { ceiling } = this.resolvedImageLimits();
+    return { imageCeiling: ceiling.images, imageByteCeiling: ceiling.bytes };
+  }
+
+  /** The live window's count and byte limits, kept within the image
+   *  ceilings, and the ceilings themselves. */
+  private resolvedImageLimits(): ResolvedImageLimits {
+    return resolveLiveImageLimits(this.configuredImageLimits);
+  }
+
+  /** Say once that an image ceiling holds a limit the options set as none
+   *  or above it, once a limit it sets was over where the window strips an
+   *  image (liveImagePolicy's `ceilings`). */
+  private reportCeilingBoundOnce(kind: 'images' | 'bytes'): void {
+    if (this.ceilingBoundReported[kind]) return;
+    this.ceilingBoundReported[kind] = true;
+    this.diag.warn(ceilingBoundLine(this.name, kind, this.configuredImageLimits, this.imageLimitsDefaulted));
   }
 
   async initialize(ctx: StrategyContext): Promise<void> {
     this.store = ctx.store;
     this.ns = ctx.namespace;
+    if (!this.imageLimitsWarningReported) {
+      this.imageLimitsWarningReported = true;
+      const line = liveImageLimitsWarning(this.name, this.configuredImageLimits, this.imageLimitsDefaulted);
+      if (line) this.diag.warn(line);
+    }
     this.stateId = this.anchorStateIdOverride ?? `${ctx.namespace}/windowed:anchor`;
     registerStateIfAbsent(this.store, { id: this.stateId, strategy: 'snapshot' });
     this.loadBranchState();
@@ -405,6 +481,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     for (let i = start; i < messages.length; i++) add(i);
 
     this.stripImages(entries, policy);
+    // Only a render select returns says a ceiling's line, for the images it
+    // holds. A preview's (dryRun) doesn't, nor any other caller's.
+    if (!opts?.dryRun) this.reportCeilings(entries, policy);
     if (!opts?.dryRun) this.placeCacheMarkers(entries);
     return entries;
   }
@@ -484,7 +563,10 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
    * each message's estimate gives back for the images it loses (`saved`).
    * `select` prices the window by `saved` and applies `strips` to what it
    * emits (stripImages), so the verdicts it prices are the ones the strip
-   * applies.
+   * applies. `ceilings` names, for each message, the limits an image
+   * ceiling sets (ceilingSetLimits) that were over where one of its images
+   * is stripped, whatever else strips it too, for the line a returned
+   * render says (reportCeilings).
    *
    * That holds wherever the window starts, and the re-anchor walk reads them
    * as they are, as `renderAsNewest` does from the batch's oldest message:
@@ -500,13 +582,14 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
     messages: StoredMessage[],
     store: MessageStoreView,
     from: number,
-  ): { strips: (boolean[] | undefined)[]; saved: number[] } {
+  ): ImagePolicy {
     const strips: (boolean[] | undefined)[] = [];
     const saved: number[] = [];
-    const maxLive = this.maxLiveImages;
+    const ceilings: ({ images: boolean; bytes: boolean } | undefined)[] = [];
+    // Count and bytes within the image ceilings; 0 = unlimited.
+    const { images: maxLive, bytes: maxLiveBytes } = this.resolvedImageLimits().target;
     const depthTokens = this.imageStripDepthTokens;
-    const maxLiveBytes = this.maxLiveImageBytes;
-    if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return { strips, saved };
+    if (maxLive === 0 && depthTokens === 0 && maxLiveBytes === 0) return { strips, saved, ceilings };
     const calibration = store.getTokenCalibration?.() ?? 1;
     // The placeholder as the store prices it, calibrated, by its own text estimator.
     const placeholderPrice = store.estimateTokens({ content: [{ type: 'text', text: IMAGE_PLACEHOLDER }] } as unknown as StoredMessage);
@@ -522,6 +605,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       }
     }
 
+    const ceilingSet = ceilingSetLimits(this.configuredImageLimits);
     let keptImages = 0;
     let keptImageBytes = 0;
     // Newest-first. Every image a message carries, nested in a tool_result
@@ -538,6 +622,9 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
         const overCount = maxLive > 0 && keptImages >= maxLive;
         const overBytes = maxLiveBytes > 0 && keptImageBytes + bytes > maxLiveBytes;
         const strip = tooDeep || overCount || overBytes;
+        const decided = (ceilings[i] ??= { images: false, bytes: false });
+        decided.images ||= overCount && ceilingSet.images;
+        decided.bytes ||= overBytes && ceilingSet.bytes;
         if (strip) {
           tokens += strippedImageSaving(image, placeholderPrice, calibration);
         } else {
@@ -549,7 +636,7 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       strips[i] = verdicts;
       saved[i] = tokens;
     }
-    return { strips, saved };
+    return { strips, saved, ceilings };
   }
 
   /** The policy's verdicts applied to entries whose `index` is their
@@ -562,6 +649,15 @@ export class WindowedPassthroughStrategy implements ContextStrategy {
       if (!strips) continue;
       let k = 0;
       entry.content = replaceImages(entry.content, () => strips[k++]!, IMAGE_PLACEHOLDER);
+    }
+  }
+
+  /** Says a ceiling's line once, for a ceiling whose limit was over where the window strips an image of an entry the render holds. */
+  private reportCeilings(entries: ContextEntry[], policy: ImagePolicy): void {
+    for (const entry of entries) {
+      const decided = policy.ceilings[entry.index];
+      if (decided?.images) this.reportCeilingBoundOnce('images');
+      if (decided?.bytes) this.reportCeilingBoundOnce('bytes');
     }
   }
 
