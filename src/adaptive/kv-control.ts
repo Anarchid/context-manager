@@ -494,12 +494,35 @@ function relevanceCut(
     const olderListed = new Int32Array(n); // the next older listed position, or -1
     const youngerListed = new Int32Array(n); // the next younger listed position, or n
     const listed = new Uint8Array(n);
+    // Listed counts by position (a Fenwick tree), so `relist` finds the next
+    // older listed chunk in O(log n) rather than by scanning back over every
+    // parked or raw one: one accept per pass can relist a group behind a long
+    // unlisted run, and scanning it each time was quadratic in the run.
+    // Each step of that search counts as a visit (KV_TIMING's `visits`), so
+    // the tests that bound phase C's visits bound relist's search too (#156
+    // R6-1).
+    const counts = new Int32Array(n + 1);
+    const count = (i: number, d: number): void => { for (let x = i + 1; x <= n; x += x & -x) counts[x] += d; };
+    let top = 1;
+    while (top * 2 <= n) top *= 2;
+    const olderThan = (i: number): number => {
+      let k = 0; // listed positions before i
+      for (let x = i; x > 0; x -= x & -x) { k += counts[x]; visits++; }
+      if (k === 0) return -1;
+      let pos = 0; // the k-th listed position
+      for (let step = top; step > 0; step >>= 1) {
+        visits++;
+        if (pos + step <= n && counts[pos + step] < k) { pos += step; k -= counts[pos]; }
+      }
+      return pos;
+    };
     let youngestListed = -1;
     let oldestListed = n;
     for (let i = 0; i < n; i++) {
       const id = ordered[i].id;
       if ((F.get(id) ?? 0) < 1 || rawZone.has(id) || immovable.has(id)) continue;
       listed[i] = 1;
+      count(i, 1);
       if (oldestListed === n) oldestListed = i;
       olderListed[i] = youngestListed;
       if (youngestListed >= 0) youngerListed[youngestListed] = i;
@@ -510,6 +533,7 @@ function relevanceCut(
     const unlist = (i: number): void => {
       if (!listed[i]) return;
       listed[i] = 0;
+      count(i, -1);
       const older = olderListed[i];
       const younger = youngerListed[i];
       if (older >= 0) youngerListed[older] = younger;
@@ -519,9 +543,9 @@ function relevanceCut(
     };
     const relist = (i: number): void => {
       if (listed[i]) return;
+      const older = olderThan(i);
       listed[i] = 1;
-      let older = i - 1;
-      while (older >= 0 && !listed[older]) older--;
+      count(i, 1);
       const younger = older >= 0 ? youngerListed[older] : oldestListed;
       olderListed[i] = older;
       youngerListed[i] = younger;

@@ -513,3 +513,50 @@ test('phase C: a group it couldn\'t take returns to the walk once an accept move
   assert.equal(raised.seedingReleased, true, 'the seeded cut re-read enough for the release');
   assert.equal(levels(raised.resolutions), '0'.repeat(chunks.length), 'every chunk raw, as before R5-1');
 });
+
+/**
+ * R6-1: a cleared key puts its parked chunks back on the walk, each at its
+ * place among the chunks still listed. Finding that place by scanning back
+ * over every unlisted position took a step per position passed, so an accept
+ * that clears many keys behind a long parked run was quadratic. The shape is
+ * Sol's, from the round-6 review: the oldest leaf x has its own L1, and each
+ * of n younger leaves has an L1 that also lists x, which it doesn't render.
+ * Raw, each younger leaf costs less than its L1, so each of their un-folds is
+ * declined and its key is filed under x too. x's accept clears all n keys and relists
+ * their chunks youngest first, so each scan ran back to x: 500,501 steps here.
+ * Under KV_TIMING, phase C counts each step of relist's search as a visit.
+ */
+test('phase C: a cleared key relists its parked chunks in O(log n) steps each, not by scanning back over the unlisted run (R6-1)', () => {
+  const n = 1000;
+  const chunks = [{ id: 'x', l1Id: 'S', rawTokens: 50 }, ...Array.from({ length: n }, (_, j) => ({ id: `y${j}`, l1Id: `T${j}`, rawTokens: 10 }))]
+    .map((c, sequence) => ({ ...c, sequence, currentResolution: 0, lockedByAgent: false, pinned: false }));
+  const summary = (id: string, sourceIds: string[], tokens: number) => [id, {
+    id, level: 1, sourceLevel: 0, sourceIds, tokens, content: `summary ${id}`, timestamp: 0,
+    sourceRange: { first: sourceIds[0], last: sourceIds[sourceIds.length - 1] },
+  }] as const;
+  const summaries = new Map([summary('S', ['x'], 20), ...Array.from({ length: n }, (_, j) => summary(`T${j}`, ['x', `y${j}`], 100))]);
+  const inputs = { chunks, summaries, headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set() } as unknown as PickerInputs;
+  const tree = new SummaryTree(inputs);
+  // Carried at L1: S's un-fold raises the ledger by 30 to the target, and each T's lowers it by 90.
+  const target = 20 + 100 * n + 30;
+  const lines: string[] = [];
+  const diagnostics = { error: (m: string) => { lines.push(m); }, warn: (m: string) => { lines.push(m); } };
+  const timing = process.env.KV_TIMING;
+  process.env.KV_TIMING = '1';
+  try {
+    planControlledFrontier(inputs, tree, {
+      previous: new Map(chunks.map((c) => [c.id, 1] as const)), targetTokens: target, foldAtTokens: 4 * target, windowTokens: 8 * target, reachTokens: 8 * target,
+      rawZone: new Set(), now: chunks.length, mergeThreshold: 2, seedFromCarried: true, diagnostics,
+    });
+  } finally {
+    if (timing === undefined) delete process.env.KV_TIMING; else process.env.KV_TIMING = timing;
+  }
+  const runs = lines.flatMap((l) => {
+    const m = /\[kv-timing\] phase-c \d+ms passes=(\d+) visits=(\d+)/.exec(l);
+    return m ? [{ passes: Number(m[1]), visits: Number(m[2]) }] : [];
+  });
+  // Past one visit a chunk, the seeded phase C counted the search for each of the n chunks x's accept relisted.
+  assert.ok(runs[0] && runs[0].visits > chunks.length, `premise: the relists' search steps are counted (${JSON.stringify(runs)})`);
+  const bound = 3 * chunks.length * Math.ceil(Math.log2(chunks.length));
+  for (const r of runs) assert.ok(r.visits <= bound, `phase C took ${r.visits} steps over ${r.passes} passes, past ${bound}`);
+});
