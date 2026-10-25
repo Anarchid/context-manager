@@ -256,6 +256,33 @@ describe('kv-unified holds a level pin until its level exists (#193)', () => {
     store.cm.close();
   });
 
+  it('leaves a message of system changes out of the hold and its count: the strategy keeps it raw under any pin', async () => {
+    const path = join(dir, `store-${stores++}`);
+    const opened = await open(path);
+    const change = { type: 'system_change', addSystem: ['Use metric units.'] } as unknown as ContentBlock;
+    const ids: string[] = [];
+    for (let i = 0; i < 24; i++) {
+      if (i === 4) ids.push(opened.cm.addMessage('Harness', [change]));
+      ids.push(opened.cm.addMessage(i % 2 ? 'Claude' : 'User', [{ type: 'text', text: `MSG-${i} ${'word '.repeat(110)}` }]));
+    }
+    for (let round = 0; round < 60; round++) {
+      const before = opened.calls();
+      await opened.cm.compile();
+      await opened.cm.tick();
+      await opened.cm.tick();
+      if (opened.calls() === before) break;
+    }
+    // The first pin spans eight messages and the change between them; the
+    // second covers the change alone.
+    opened.cm.pinAtLevel(ids[0], ids[8], 2, { name: 'around-change' });
+    opened.cm.pinAtLevel(ids[4], ids[4], 2, { name: 'change-only' });
+    const lines = await holdLines(async () => { await opened.cm.compile(); });
+    assert.deepEqual(lines, [
+      'autobio: kv-unified holds pin pin-0 ("around-change"), pinned at L2, at L1 in 8 message(s): no summary supplies L2 over them yet. They move to L2 once one does. ns=default',
+    ]);
+    opened.cm.close();
+  });
+
   it('starts over on each branch, so a pin on another branch is not reported removed', async () => {
     const store = await conversation(24);
     store.cm.pinAtLevel(store.ids[0], store.ids[7], 2, { name: 'shared' });

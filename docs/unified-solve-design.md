@@ -194,7 +194,9 @@ Binary x_v per node. Constraints:
   pin over a message in the head or tail zone, the recent window included,
   adds no restriction while the message is there: the zone keeps it raw, as
   it did before #193, and the pin applies once the message is in the folded
-  middle.)
+  middle. Nor does a pin over a message of system changes, which the
+  strategy keeps raw whatever the pins (#298): the hold never applies to it,
+  and its log doesn't count it.)
 - **F4b constraint composition: intersect, never pick a winner (review-3
   §1).** Pins and locks are absolute; precedence would silently violate one
   of them even if logged. Canonicalization builds, per live leaf,
