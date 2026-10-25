@@ -8,7 +8,6 @@ import type {
   PendingWork,
 } from './context.js';
 import type { OverBudgetClearedBy } from '../adaptive/picker.js';
-import type { ContextObserver } from '../observer.js';
 import { DEFAULT_IMAGE_BYTE_CEILING, DEFAULT_IMAGE_CEILING } from '../live-image-limits.js';
 
 /**
@@ -115,12 +114,6 @@ export interface StrategyContext {
    * CompressionWithdrawn).
    */
   membrane?: Membrane;
-  /**
-   * The host's observer (`ContextManagerConfig.observer`), already isolated:
-   * a strategy reports its compression refusals and calibration samples to it
-   * and needs no guard of its own. Absent when the host gave none.
-   */
-  observer?: ContextObserver;
   /** Current sequence number */
   currentSequence: Sequence;
   /**
@@ -145,8 +138,7 @@ export interface StrategyContext {
  * Result of readiness check.
  */
 export interface ReadinessState {
-  /** Whether the strategy has no background work pending. compile() doesn't
-   *  wait for that work either way: it compiles from what's there. */
+  /** Whether compile() can proceed immediately */
   ready: boolean;
   /** Promise that resolves when ready (if not ready) */
   pendingWork?: Promise<void>;
@@ -256,8 +248,8 @@ export interface ContextStrategy {
   onCompressionHoldsReleased?(ctx: StrategyContext): void;
 
   /**
-   * Whether the strategy has background work pending, with its info if so.
-   * compile() doesn't wait for it.
+   * Check if strategy is ready to compile.
+   * Returns pending work info if not ready.
    */
   checkReadiness(): ReadinessState;
 
