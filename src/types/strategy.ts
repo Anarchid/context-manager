@@ -2127,9 +2127,11 @@ export interface AutobiographicalConfig {
    * folds it demands through the normal drain queues. Once the forest has
    * converged, the live budget can be lowered to the target in one move: no
    * fold-storm, a single KV invalidation ("produce first, fold once").
-   * If the target is unreachable even fully folded (head + tail + max-depth
-   * summaries still exceed it), every compile warns loudly — a descent to
-   * that budget would hard-fail with OverBudgetError. Shadow demand is
+   * If the shadow pick runs out of folds and produce requests with its plan
+   * still over the target's soft line, the compile warns, giving the plan's
+   * size and the line above which a compile at the target is refused with
+   * OverBudgetError: lowering the live budget to the target fails only while
+   * the plan is over that line. Shadow demand is
    * speculative and never bypasses the `l1HoldbackChunks` window. Must be
    * positive; no effect unless lower than the live compile budget.
    */

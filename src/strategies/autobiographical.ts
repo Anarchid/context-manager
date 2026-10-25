@@ -13477,6 +13477,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       totalBudget,
       targetBudget: totalBudget * (1 - slack),
       slack,
+      // The line the plan check below refuses above.
+      rejectionBudget,
     };
 
     const headSetForPicker = new Set<ChunkId>(headMessageIds);
@@ -13694,18 +13696,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const liveKvStable = this._lastKvStable;
       const liveKvUnified = this._lastKvUnified;
       try {
+        // With the line a compile at prodBudget refuses above, as the live
+        // pick has its own, so the solver plans as that compile would.
         const shadowResult = this.buildPicker(pickerInputs).run(pickerInputs, {
           totalBudget: prodBudget,
           targetBudget: prodBudget * (1 - slack),
           slack,
+          rejectionBudget: Math.floor(prodBudget * (1 + overBudgetGraceRatio)),
         });
         if (shadowResult.produced.length > 0) {
           this.handleProducedOps(shadowResult.produced, { speculative: true });
         } else if (shadowResult.exhausted) {
           this.diag.warn(
-            `autobio: production target ${prodBudget} unreachable even fully folded ` +
-              `(${shadowResult.finalTokens} tokens); lowering the live budget to it ` +
-              `would hard-fail with OverBudgetError`,
+            `autobio: production target ${prodBudget} unreachable: the solver's plan for it ` +
+              `is ${shadowResult.finalTokens} tokens, over its soft target of ` +
+              `${Math.floor(prodBudget * (1 - slack))}, with nothing left to fold or produce; ` +
+              `a compile at that budget refuses a plan over ` +
+              `${Math.floor(prodBudget * (1 + overBudgetGraceRatio))} tokens with OverBudgetError`,
           );
         }
       } catch (err) {
