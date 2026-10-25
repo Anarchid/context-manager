@@ -14601,7 +14601,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // write over even when it only confirms the 1.
           this._calibrationProvisional = { fromEpoch: null };
         }
-      } catch { /* a record the store can't read loads 1, not provisional: see the no-record branch above */ }
+      } catch { /* a record the store can't read loads 1, not provisional: unlike no record, it may hold what the store keeps (see the no-record branch above) */ }
     }
     // A dry select changes the store's multiplier only where select() read it
     // first and can put it back (see MessageStoreView).
