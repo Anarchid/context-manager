@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AutobiographicalStrategy, ContextManager, OverBudgetError } from '../src/index.js';
+import { assertStage } from './fixtures/over-budget-hook.js';
 import type { StoredMessage, SummaryEntry, SummaryLevel } from '../src/types/index.js';
 import { Picker, type PickerInputs } from '../src/adaptive/picker.js';
 import type { FoldingBudget } from '../src/adaptive/folding-strategy.js';
@@ -503,6 +504,7 @@ async function refusalOfWholeMiddle(manager: ContextManager): Promise<OverBudget
   }
   const error = await refusal(manager, undefined, { maxTokens: low, reserveForResponse: 20 });
   assert.match(error.message, /^Hierarchical emission overran the budget/, 'a refusal in the hierarchical middle');
+  assertStage(error, 'hierarchical-emission-overran');
   const strategy = (manager as unknown as { strategy: DiagnosticStrategy }).strategy;
   assert.ok(strategy.prefixHoldsWholeMiddle(), 'the refusal\'s prefix holds every message the selection can fold');
   return error;
@@ -542,6 +544,7 @@ describe('OverBudgetError diagnostics', () => {
           assert.doesNotMatch(error.message, /deepest planned level/);
         } else {
           assert.match(error.message, /^Hierarchical emission overran the budget/);
+          assertStage(error, 'hierarchical-emission-overran');
           assert.match(error.message, /attempted representation level=L0/);
         }
       });
@@ -650,6 +653,7 @@ describe('OverBudgetError diagnostics', () => {
       strategy.seedPyramid([id], 5);
       const error = await refusal(manager);
       assert.match(error.message, /^Emission overran the plan/);
+      assertStage(error, 'emission-overran-plan');
       checkBudget(error);
       assert.deepEqual(error.clearedBy, [], 'the plan has no summaries left to produce');
       assert.equal(error.diagnostics.deepestLevel, 5, 'the first raw emission fails, but the complete plan reaches L5');
@@ -1022,6 +1026,7 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.startCompressing();
       const error = await refusal(manager);
       assert.match(error.message, /^Emission overran the plan/);
+      assertStage(error, 'emission-overran-plan');
       assert.deepEqual(error.clearedBy, ['compression']);
     });
   });
@@ -1043,10 +1048,12 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.startCompressing();
       const error = await refusal(manager);
       assert.match(error.message, /^Tail emission dropped reserved recent-window messages/);
+      assertStage(error, 'tail-emission-dropped');
       assert.deepEqual(error.clearedBy, ['compression']);
       strategy.produce = false;
       const without = await refusal(manager);
       assert.match(without.message, /^Tail emission dropped reserved recent-window messages/);
+      assertStage(without, 'tail-emission-dropped');
       assert.deepEqual(without.clearedBy, [], 'a plan with nothing to produce names nothing');
     });
   });
@@ -1112,6 +1119,7 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.startCompressing();
       const dry = await refusal(manager, { dryRun: true });
       assert.match(dry.message, /^Structural repair did not retain the newest turn/);
+      assertStage(dry, 'repair-lost-newest-turn');
       assert.deepEqual(dry.clearedBy, []);
       // The live compile refuses the plan at its gate first, so the preview
       // names what that refusal names.
@@ -1223,9 +1231,11 @@ describe('OverBudgetError.clearedBy', () => {
       for (let i = 0; i < 6; i++) manager.addMessage('user', [{ type: 'text', text: `message ${i} ` + 'word '.repeat(30) }]);
       const dry = await refusal(manager, { dryRun: true });
       assert.match(dry.message, /^Emission overran the plan/);
+      assertStage(dry, 'emission-overran-plan');
       assert.deepEqual(dry.clearedBy, []);
       const live = await refusal(manager);
       assert.match(live.message, /^Emission overran the plan/);
+      assertStage(live, 'emission-overran-plan');
       assert.deepEqual(live.clearedBy, ['compression'], 'the live compile demands the chunk first');
     });
   });
@@ -1246,6 +1256,7 @@ describe('OverBudgetError.clearedBy', () => {
       assert.equal(strategy.checkReadiness().ready, false, 'chunks are waiting for compression');
       const error = await refusal(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, ['compression']);
     });
   });
@@ -1684,7 +1695,7 @@ describe('OverBudgetError.clearedBy', () => {
     });
   }
 
-  it('before the host declares its tools, counts no queued chunk that starts inside the head window when the head carries a tool cycle after the chunk\'s start, which tick\'s head carries raw', async () => {
+  it('before the host declares its tools, counts no queued chunk that lies inside the head window, and tick asks the model for the first: its request carries the head only up to the chunk, not the tool cycle after it (#317)', async () => {
     const strategy = new DiagnosticStrategy({
       adaptiveResolution: false,
       targetChunkTokens: 40,
@@ -1712,19 +1723,22 @@ describe('OverBudgetError.clearedBy', () => {
       const queued = await settledQueue(manager, strategy);
       assert.ok(!queued[0].some((id) => cycle.includes(id)), 'the first queued chunk is text ahead of the cycle');
       strategy.setHeadWindowTokens(100_000);
-      assert.equal(strategy.countsCompressionWork(), false, 'tick defers every queued chunk until the tools come');
-      // The premise: tick's head carries the cycle raw, so it defers each queued chunk, with no model call.
-      for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
-      assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
-      assert.equal(calls.n, 0, 'tick asked no model');
-      assert.deepEqual(strategy.summaryIds(), [], 'and compressed none');
+      assert.equal(strategy.countsCompressionWork(), false, 'chunks inside the head fold nothing, so none counts');
+      // The head a request gives is cut at its chunk's start (headAsOf), so the cycle after the first chunk isn't in
+      // its request: tick asks the model rather than deferring, and the counting membrane throws. Before #317 the
+      // head went whole, messages after the chunk included.
+      await assert.rejects(async () => {
+        for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+      }, /no model in this test/);
+      assert.equal(calls.n, 1, 'tick asked the model');
     }, { membrane: countingMembrane(calls) });
   });
 
   // The chunks the test above widens the head over lie wholly inside it, so they fold nothing and don't count
-  // whatever the tools say. A chunk that lies before a reset head start folds, and the head after it, which
-  // tick's request carries raw, is what holds it back: a tool message in the head lies past the chunk's start.
-  it('before the host declares its tools, counts no queued chunk that lies before a reset head start when the head carries a tool cycle, which tick\'s request carries raw though it lies after the chunk', async () => {
+  // whatever the tools say. A chunk that lies before a reset head start folds. Tick's request for it gives the
+  // head that history followed, the opening here, and not the reset head after it (#317), so a tool cycle in the
+  // reset head doesn't hold it back.
+  it('before the host declares its tools, names compression for a queued chunk that lies before a reset head start when that head carries a tool cycle, which lies after the chunk and tick\'s request leaves out (#317)', async () => {
     const strategy = new DiagnosticStrategy({
       adaptiveResolution: false,
       targetChunkTokens: 40,
@@ -1756,14 +1770,13 @@ describe('OverBudgetError.clearedBy', () => {
       assert.ok(chunkAt.every((i) => i >= 0 && i < headStart), 'the premise: the first queued chunk lies before the head window\'s start, so it folds');
       assert.ok(!queued[0]!.some((id) => cycle.includes(id)), 'the premise: and holds no tool block of its own');
       assert.ok(cycleAt.every((i) => i >= headStart && i < headEnd), 'the premise: the cycle sits in the head window, past the chunk\'s start');
-      assert.deepEqual(error.clearedBy, [], 'tick defers every queued chunk until the tools come');
-      // The premise: tick's request carries the head raw, cycle included, so it defers each queued chunk, with no model call.
-      for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
-      assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
-      assert.equal(calls.n, 0, 'tick asked no model');
-      assert.deepEqual(strategy.summaryIds(), [], 'and compressed none');
-      manager.setToolDefinitions([{ name: 'zz_tool', description: 'zz', inputSchema: { type: 'object' } }]);
-      assert.deepEqual((await refusal(manager)).clearedBy, ['compression'], 'with the tools declared, they count');
+      assert.deepEqual(error.clearedBy, ['compression'], 'the chunk folds and tick will take it without the tools');
+      // The premise: tick's request gives the opening as its head, without the cycle, so tick asks the model, and the
+      // counting membrane throws.
+      await assert.rejects(async () => {
+        for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
+      }, /no model in this test/);
+      assert.equal(calls.n, 1, 'tick asked the model');
     }, { membrane: countingMembrane(calls) });
   });
 
@@ -1814,7 +1827,7 @@ describe('OverBudgetError.clearedBy', () => {
   }
 
   for (const pinned of [false, true]) {
-    it(`names ${pinned ? 'nothing' : 'compression'} before the host declares its tools for text chunks after a tool cycle no L1 covers, before the head window's start, ${pinned ? 'pinned, which tick\'s request then carries raw' : 'which tick\'s request leaves out'}`, async () => {
+    it(`names nothing before the host declares its tools for text chunks after a tool cycle no L1 covers, before the head window's start, ${pinned ? 'pinned' : 'unpinned'}: tick's request carries the cycle raw in the opening, the head of that history (#317)`, async () => {
       const strategy = new DiagnosticStrategy({
         adaptiveResolution: false,
         targetChunkTokens: 40,
@@ -1841,17 +1854,10 @@ describe('OverBudgetError.clearedBy', () => {
         assert.ok(indices.every((i) => i >= 0 && i < headStart), 'the premise: the cycle sits before the head window\'s start');
         const queued = strategy.queuedChunkIds();
         assert.ok(queued.some((ids) => !ids.some((id) => cycle.includes(id))), 'text chunks are queued');
-        if (!pinned) {
-          assert.deepEqual(error.clearedBy, ['compression']);
-          // The premise: tick's request leaves the cycle out, so tick asks the model, and the counting membrane throws.
-          await assert.rejects(async () => {
-            for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
-          }, /no model in this test/);
-          assert.equal(calls.n, 1, 'tick asked the model');
-          return;
-        }
         assert.deepEqual(error.clearedBy, [], 'nothing tick will do clears it');
-        // The premise: tick's request carries the pinned cycle raw, so tick defers every queued chunk, with no model call.
+        // The premise: tick's request for a chunk before the reset gives the opening as its head, cycle included, raw
+        // (pinned or not), so tick defers every queued chunk, with no model call. Before #317 an unpinned cycle there
+        // was left out, since the head was the reset one.
         for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
         assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
         assert.equal(calls.n, 0, 'tick asked no model');
@@ -2039,6 +2045,7 @@ describe('OverBudgetError.clearedBy', () => {
       strategy.seedL1('L1-covering', ids);
       const error = await refusal(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, []);
       // Tick drops each one without compressing it: the stub membrane has no
       // model to call, and no L1 is added.
@@ -2094,6 +2101,7 @@ describe('OverBudgetError.clearedBy', () => {
       assert.ok(!strategy.summaryIds().some((id) => id.startsWith('L1-stored-')), 'no exact L1 is in memory');
       const error = await refusal(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, ['compression']);
       for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
       assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
@@ -2113,6 +2121,7 @@ describe('OverBudgetError.clearedBy', () => {
       });
       const error = await refusal(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, [], 'adoption doesn\'t persist, so the stored L1s shrink nothing');
     }, { membrane: true });
   });
@@ -2127,6 +2136,7 @@ describe('OverBudgetError.clearedBy', () => {
         assert.deepEqual(strategy.summaryIds(), [], 'no L1 is in memory');
         const error = await refusal(manager);
         assert.match(error.message, /^Hierarchical emission overran the budget/);
+        assertStage(error, 'hierarchical-emission-overran');
         assert.deepEqual(error.clearedBy, ['compression']);
         for (let i = 0; i < 20 && strategy.queuedChunkIds().length > 0; i++) await manager.tick();
         assert.deepEqual(strategy.queuedChunkIds(), [], 'tick took every queued chunk');
@@ -2158,6 +2168,7 @@ describe('OverBudgetError.clearedBy', () => {
         queued.forEach((ids, i) => strategy.seedL1(`L1-exact-${i}`, ids));
         const error = await refusal(manager);
         assert.match(error.message, /^Hierarchical emission overran the budget/);
+        assertStage(error, 'hierarchical-emission-overran');
         assert.deepEqual(strategy.queuedChunkIds(), queued, 'the compile closed no new chunk');
         assert.deepEqual(error.clearedBy, persistChunks ? ['compression'] : []);
         if (!persistChunks) return;
@@ -2454,6 +2465,7 @@ describe('OverBudgetError.clearedBy', () => {
         assert.equal(strategy.checkReadiness().ready, false, 'the merge is queued');
         const error = await refusal(manager, undefined, positionedRecallPairs ? undefined : PAIR_FITS);
         assert.match(error.message, /^Hierarchical emission overran the budget/);
+        assertStage(error, 'hierarchical-emission-overran');
         assert.equal(Reflect.get(error.diagnostics, 'middleCountUnit'), positionedRecallPairs ? 'selection-items' : 'raw-messages',
           'the pair, or with the combined pair fitting, the raw message after it, refuses');
         assert.deepEqual(error.clearedBy, [], 'tick stops at a blocked merge until the hold is released');
@@ -2498,6 +2510,7 @@ describe('OverBudgetError.clearedBy', () => {
         assert.equal(strategy.checkReadiness().ready, false, 'chunks are queued');
         const error = await refusal(manager);
         assert.match(error.message, /^Hierarchical emission overran the budget/);
+        assertStage(error, 'hierarchical-emission-overran');
         assert.deepEqual(error.clearedBy, merge === 'blocked' ? [] : ['compression']);
       });
     });
@@ -2641,6 +2654,7 @@ describe('OverBudgetError.clearedBy', () => {
       pinChunks(manager, queued);
       const error = await refusal(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, []);
       // The premise: tick still takes them, adopting each stored L1.
       await adoptAll(manager, strategy);
@@ -2658,6 +2672,7 @@ describe('OverBudgetError.clearedBy', () => {
       pinChunks(manager, queued);
       const error = await refusal(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, []);
       // The premise: adopting the exact L1s leaves the render as it was, where unpinned chunks' adoption shrinks it.
       const before = (await manager.compile({ maxTokens: 100_000, reserveForResponse: 20 })).messages.length;
@@ -2782,6 +2797,7 @@ describe('OverBudgetError.clearedBy', () => {
       pinChunks(manager, queued.slice(0, 1));
       const error = await refusalOfWholeMiddle(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, ['compression']);
     }, { membrane: true });
   });
@@ -2796,6 +2812,7 @@ describe('OverBudgetError.clearedBy', () => {
       pinChunks(manager, queued.slice(0, 1));
       const error = await refusalOfWholeMiddle(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, ['compression']);
     }, { membrane: true });
   });
@@ -2809,6 +2826,7 @@ describe('OverBudgetError.clearedBy', () => {
       pinChunks(manager, queued.slice(0, 1));
       const error = await refusalOfWholeMiddle(manager);
       assert.match(error.message, /^Hierarchical emission overran the budget/);
+      assertStage(error, 'hierarchical-emission-overran');
       assert.deepEqual(error.clearedBy, ['compression']);
     });
   });

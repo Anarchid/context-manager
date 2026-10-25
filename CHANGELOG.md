@@ -12,6 +12,153 @@ Releases up to and including 0.6.2 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.22.0 — 2026-10-24
+
+### Breaking
+
+- **Host operators:** a `maxLiveImages` or `maxLiveImageBytes` of 0, documented as no limit, now means up to `imageCeiling` (500 images by default) or `imageByteCeiling` (24 MiB), and a `maxCompressionImageBytes` of 0, which meant no budget, now means up to `imageByteCeiling`. So does any other value of these that isn't a positive finite number: a negative or `Infinity`, which had also meant no limit, or `NaN`, which had meant no limit in the window and had replaced every image in a compression prompt. A value above its ceiling, such as a `maxLiveImageBytes` of 30 MiB, is now held to the ceiling, and the strategy warns about it when it initializes. A host that set one of these to 0 to keep every image, or above a ceiling, now keeps up to the ceiling's worth, and its strategy says once which ceiling it was and what it holds, at the first render a select returns where images are shown as placeholders and that ceiling's limit was over.
+  - **Cost at a ceiling:** a window held at a ceiling strips its oldest images as new ones come, as under any limit, but from deep in the request, so the prompt cache is rewritten from there at every new image. At the store's default price of 1,600 tokens an image, a window held at the count ceiling rewrites about 800k tokens of it at each new image. The autobiographical strategy's `imageStripHysteresisRatio` strips in batches instead, so the cache is rewritten once a batch, and its line names that option when it's off.
+  - **Migration:** to keep no limit, or a limit above a ceiling, set that ceiling to 0 or raise it. A host that raised membrane's byte cap (`MEMBRANE_MAX_REQUEST_BYTES`) raises `imageByteCeiling` with it, leaving room under the cap for what the ceiling doesn't count.
+  - **Siblings:** no sibling's current range admits this release; each takes these changes on when it raises its range.
+  - **Unchanged:** for a host that sets none of these, the live window, whose defaults of 6 images and 20 MiB are under the default ceilings. A compression prompt keeps its default 12 MiB budget, though it now carries at most 500 images (under Fixed). A whole-number limit above 0 and under its ceiling works as before; a fractional one is now floored, to at least 1.
+
+### Added
+
+- `compile()` takes `thinkingBinding` and `identity` (`SelectOptions`) for a model that binds each signed thinking block to the request it was minted in (#155). On an account that enforces the binding, such a model refuses a request carrying a block whose request has changed since, with a 400 ("Invalid `signature` in `thinking` block. The block is bound to a different conversation…"), and with the provider's drop control on it sets the block aside instead. With `thinkingBinding.binds`, a compile leaves such blocks out.
+  - **What it takes:** `thinkingBinding: { binds, dropBlock, participant }`, with `participant` the name the model's own replies are stored under, and `identity: { system, tools, model, request }`, digests of the request's head. With `binds`, `participant` and `identity` are required, and a compile without them, or with a digest that isn't a string, is refused before anything is selected.
+  - **The record:** the manager keeps one per branch, in its namespace, of what the branch last sent: each message its last committing compile with `binds` sent (injections included, cache breakpoints aside), the rows a host noted after them, the stored replies the compile sent without their thinking, the compile's head digests, and the branch's sequence where the record began. It survives a restart, and a branch made from another starts from the parent's as of its branch point.
+  - **What a compile keeps:** from the first message that differs from the record, or from the first message when an `identity` digest differs, every message goes without its thinking. Past the record's end nothing keeps its thinking: only the host knows which stored reply answered which request. A reply sent without its thinking stays without it while it renders. Another participant's message, and one with no stored body, such as a summary's recall answer or an injection, never keeps thinking.
+  - **Replies from before the record:** without `dropBlock`, a reply stored at or before the sequence where the branch's record began never keeps its thinking. So a branch's first compile without the drop control leaves out every reply's thinking; with the drop control it leaves them for the provider to judge. Either way it starts the record.
+  - **A dry compile** reports what it would leave out and writes no record.
+  - **Without `binds`,** a compile is as before: it neither reads nor writes the branch's record. A record an earlier binding compile left is compared at the next binding compile like any other, so only a prefix that matches what that compile sent and its stream noted keeps its thinking, and nothing past the record's end does.
+  - **A record the store can't read or write** is logged and never fails a compile or a note. One it can't read is read as none, so a committing compile with `binds` writes its own in its place; when it can't write a compile's record, the record before it, if any, stands.
+  - **While a request is streaming,** compile for its branch with `binds` only with `dryRun`: a committing compile with `binds` makes that stream's later notes vouch for nothing, so its replies go without their thinking.
+  - **A host that passes `thinkingBinding` and notes nothing** loses each reply's thinking at the compile after it's stored, once the branch has a record, and is never refused for it.
+- `ContextManager.noteRequestSent(rows, identity, compileId)` (new): a host calls it, with the `provenance.compileId` of the compile its stream was built from, as it sends each later round of that stream, with every row the stream's request carried after the compiled messages so far, and once the stream has ended, with those rows and its last reply. Each row, in order, is the id of a stored message, or `{ unstored: true }` for one the host can't vouch was carried or returned as stored. The record then holds them, so the next compile keeps their thinking while nothing up to them differs. Each stored row is digested as `renderAsNewest` renders it and as the compile sends it, a bundled tool cycle as each of its parts, and an id the store no longer holds vouches for nothing, as the marker does. A request-only row the host puts back in the same place at every later request needs no row. Call it on the branch the stream's compile was on. A note sent with another head than the record's leaves the record vouching for nothing until a compile writes it again; a compile under the new head reports the head change, and one under the record's own head reports `'messages'`. It returns false, writing nothing, when `compileId` isn't the compile that wrote the branch's record, as after another committing compile with `binds` (a compile without it leaves the record, so a later note still writes), and on a branch with no record or one it can't read, or when the store can't write it.
+- `CompileResult.thinkingStrip` says what a binding compile newly leaves out of the participant's replies (`newly`, the stored bodies, against the compile that wrote the branch's record, sent or not, so a reply that compile didn't send can be reported again) and why (`cause`: `'head'` with the `changed` digests, `'first'`, or `'messages'`). `CompileResult.thinkingRecordedAfter` gives, on every binding compile, the branch's sequence when its record began. A reply at or below it was stored before the record, so the provider dropping its thinking isn't a strip that missed. A body sent without its thinking reads as incomplete in provenance (`missing: ['content']`), and the rendered layout prices what was sent: thinking only where a stored reply kept it. New exports: `ThinkingBinding`, `RequestIdentity`, `ThinkingStrip`.
+- `ContextStrategy.noteThinkingLeftOut(blocks)`: after a committing compile, the manager hands the strategy the stored thinking it left out. `AutobiographicalStrategy` takes their price off its calibration sample's estimate, so the sample compares the provider's count with what was sent.
+- On a binding compile, `AutobiographicalStrategy` renders and prices a summary's carriers as under `carrierPolicy: 'live-strip'`, whatever the configured policy: a carrier was minted in its summarizer's request, so such a model never takes it in the live window. A select prices them by its own option, so `previewContext` takes `thinkingBinding` too, and a preview without it prices them as configured. Mint and merge requests are unchanged.
+
+- `imageCeiling` and `imageByteCeiling`, on `AutobiographicalConfig` and `WindowedPassthroughOptions`: the most images, and the most of their inline image bytes, a strategy's live window keeps, whatever `maxLiveImages` and `maxLiveImageBytes` say, and the most images and image bytes a compression prompt carries. They count images as the window's limits do. They don't bound a whole request: an image inside an opaque provider item, and anything a caller injects at compile time or appends to a compiled request, aren't counted. The defaults are 500 images, since the provider refuses a request with more than 600 images and documents together, and 24 MiB of base64, under membrane's 28 MiB request byte cap. They're in `DEFAULT_AUTOBIOGRAPHICAL_CONFIG`, so `config:effective` reports them. 0 means no ceiling, and a value that isn't 0 or a finite number above it takes the default.
+- `ContextStrategy.imageCeilings()`, which both strategies implement, reports the two ceilings as the strategy applies them, a malformed one at its default. It reports configuration, not usage: a caller that wants a request within the ceilings counts that request's images itself. `ImageCeilings` is exported.
+
+- System changes: a message holding only membrane's `system_change` blocks
+  (`SystemChangeContent`, membrane's release that adds them) changes the tools
+  and system text the model is offered from its place on, and every strategy
+  compiles it unaltered, in its place among the raw messages. (Under the
+  autobiographical strategy's `positionedRecallPairs: false`, the middle's
+  summaries go ahead of its raw messages, as they always have.) The
+  autobiographical strategy, and with it `KnowledgeStrategy`, keeps it raw as
+  a pin keeps a message, so no fold takes it and no chunk holds or spans it;
+  after a head-window reset that leaves messages in the head window, the
+  changes stored before the new head are part of the head, ahead of the head
+  window, in order. `PassthroughStrategy` and
+  `WindowedPassthroughStrategy` keep one that falls before their window,
+  ahead of the window and priced into it, and the windowed strategy sizes a
+  re-anchored window as its fraction of the room the changes leave. None is
+  dropped: when the changes alone exceed the budget (beyond the
+  autobiographical strategy's grace, and on its hierarchical path only where
+  `enforceBudget` is on), every strategy refuses with `OverBudgetError`,
+  `clearedBy` empty, until the caller consolidates them into `tools` and
+  `system`; a dry compile reports where the strategy's other refusals do,
+  which for the passthrough strategies is nowhere. They also refuse when the
+  newest conversation message doesn't fit beside the changes, naming
+  `newer-message` while they leave room for one.
+  Compression never reads one. It's priced from its JSON. A write refuses one
+  beside other blocks or inside a tool result, and one whose `removeTools` or
+  `addSystem` isn't an array of strings, or whose `defineTools` isn't an array
+  of tool definitions, each with a non-empty string `name`, a string
+  `description` and an object `inputSchema` whose `type` is `'object'`; a read
+  leaves such a change out. A write also refuses a change while one of the
+  nearest calls before it has no result between it and the change (counting
+  back over other changes and over results, by id, to the nearest message
+  holding a call, every shard of it),
+  a tool result answering a call that a change already follows, and an edit
+  giving a message a `tool_use` that a change follows before its results:
+  membrane sends a change there after the result anyway, so write it after
+  the result. Ingress sharding never splits a message of them, since it holds
+  no text block.
+  Only membrane's `NativeFormatter`, on an adapter that sends system changes,
+  sends one; elsewhere membrane refuses the request. Rolling back to a
+  release without them isn't supported once a store holds one.
+- `CompileResult.firstChanged`, optional: on a committing compile, the index
+  of the first compiled message, injections included, whose participant or
+  content bytes differ from the last committing compile's message at that
+  index, or that has none there, so after appends alone it is the first
+  appended index; an injection placed beside the newest user message moves
+  with each new user message, so after one it's that injection's old index.
+  It compares bytes, so it holds across a branch switch or a new strategy,
+  and it's `null` only for the manager's first committing compile. A dry
+  compile leaves it out and doesn't move it. It's compared when read,
+  so a compile whose caller never reads it serializes only its injections.
+
+### Changed
+
+- The live window's image limits stay within the image ceilings, in both strategies' strip, the autobiographical strategy's `imageStripHysteresisRatio` set and its post-strip estimates. They bind the images the window counts, as its limits count them. A limit above its ceiling keeps the ceiling's worth, and a fractional limit is floored, to at least 1. The default window, 6 images and 20 MiB, is under the default ceilings and doesn't change.
+- Each strategy warns once, when it initializes, when a limit is above its ceiling (the compression budget included), or when a ceiling isn't 0 or a finite number above it and takes its default. A setting the host didn't give is marked as the default. Under a window limit of 0 or above a ceiling, it also says once which ceiling it was and what it holds, at the first render a select returns where images are shown as placeholders and the limit that ceiling sets was over: at an image the render replaces, or, with `imageStripHysteresisRatio`, where it brought a trim on anywhere in the rule's replay of the history. The depth limit or a limit the host set may be stripping images there too.
+- `maxLiveImageBytes`' documentation no longer says the API's request cap is 32 MB. It names membrane's request byte cap, which the image byte ceiling leaves room under.
+
+### Fixed
+
+- A compression prompt carries at most `imageCeiling` images, counted newest message first in the walk that keeps its byte budget, images nested in tool results and generated images included. It had no count limit, so a chunk with more than 600 images made a prompt the provider refuses. Its byte budget, `maxCompressionImageBytes` (default 12 MiB), is kept within `imageByteCeiling`, and the line it logs when it replaces images names the count ceiling and the images kept.
+
+- A summarizer request no longer carries an empty turn, or a `---` separator
+  with nothing after it, where a message left empty for it sat, as one of
+  thinking alone was: merging consecutive messages passes over an empty one,
+  and its neighbours join as they would without it.
+- With the head window disabled (`headWindowTokens: 0`), a compile after
+  `resetHeadWindow` under `adaptiveResolution` no longer sends history from
+  before the reset twice, and under kv-unified no longer throws
+  `CanonicalForestError` (`duplicate-chunk-id`) for it: the middle's ranges
+  overlapped each other, and the recent window when it starts before the
+  reset.
+- A `WindowedPassthroughStrategy` compile that refuses no longer moves the
+  window's anchor; only a compile that sends does. So a retry with a larger
+  budget still sends the older turns that fit.
+- A `KnowledgeStrategy` chunk no longer runs into or across an L1 summary's
+  span once a removal moves where its walk closes, which left the chunk after
+  it uncompressed for good and its messages sent raw beside the summary: a
+  chunk now closes where the L1 summary covering its messages changes, except
+  between a call and the result right after it.
+
+## 0.21.0 — 2026-10-24
+
+### Added
+
+- **`OverBudgetError` names the pins that keep raw tokens in its middle.** Under adaptive resolution, the refusal of a plan whose middle is over the budget ("Adaptive picker exhausted but …") sets `diagnostics.rawPins` (`{ tokens, pins }`, each pin an `OverBudgetRawPin`: `pinId`, `kind`, `name`, `firstMessageId`, `lastMessageId`, `parts` for a pin read as whole messages, and the raw `tokens` it keeps in that middle, priced as the plan priced them), and the message ends with a sentence naming each pin and the tokens, and saying that whoever manages pins can unpin them, freeing up to those tokens, or whoever sets the hard budget can raise it if the model's window allows. It says who can act rather than telling its reader to, since a host can pass it on to an agent, and it comes last and under 140 characters, so a host that quotes a long message by its head and its last 140 characters, as agent-framework does, keeps it whole. Each pin's tokens are what it keeps raw, a part locked with `lockChunk` included, so they're what unpinning frees at most; a message two pins cover counts toward each, and once in the total. The message still begins as before and still says "exceed hard budget". Every other refusal is unchanged, a refusal with no pin keeping raw tokens in the middle among them.
+
+### Fixed
+
+- **Pins and document marks cover whole messages.** Under `adaptiveResolution`, a pin whose first or last id names one part of a message stored in parts (a long message that ingress splits) now covers that message from its first part to its last, in what the agent is sent, in compression and in the summarizer's prompt alike, as a `pinRange` over all its parts does where no part is locked. Before, it covered only the parts its ids named, so a document mark on a long message, made with the id of its first part as connectome-host's web panel makes it, kept that part raw and let the rest fold. A part locked with `lockChunk` outside the span the pin's ids name keeps its lock, which only the whole reading would have added; one between them is covered, as before. Under `kv-stable`, a pin with `level` (not `maxLevel`) holds whole each summary it reaches, so a locked part that shares a summary with a part the pin covers renders at the level the pin holds that summary at, as one sharing a summary with the part its ids name did before.
+  - **The summarizer's input.** The canonical L1 compression prompt shows a marked message raw, as it shows any raw pin, so compression requests after it carry the whole message where they carried its first part. In a test store, that took the summarizer's input after a mark to 2.3 times what it was for a 6,800-word message and 5.2 times for a 20,000-word one.
+  - **Marks the summarizer's budget can't hold.** The parts of a marked message that no chunk held when it was marked stay out of compression while the mark keeps them raw. From the head window's end on, the compression requests after them carry them whole and don't price them against `compressionContextBudgetTokens`, as for a `pinRange` over the same parts (#332). A mark made as a long message arrives leaves every part not yet chunked this way. Where such parts together come to more than that budget, a summarizer whose window is smaller would refuse those requests, and unless `compressionSourceOnly` or `compressionSourceOnlyFallback` is set, compression would stop making progress for that store. Unpinning the marks lets later requests leave them out; a chunk already refused in three request shapes can stay quarantined after that, and `clearCompressionRefusalQuarantine` clears it.
+  - **Upgrade.** A stored mark on part of a long message reads whole at the first compile after the upgrade. Where the whole message fits, that compile rewrites the request once, from that message on, or from earlier where the select folds older history further to make room for it. Where it doesn't fit, the compile refuses with `OverBudgetError`, as for any pin the budget can't hold; where the plan's middle is what's over, that refusal ("Adaptive picker exhausted but …") names the mark and the tokens it keeps raw, and says whoever manages pins can unpin it, freeing up to those tokens, or whoever sets the hard budget can raise it if the model's window allows.
+
+## 0.20.1 — 2026-10-23
+
+### Added
+
+- `AutobiographicalStrategy.setLoadRepairHandler(fn)` tells a host when a load's repair of the summary state drops summaries holding text, so whoever keeps the agent can learn that its memory changed from more than a log line (#175). A load runs at each initialization (an open, a branch switch, a fork, `setStrategy`) and at each take-up of what another instance on the store wrote. The handler gets one `LoadRepairReport` per such load. The report holds no summary text. For each dropped summary that held text, it gives the id, the level and the stored `tokens` (each null where it isn't a number), why it was dropped (`unreadable`, `names-missing`, `names-not-below` or `names-non-child`), and, where its range can be read, the messages it covered, with each end's stored time where the strategy's message view gives it. It also gives the sum of those tokens, how many empty summaries the same repair dropped, the namespace, and where the old summaries read back from: `getStateJsonAt(stateId, sequenceBefore)`, with `branch`, the Chronicle branch the repair wrote on, current. A repair that drops only empty summaries, or none, makes no report, and the repair's diagnostic line is written as before. A report made while a handler is set goes to it once its load's synchronous run has ended, never during it. Reports made while no handler is set, such as an open's where the host sets the handler after opening, are held in memory and handed to the handler, oldest first, when it's set. Each strategy instance holds its own. A handler that throws, or whose returned promise or thenable rejects, is logged, and stops neither the load nor the next report. `getLatestLoadRepairReport()` gives the newest report the instance has made, whether held or handed on, for a health surface to show. A load that drops text makes no report only where the store's branch or sequence can't be read, which is logged.
+
+- `CompileResult.renderStats`: each compile's result carries the render stats its own select recorded. A dry compile's (`dryRun`) are its own, which `getRenderStats()` never returns, so a host can show the composition of the request a dry compile built, beside the last live compile's, without sending anything. A live compile's are the object `getRenderStats()` then returns. Strategies supply them through an optional `RenderStatsCapableStrategy.getLastSelectStats()`; a strategy without it gives compiles none.
+
+### Changed
+
+- A compression request recalls only the summaries that start before the history it summarizes, the rule a merge's recall already used (#317). A source-only request (`compressionSourceOnly`) recalls none, before or after.
+  - **Before:** it recalled every summary on the frontier, as 0.15.0's entry said: "Only pins before the chunk being compressed count, so a summary after it is recalled as before." So a chunk compressed after later history had been summarized was given those later summaries too, ahead of it. That's the old head's chunk, which a head-window reset makes compressible late, or a pinned or quarantined chunk let go late.
+  - **Now:** a summary that starts after the history being summarized isn't recalled, and its messages stay out of the request, as before. Pins still count only before the chunk.
+  - **What still reaches a request from after it:** a summary that starts before the history being summarized and reaches past it is still recalled, since what it covers before that history has no other form there. So its later part reaches the request, and only where a summary straddles the chunk. When a refused request is retried with a recalled summary above L1 replaced by its children (the recall-curve fallback), a straddling summary's later child is recalled too: the same later part, as a summary of its own. Summaries written before this change are recalled as written, and one written after a reset may already carry the new topic.
+
+### Fixed
+
+- After a head-window reset (`ContextManager.resetHeadWindow()`), a compression or merge request for history from before the reset no longer gets the new topic's opening as its head, ahead of the history it summarizes (#317). A source-only request (`compressionSourceOnly` or `compressionMergeSourceOnly`) carries no head, so this didn't reach it. The other way later history reached a compression request, its recall pairs, is under Changed.
+  - **The head it gets now:** the head that history followed, the opening or its own topic's transition and opening, cut at the request's first message. A merge gets the head as of its first message.
+  - **Which head:** before the live head's start, the one starting at the latest Context Manager message whose text starts with `[Topic Transition]` at or before the request's first message, or the opening when there is none. That's the store as a restart reads it, so for that history a strategy-level `resetHeadWindow` to a message that isn't a transition doesn't count. It ends by the walk the live head takes, priced with today's `headWindowTokens` and calibration. There, a chunk that starts at a transition gets no head, and so does the opening's own chunk: nothing came before either.
+  - **From the live head's start on,** a request still gets the live head, but now cut at its first message. So a queued chunk inside the live head window (one a widened window grew over) no longer gets the head's messages after it, and before the host declares its tools, tick no longer defers it for a tool cycle among them.
+  - **Removed messages:** where history starts is its first message still in the store, for a queued chunk, a summary (its first leaf still there) and a merge alike: a host can remove stored messages (agent-framework's Discord module does) while a summary over them or a queued chunk holding them lives on. A summary whose first message was removed is still recalled, in its place, so its other messages keep a form. History with no message left gets no head and recalls nothing: nothing in the store says when it happened. Before, a summary whose first message was removed was left out of a merge's recall while its other messages stayed out too, and a compression request placed it after newer ones.
+  - **Unchanged:** what every compile selects and sends, and every summary already written. What an over-budget refusal names as clearing it (`clearedBy`) follows tick's deferral, which reads the request's head.
+  - **Prompt cache:** a request for older history after a reset carries on the prefix it had before the reset, where it used to restart with the new topic, and restart again each time the live head grew.
+
 ## 0.20.0 — 2026-10-23
 
 ### Breaking
