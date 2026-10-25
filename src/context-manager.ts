@@ -1160,7 +1160,9 @@ export class ContextManager {
   // ==========================================================================
 
   /**
-   * Check if compile() will block waiting for background work.
+   * Whether the strategy has no background work pending (its
+   * `checkReadiness()`). compile() doesn't wait for that work: it compiles
+   * from what's there.
    */
   isReady(): boolean {
     this.requireInitialized('isReady');
@@ -1198,7 +1200,7 @@ export class ContextManager {
    * model that binds thinking can no longer take, injections placed (see
    * `SelectOptions.thinkingBinding`).
    *
-   * May block if strategy has pending work.
+   * It awaits nothing, so it doesn't wait for the strategy's background work.
    */
   async compile(
     budget?: TokenBudget,
