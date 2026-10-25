@@ -1857,9 +1857,7 @@ function imageGroup(block: ContentBlock): unknown {
 
 /** Out-of-band calibration samples in a row it takes to learn from them, and
  *  how close each one's implied multiplier must be to the run's first to
- *  continue the run (see reportRealInputTokens). The agreement also decides
- *  whether two declared samples move a store whose multiplier wasn't
- *  learned from declared samples. */
+ *  continue the run (see reportRealInputTokens). */
 const OUT_OF_BAND_RUN_LENGTH = 3;
 const OUT_OF_BAND_RUN_AGREEMENT = 0.1;
 
@@ -13867,10 +13865,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._lastCompileEstimate =
         rs.head.tokens + rs.tail.tokens + rs.middleRaw.tokens +
         rs.summaries.l1.tokens + rs.summaries.l2.tokens + rs.summaries.l3.tokens;
-      // What the compile inserts among these entries after the select (its
-      // message-position injections) is in the request and not in the
-      // window: priced here, at the multiplier the window was priced at, so
-      // the sample counts it as the request does (#323).
       let injected = 0;
       for (const content of opts?.messageInjections ?? []) {
         injected += store.estimateTokens({ content } as unknown as StoredMessage);
@@ -13882,7 +13876,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   private _lastCompileEstimate = 0;
-  /** The armed compile's message-position injections, priced with its window. */
   private _lastCompileInjected = 0;
   private _storeView: MessageStoreView | null = null;
 
@@ -13916,8 +13909,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // exhausting the picker on every wake. One sample per compile, always.
     if (!this._calibrationArmed) return;
     this._calibrationArmed = false;
-    // Declared: the caller passed what the request sent besides the window
-    // and the compile's injections ({} included). A JS caller's null isn't.
     const declared = overhead != null;
 
     // The overhead in the window's units (current calibrated), so the implied
@@ -13938,8 +13929,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const observed = ratio * current; // back out the multiplier already applied
     // SANITY BAND: a representative sample sits near 1. Anything wilder is a
     // structural mismatch (a request we didn't compile, a partial compile, a
-    // provider quirk) — never evidence about chars-per-token. Log, don't learn,
-    // except a declared consistent run (below).
+    // provider quirk) — never evidence about chars-per-token. Log, don't learn.
     // The band is also checked on the IMPLIED raw multiplier: when the
     // multiplier sits at a clamp edge because the per-class rates were wrong
     // (signed thinking at a flat 600) and the rates are then fixed, every
@@ -13953,11 +13943,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the same number, so a store whose true ratio is past the band (every
     // epoch discard restarts there) rejects every sample and never learns.
     // A single wild sample is still noise, but a run of them that agree with
-    // the run's first, within OUT_OF_BAND_RUN_AGREEMENT, is a ruler that's
-    // off, not a request we didn't compile: the third in a row is learned,
-    // outright, which lands it on the clamp edge. Agreement is with the first,
-    // not the one before, so a drifting run (a growing unpriced part) isn't
-    // learned as a constant.
+    // the run's first is a ruler that's off, not a request we didn't compile:
+    // the third in a row is learned, outright, which lands it on the clamp edge.
     // Only for samples whose caller declared what it sent besides the window:
     // undeclared, a consistent ratio past the band is what tool schemas and a
     // system prompt look like, and learning it would fold the window to the
@@ -13988,22 +13975,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._outOfBandRun = null;
     }
 
-    // A multiplier learned before samples declared their overhead learned it
-    // as a rate (#323). Inside the band, the first declared sample on such a
-    // record is held, and the next declared sample decides: if the two agree
-    // within OUT_OF_BAND_RUN_AGREEMENT their mean replaces the multiplier,
-    // instead of about ten EMA steps, each a reprice of every message and
-    // summary; if not, the EMA steps as for any sample. Two, not one: this
-    // reaches every store that samples after the upgrade, those whose
-    // multiplier is already right included, and one wild sample shouldn't
-    // set their ruler alone. The held sample is in memory only, so a restart
-    // between them costs one more sample; an undeclared sample between them
-    // leaves it, since an implied multiplier doesn't depend on the multiplier
-    // in force. Either way the record is then marked (declaredOverhead): the
-    // move has run for it, and later declared samples step by the EMA; an
-    // undeclared sample that moves the multiplier takes the mark back. A
-    // provisional multiplier, or a consistent run (out of the band, three
-    // samples), is replaced by one sample as before.
+    // A multiplier learned from samples that didn't declare their overhead
+    // holds that overhead as a rate (#323).
     const markDeclared = declared && !this._calibrationDeclared;
     let replacement: number | null = null;
     if (markDeclared && !this._calibrationProvisional && !fromRun) {
@@ -14021,10 +13994,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._declaredCandidate = null;
       if (Math.abs(observed / candidate - 1) <= OUT_OF_BAND_RUN_AGREEMENT) replacement = (candidate + observed) / 2;
     } else if (declared) {
-      // A declared sample that decides the multiplier another way (a
-      // provisional replacement, a run) or meets a marked record ends any
-      // held sample: what it was held for, whether two declared samples
-      // should replace an unmarked multiplier, has been settled.
       this._declaredCandidate = null;
     }
 
@@ -14033,9 +14002,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // A provisional multiplier is a guess (see CALIBRATION_PRICING_EPOCH). This
     // sample is the first evidence under this release's pricing, so it replaces
     // the guess outright; the EMA steps from here on. A consistent run replaces
-    // it outright too: its samples agree on the multiplier, and stepping toward
-    // it would take several more applied changes, each a reprice of every
-    // message and summary.
+    // it outright too.
     const provisional = this._calibrationProvisional;
     this._calibrationProvisional = null;
     const next = replacement ?? (provisional || fromRun ? observed : ema + alpha * (observed - ema));
@@ -14247,19 +14214,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _calibrationEma: number | null = null;
   /** The out-of-band samples rejected in a row that agree with the first,
    *  and the first one's implied multiplier (see reportRealInputTokens). In
-   *  memory only: a restart, or a branch's re-initialisation
-   *  (clearBranchMirrors), counts afresh. */
+   *  memory only: a restart counts afresh. */
   private _outOfBandRun: { first: number; count: number } | null = null;
-  /** The implied multiplier of the first declared sample on a record whose
-   *  multiplier wasn't learned from declared samples, held for the next
-   *  declared sample (see reportRealInputTokens). In memory only. */
   private _declaredCandidate: number | null = null;
-  /** Whether the two-sample move has run for the multiplier in force: set
-   *  once declared samples have set, stepped or confirmed it (one sample for a
-   *  provisional multiplier or a run, two for a learned one). Persisted as the
-   *  record's declaredOverhead; an undeclared sample that moves the multiplier
-   *  clears it, and so does dropping a provisional multiplier to 1 (see
-   *  reportRealInputTokens). */
   private _calibrationDeclared = false;
   private _calibrationLoaded = false;
   /** Set when an older-epoch multiplier was discarded; persisted with the record. */
@@ -14469,6 +14426,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       try {
         const saved = this.store?.getStateJson(this.calibrationStateId) as
           { multiplier?: number; pricing?: number; reset?: CalibrationReset; provisional?: boolean; declaredOverhead?: boolean } | null;
+        const fromNewerEpoch = typeof saved?.pricing === 'number' && saved.pricing > AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
         if (saved && Number.isFinite(saved.multiplier)) {
           const current = AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH;
           const stamped = typeof saved.pricing === 'number' && Number.isFinite(saved.pricing);
@@ -14584,24 +14542,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // This binary's learner still writes its own record over it on its
           // first applied sample, or when two declared samples confirm and
           // mark the 1 (see CALIBRATION_PRICING_EPOCH).
-        } else if (!(typeof saved?.pricing === 'number' && saved.pricing > AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH)) {
-          // No record, or none with a multiplier to use: nothing this store
-          // kept says what its multiplier is, so its 1 is a guess, as a
-          // discard's restart is, and the first sample the band accepts sets
-          // it (#328). Learned, it would take the slowest path for the store
-          // with the least evidence: for an undeclared caller nine applied
-          // EMA steps to reach a true 1.4, each a reprice of every message and
-          // summary, and for a declared one two samples, the first held.
-          // Nothing is
-          // written: with no record, the next load decides the same, and the
-          // first sample's write gives the stamp. A record from a newer epoch,
-          // with a multiplier this binary can read or not, and a read that
-          // throws (below) aren't this case: each may hold what a later binary
-          // or the store keeps, which a provisional 1's first sample would
-          // write over even when it only confirms the 1.
+        } else if (!fromNewerEpoch) {
           this._calibrationProvisional = { fromEpoch: null };
         }
-      } catch { /* a record the store can't read loads 1, not provisional: unlike no record, it may hold what the store keeps (see the no-record branch above) */ }
+      } catch {}
     }
     // A dry select changes the store's multiplier only where select() read it
     // first and can put it back (see MessageStoreView).
@@ -14629,8 +14573,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const reset: CalibrationReset = { discardedMultiplier: discarded, fromEpoch: provisional.fromEpoch, at: Date.now() };
     this._calibration = 1;
     this._calibrationReset = reset;
-    // The mark was about the multiplier dropped, and goes with it, as the
-    // record below is written without it.
     this._calibrationDeclared = false;
     this.applyCalibration();
     if (dryRun) return true;

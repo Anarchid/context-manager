@@ -1178,8 +1178,7 @@ export class ContextManager {
     const branch = branchRefOf(this.store);
     const view = this.strategyMessageView();
 
-    // Get selected entries from strategy. The injections it will sit among
-    // go with it, for its calibration's count of the request (SelectOptions).
+    // Get selected entries from strategy
     const messageInjections = (injections ?? [])
       .filter((inj) => inj.position === 'beforeUser' || inj.position === 'afterUser')
       .map((inj) => inj.content);

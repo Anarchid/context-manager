@@ -84,12 +84,11 @@ describe('estimator calibration and request overhead (#323)', () => {
     const overhead = overheadPrice(cm, SYSTEM, tools);
     assert.ok(overhead > window * 0.4 && overhead < window * 0.7, `overhead ${overhead} vs window ${window}`);
     // Undeclared, this sample reads real/est ≈ 1.5: in band, so it would be
-    // learned as a per-token rate 50% above the truth. The first sample sets
-    // a store with no record; the second steps it.
+    // learned as a per-token rate 50% above the truth.
     strategy.reportRealInputTokens(window + overhead, { system: SYSTEM, tools });
     await cm.compile(BUDGET);
     strategy.reportRealInputTokens(internals._lastCompileEstimate + overhead, { system: SYSTEM, tools });
-    assert.equal(internals._calibration, 1);
+    assert.equal(internals._calibration, 1, 'neither the first sample, which sets a store with no record, nor the second, which steps it, moves it from 1');
     cm.close();
   });
 
@@ -200,12 +199,10 @@ describe('estimator calibration and request overhead (#323)', () => {
   });
 });
 
-/** The store's price of some content, at its current multiplier. */
 function priceOf(cm: ContextManager, content: ContentBlock[]): number {
   return (cm as unknown as { messageStore: { estimateTokens(m: StoredMessage): number } }).messageStore.estimateTokens({ content } as unknown as StoredMessage);
 }
 
-/** An injection at a position, of about `tokens` estimated tokens. */
 function injectionOf(position: 'beforeUser' | 'afterUser' | 'system', tokens: number): ContextInjection {
   return { namespace: 'probe', position, content: [{ type: 'text', text: 'Retrieved knowledge. '.repeat(Math.ceil(tokens / 4)) }] };
 }
@@ -223,21 +220,19 @@ async function seeded(name: string, record: Record<string, unknown>) {
   return { ...opened, internals: opened.internals as DeclaredInternals };
 }
 
-/** Compile, then one sample at implied multiplier k, with system and tools declared or not. */
-async function sampleAt(cm: ContextManager, strategy: AutobiographicalStrategy, internals: Internals, k: number, declared: boolean): Promise<void> {
+async function sampleAt(cm: ContextManager, strategy: AutobiographicalStrategy, internals: Internals, impliedMultiplier: number, declared: boolean): Promise<void> {
   await cm.compile(BUDGET);
   const m = internals._calibration;
   const tools = toolsOf(internals._lastCompileEstimate / m / 2);
   const rawWindow = internals._lastCompileEstimate / m;
   const rawOverhead = overheadPrice(cm, SYSTEM, tools) / m;
-  strategy.reportRealInputTokens(k * (rawWindow + (declared ? rawOverhead : 0)), declared ? { system: SYSTEM, tools } : undefined);
+  strategy.reportRealInputTokens(impliedMultiplier * (rawWindow + (declared ? rawOverhead : 0)), declared ? { system: SYSTEM, tools } : undefined);
 }
 
 const declaredOf = (internals: Internals) =>
   (internals.store!.getStateJson(internals.calibrationStateId) as { declaredOverhead?: boolean } | null)?.declaredOverhead;
 
 describe('estimator calibration: what the compile adds among the messages', () => {
-  /** Two compiles with the injection, each sampled with system, tools and the injection in the provider's count. */
   async function twoSamples(name: string, injection: (window: number) => ContextInjection) {
     const { cm, strategy, internals } = await openManager(name);
     await cm.compile(BUDGET);
@@ -254,8 +249,8 @@ describe('estimator calibration: what the compile adds among the messages', () =
 
   it('a message-position injection is priced into the sample: in band, it is not learned as a per-token rate', async () => {
     const { cm, internals, window, inj } = await twoSamples('injected-in-band', (w) => injectionOf('afterUser', w / 2));
-    // Premise: priced as the window and the declared head alone, these samples read about 1.33.
-    assert.ok(priceOf(cm, inj.content) > window * 0.4, `injection ${priceOf(cm, inj.content)} vs window ${window}`);
+    assert.ok(priceOf(cm, inj.content) > window * 0.4,
+      `premise: priced as the window and the declared head alone, these samples would read about 1.33; injection ${priceOf(cm, inj.content)} vs window ${window}`);
     assert.equal(internals._calibration, 1);
     assert.equal(declaredOf(internals), true, 'the samples were taken');
     cm.close();
@@ -315,7 +310,6 @@ describe('estimator calibration: what the compile adds among the messages', () =
     const tools = toolsOf(window / 2);
     for (let i = 0; i < 2; i++) {
       const result = await cm.compile(BUDGET, [injection]);
-      // The caller appends systemInjections to its system prompt, and declares that.
       const system = `${SYSTEM}\n${result.systemInjections.map((b) => (b as { text: string }).text).join('\n')}`;
       strategy.reportRealInputTokens(internals._lastCompileEstimate + overheadPrice(cm, system, tools), { system, tools });
     }
@@ -361,7 +355,6 @@ describe('estimator calibration: what the compile adds among the messages', () =
     const tools = toolsOf(internals._lastCompileEstimate / 2);
     const injection = injectionOf('afterUser', internals._lastCompileEstimate / 2);
     await cm.compile(BUDGET, [injection]);
-    // A provider at k = 1.5: the window, the head and the injection, each at the store's price.
     strategy.reportRealInputTokens(internals._lastCompileEstimate + overheadPrice(cm, SYSTEM, tools) + priceOf(cm, injection.content), { system: SYSTEM, tools });
     assert.equal(internals._calibration, 1.5);
     assert.equal((internals as unknown as { _calibrationEma: number | null })._calibrationEma, 1.5, 'the sample was taken');
@@ -385,9 +378,8 @@ describe('estimator calibration: what the compile adds among the messages', () =
     await cm.compile(BUDGET);
     const window = internals._lastCompileEstimate;
     const system = `You are a resident. ${'Keep to your purpose. '.repeat(Math.ceil(window / 14))}`;
-    // Premise: left out, the samples read 1.25 to 1.7, inside the band, where they'd be learned.
     const share = overheadPrice(cm, system, []) / window;
-    assert.ok(share > 0.25 && share < 0.7, `the system prompt is ${share} of the window`);
+    assert.ok(share > 0.25 && share < 0.7, `premise: left out, the samples would read 1.25 to 1.7, in band; the system prompt is ${share} of the window`);
     for (let i = 0; i < 2; i++) {
       await cm.compile(BUDGET);
       strategy.reportRealInputTokens(internals._lastCompileEstimate + overheadPrice(cm, system, []), { system });
@@ -399,16 +391,13 @@ describe('estimator calibration: what the compile adds among the messages', () =
 });
 
 describe('estimator calibration: consistent out-of-band runs', () => {
-  /** Compile, then one declared sample at `ratio` of the compile's estimate. */
   async function oob(cm: ContextManager, strategy: AutobiographicalStrategy, internals: Internals, ratio: number, declared = true) {
     await cm.compile(BUDGET);
-    const nothingBesides: RequestOverhead = {}; // the package's type, from its root
+    const nothingBesides: RequestOverhead = {};
     strategy.reportRealInputTokens(internals._lastCompileEstimate * ratio, declared ? nothingBesides : undefined);
   }
 
   it('a consistent run on a learned record without the flag is learned at the clamp, not held', async () => {
-    // The upgrade case: a learned multiplier no declared sample has confirmed.
-    // A store with no record is provisional, which skips the hold anyway.
     const { cm, strategy, internals } = await seeded('run-on-learned', { multiplier: 1, at: 1, pricing: epoch });
     assert.equal(internals._calibrationProvisional, null, 'learned');
     for (let i = 0; i < 3; i++) await oob(cm, strategy, internals, 2.1);
