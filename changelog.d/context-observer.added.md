@@ -7,8 +7,8 @@
   drops the rest, so a compile's result is the same with an observer as
   without one. Outside that is a returned promise no JavaScript can give a
   handler, such as one whose `constructor` or species can't be used, or a
-  proxy around one: what's thrown on the way is logged, and its rejection
-  goes unhandled, which ends a Node process by default. A record's
+  proxy around one: its rejection goes unhandled, which ends a Node process
+  by default. A record's
   error and render stats are the objects the caller gets, so an observer
   treats them as read-only.
   - `compile(record)`, once per `compile()`: the strategy, `dryRun`,

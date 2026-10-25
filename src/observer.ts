@@ -147,10 +147,9 @@ export interface CalibrationSampleRecord {
  * observes: the manager logs a callback's first failure through its
  * diagnostics, and drops the rest. Outside that is a returned promise no
  * JavaScript can give a handler, such as one whose `constructor` or species
- * can't be used, or a proxy around one: what's thrown on the way is logged,
- * and the promise's own rejection goes unhandled, which ends a Node process
- * by default. A record's error and render stats are the objects the caller
- * gets, so an observer treats them as read-only.
+ * can't be used, or a proxy around one: its rejection goes unhandled, which
+ * ends a Node process by default. A record's error and render stats are the
+ * objects the caller gets, so an observer treats them as read-only.
  */
 export interface ContextObserver {
   compile?(record: CompileRecord): void;
@@ -216,8 +215,11 @@ export function isolateObserver(
             // getter that throws, or a `then` that throws before it settles,
             // rejects the promise handled here. (A promise no JavaScript can
             // give a handler, such as one whose constructor or species can't
-            // be used, or a proxy around one, is told of here or below, and
-            // its own rejection goes unhandled.)
+            // be used, or a proxy around one, keeps its own rejection
+            // unhandled. What it throws is told where the adoption or the
+            // catch below meets it, if either does: one whose species can't
+            // be used and whose own `then` is undefined is adopted as a plain
+            // value, and nothing is told.)
             Reflect.apply(Promise.prototype.then, Promise.resolve(returned), handlers);
           }
         }
