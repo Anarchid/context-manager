@@ -491,8 +491,11 @@ function relevanceCut(
     // with the walk's restart that was quadratic again (#156 R5-1).
     const attempted = new Set<string>();
     const readers = new Map<ChunkId, string[]>();
-    const fileReads = (key: string, leafIds: readonly ChunkId[]): void => {
+    const fileReads = (key: string, nodeId: string, leafIds: readonly ChunkId[], level: number): void => {
       for (const id of leafIds) {
+        // Only a leaf the summary renders at that level reaches the verdict:
+        // eligibility, the landing veto and the ledger's units all skip the rest.
+        if (tree.ancestorAt(id, level)?.id !== nodeId) continue;
         const keys = readers.get(id);
         if (keys) keys.push(key); else readers.set(id, [key]);
       }
@@ -620,7 +623,7 @@ function relevanceCut(
             break;
           }
         }
-        if (!eligible) { attempted.add(attemptKey); fileReads(attemptKey, node.leafChunkIds); park(attemptKey, node.id, node.leafChunkIds, level); continue; }
+        if (!eligible) { attempted.add(attemptKey); fileReads(attemptKey, node.id, node.leafChunkIds, level); park(attemptKey, node.id, node.leafChunkIds, level); continue; }
         const before = ledger.tokens;
         // Record exact prior levels for an honest revert: with boundary-cut
         // tolerance a group may hold members below `level` (protected raw,
@@ -643,14 +646,14 @@ function relevanceCut(
         // change while the un-fold moves its leaves, or when the projection
         // runs after it. Eligibility put every leaf moved here at `level`.
         const vetoMemo = new Map<string, boolean>();
-        const landings: Array<readonly ChunkId[]> = [];
+        const landings: Array<[{ id: string; leafChunkIds: readonly ChunkId[] }, number]> = [];
         const landingVetoed = (own: { id: string; leafChunkIds: readonly ChunkId[] }, at: number): boolean => {
           const key = `${own.id}:${at}`;
           let verdict = vetoMemo.get(key);
           if (verdict === undefined) {
             verdict = vetoed(tree, own, at, F, projectionExempt);
             vetoMemo.set(key, verdict);
-            landings.push(own.leafChunkIds);
+            landings.push([own, at]);
           }
           return verdict;
         };
@@ -686,8 +689,8 @@ function relevanceCut(
             F.set(leafId, from);
           }
           attempted.add(attemptKey);
-          fileReads(attemptKey, node.leafChunkIds);
-          for (const leafIds of landings) fileReads(attemptKey, leafIds);
+          fileReads(attemptKey, node.id, node.leafChunkIds, level);
+          for (const [own, at] of landings) fileReads(attemptKey, own.id, own.leafChunkIds, at);
           park(attemptKey, node.id, node.leafChunkIds, level);
         } else {
           // The ledger moved: a group whose verdict read a moved leaf may now
