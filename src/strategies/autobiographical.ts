@@ -15807,11 +15807,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   private reportHeldLevelPins(forest: CanonicalSummaryForest, messages: StoredMessage[]): void {
     const held = new Map<MessageId, { level: number; heldAt: number }>();
-    if (this.pins.some((pin) => pin.level !== undefined && pin.level > 0)) {
-      for (const leaf of forest.orderedLeaves()) {
-        const hold = heldLevelPin(leaf);
-        if (hold) held.set(leaf.id, hold);
-      }
+    for (const leaf of forest.orderedLeaves()) {
+      const hold = heldLevelPin(leaf);
+      if (hold) held.set(leaf.id, hold);
     }
     const now = new Map<string, { label: string; level: number; heldAt: Set<number>; count: number }>();
     if (held.size > 0) {
