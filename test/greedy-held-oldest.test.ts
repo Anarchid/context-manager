@@ -105,4 +105,37 @@ describe('the strategy gives the solver the line its compile refuses above', () 
       manager.close();
     }
   });
+
+  it('the shadow pick at productionBudgetTokens is given that budget and, as rejectionBudget, that budget with its grace', async () => {
+    cleanup();
+    calls = 0;
+    const strategy = new Lane({
+      adaptiveResolution: true, foldingStrategy: 'flat-profile', overBudgetGraceRatio: 0.05, productionBudgetTokens: 600,
+      mergeThreshold: 3, headWindowTokens: 0, recentWindowTokens: 200, targetChunkTokens: 60, l1HoldbackChunks: 0,
+      autoTickOnNewMessage: false, compressionModel: 'mock',
+    } as never);
+    const manager = await ContextManager.open({ path: STORE, strategy, membrane: membrane as never });
+    const seen: FoldingBudget[] = [];
+    const solve = FlatProfileStrategy.prototype.solve;
+    FlatProfileStrategy.prototype.solve = function (this: FlatProfileStrategy, ...args: Parameters<typeof solve>) {
+      seen.push(args[1]);
+      return solve.apply(this, args);
+    };
+    try {
+      await quietly(async () => {
+        for (let n = 0; n < 60; n++) {
+          manager.addMessage(n % 2 ? 'Claude' : 'User', [{ type: 'text', text: `m-${n} hello world, and a few more words to give it weight` }]);
+          if (n % 5 === 4) for (let t = 0; t < 6; t++) await manager.tick();
+        }
+      });
+      seen.length = 0;
+      await quietly(() => manager.compile({ maxTokens: 1000, reserveForResponse: 0 }));
+      const shadow = seen.filter((budget) => budget.totalBudget === 600);
+      assert.ok(shadow.length > 0, 'premise: the compile ran the shadow pick');
+      for (const budget of shadow) assert.equal((budget as { rejectionBudget?: number }).rejectionBudget, 630);
+    } finally {
+      FlatProfileStrategy.prototype.solve = solve;
+      manager.close();
+    }
+  });
 });

@@ -575,6 +575,22 @@ for (const [name, make] of greedySolvers) {
     assert.deepEqual(unrealizable, []);
   });
 
+  // s0's L1 S has no parent. x0 and x1 are under N1, whose parent is M1, and
+  // the younger y0 and y1 under N2, whose parent is M2. Once every chunk is at
+  // L1, a step passes s0 over and raises the oldest chunk that can rise, x0,
+  // through M1. Raising y0 through M2 would fit the budget as well.
+  test(`picker (${name}): passing over a chunk, a step raises the oldest chunk that can rise, not a younger one under another parent`, () => {
+    const inputs = greedyStore([['s0', 'S'], ['x0', 'N1'], ['x1', 'N1'], ['y0', 'N2'], ['y1', 'N2']], [
+      ['S', 1, ['s0'], 30], ['N1', 1, ['x0', 'x1'], 30, 'M1'], ['N2', 1, ['y0', 'y1'], 30, 'M2'],
+      ['M1', 2, ['N1'], 20], ['M2', 2, ['N2'], 20],
+    ]);
+    const { result } = runQuietly(make(), inputs, BUDGET(90, 0));
+    assert.equal(result.finalTokens, 90);
+    assert.equal(result.finalResolutions.get('s0'), 1, 's0 stays at S');
+    for (const id of ['x0', 'x1']) assert.equal(result.finalResolutions.get(id), 2, `${id} rises through M1`);
+    for (const id of ['y0', 'y1']) assert.equal(result.finalResolutions.get(id), 1, `${id} stays at N2`);
+  });
+
   // Neither S nor T has a parent. With every chunk at the top of its lineage,
   // the step asks for the next level over the oldest chunk's group, as it
   // always has.
@@ -891,6 +907,35 @@ test('picker (flat-profile): the fewest-token plan comes with the request its ow
   assert.equal(result.finalTokens, 200);
   assert.equal(result.finalResolutions.get('a0'), 1, 'the oldest-only solve\'s plan');
   assert.deepEqual(result.produced, [{ level: 2, range: { firstChunkId: 's0', lastChunkId: 's0' } }], 'its own request, not the L3 the other solve asked for');
+});
+
+// The fixture above with P costing 5. Passing s0 over raises a0 through P
+// (280 to 255), then c0 (175), and ends asking for an L3 over P's group; the
+// oldest-only solve raises c0 (200) and asks for an L2 over s0. Neither last
+// plan fits 150, so the fewest-token plan is the solve that passes over, and
+// its own request comes with it.
+test('picker (flat-profile): the fewest-token plan from the solve that passes over comes with that solve\'s request', () => {
+  const chunk = (id: string, sequence: number, currentResolution: number, l1Id: string): PickerChunk => ({
+    id, sequence, rawTokens: 100, currentResolution, lockedByAgent: false, pinned: false, l1Id,
+  });
+  const summary = (id: string, level: number, sourceIds: string[], tokens: number, parentId?: string): [string, SummaryEntry] => [id, {
+    id, level, content: id, tokens, sourceLevel: level - 1, sourceIds, created: 0,
+    sourceRange: { first: sourceIds[0]!, last: sourceIds[sourceIds.length - 1]! }, ...(parentId ? { parentId } : {}),
+  }];
+  const inputs: PickerInputs = {
+    chunks: [chunk('s0', 0, 1, 'S'), chunk('a0', 1, 1, 'A'), chunk('c0', 2, 0, 'C'), chunk('e0', 3, 2, 'E1'), chunk('f0', 4, 2, 'F1'), chunk('b0', 5, 0, 'B')],
+    summaries: new Map([
+      summary('S', 1, ['s0'], 30), summary('C', 1, ['c0'], 20),
+      summary('A', 1, ['a0'], 30, 'P'), summary('B', 1, ['b0'], 30, 'P'), summary('P', 2, ['A', 'B'], 5),
+      summary('E1', 1, ['e0'], 30, 'E2'), summary('E2', 2, ['E1'], 10), summary('F1', 1, ['f0'], 30, 'F2'), summary('F2', 2, ['F1'], 10),
+    ]),
+    headTokens: 0, tailTokens: 100, headChunkIds: new Set(), tailChunkIds: new Set(['b0']),
+  };
+  const { result } = runQuietly(new FlatProfileStrategy(), inputs, { totalBudget: 150, targetBudget: 135, slack: 0.1 });
+  assert.equal(result.finalTokens, 175);
+  assert.equal(result.finalResolutions.get('a0'), 2, 'the passing-over solve\'s plan: a0 through P');
+  assert.equal(result.produced.length, 1);
+  assert.equal(result.produced[0]!.level, 3, 'its own request, an L3 over P\'s group, not the L2 over s0 the other solve asked for');
 });
 
 // flat-profile chooses within its best-ranked level: L1 holds three rendered
