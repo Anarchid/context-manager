@@ -499,6 +499,41 @@ test('phase C: a group it couldn\'t take returns to the walk once an accept move
 });
 
 /**
+ * R5-1's landing half: a group's verdict also reads the leaves of each
+ * summary its un-fold would land on, so an accept that moves one of those
+ * returns it to the walk too. Leaves b, a, c (1,000 raw tokens each); S, an
+ * L1 over a and b (100), T over c (80), both pointing at H, an L2 that lists
+ * a and c through stray L1s and omits b (60); H points at J, an L3 that
+ * lists b through another branch and omits a and c (90). Carried with b at
+ * L3 and a and c at L2, at 150 of a target of 190: H's un-fold lands a on S
+ * and c on T, 270, and is declined. J's un-fold lands b on S, 160, and is
+ * taken. That moves b, which S lists, so H, whose landing S read b, is tried
+ * again: a joins b on S and c lands on T, 180. Kept off the walk, H leaves
+ * the plan at 160.
+ */
+test('phase C: a group returns to the walk once an accept moves a leaf of a summary its un-fold would land on (R5-1)', () => {
+  const chunks = [{ id: 'b', l1Id: 'S' }, { id: 'a', l1Id: 'S' }, { id: 'c', l1Id: 'T' }]
+    .map((c, sequence) => ({ ...c, sequence, rawTokens: 1000, currentResolution: 0, lockedByAgent: false, pinned: false }));
+  const summary = (id: string, level: number, sourceIds: string[], tokens: number, parentId?: string) => [id, {
+    id, level, sourceLevel: level - 1, sourceIds, tokens, content: `summary ${id}`, timestamp: 0,
+    sourceRange: { first: sourceIds[0], last: sourceIds[sourceIds.length - 1] }, ...(parentId ? { parentId } : {}),
+  }] as const;
+  const summaries = new Map([
+    summary('S', 1, ['a', 'b'], 100, 'H'), summary('T', 1, ['c'], 80, 'H'),
+    summary('Ra', 1, ['a'], 1), summary('Rc', 1, ['c'], 1), summary('H', 2, ['Ra', 'Rc'], 60, 'J'),
+    summary('Bl', 1, ['b'], 1), summary('Bk', 2, ['Bl'], 1), summary('J', 3, ['Bk'], 90),
+  ]);
+  const inputs = { chunks, summaries, headTokens: 0, tailTokens: 0, headChunkIds: new Set(), tailChunkIds: new Set() } as unknown as PickerInputs;
+  const tree = new SummaryTree(inputs);
+  const plan = planControlledFrontier(inputs, tree, {
+    previous: new Map([['b', 3], ['a', 2], ['c', 2]]), targetTokens: 190, foldAtTokens: 100_000, windowTokens: 100_000, reachTokens: 100_000,
+    rawZone: new Set(), now: chunks.length, mergeThreshold: 2, seedFromCarried: true,
+  });
+  assert.deepEqual(Object.fromEntries(chunks.map((c) => [c.id, plan.resolutions.get(c.id) ?? 0])), { b: 1, a: 1, c: 1 });
+  assert.equal(plan.tokens, 180);
+});
+
+/**
  * R6-1: a cleared key puts its parked chunks back on the walk, each at its
  * place among the chunks still listed. Finding that place by scanning back
  * over every unlisted position took a step per position passed, so one
@@ -548,8 +583,11 @@ test('phase C: a cleared key relists its parked chunks in O(log n) steps each, n
     const m = /\[kv-timing\] phase-c \d+ms passes=(\d+) visits=(\d+)/.exec(l);
     return m ? [{ passes: Number(m[1]), visits: Number(m[2]) }] : [];
   });
-  // Past one visit a chunk, a phase C counted the search for the chunks the accepts relisted.
-  assert.ok(runs.some((r) => r.visits > chunks.length), `premise: the relists' search steps are counted (${JSON.stringify(runs)})`);
+  // Each of the n relists searches with olderThan, whose descent alone takes
+  // ⌊log₂ chunks⌋ + 1 steps while an older chunk is listed. Here the walk's
+  // own visits come to 4,000 and the searches add the rest, so past
+  // n·⌊log₂ chunks⌋ = 11,000 visits a phase C counted the relists' search.
+  assert.ok(runs.some((r) => r.visits > n * Math.floor(Math.log2(chunks.length))), `premise: the relists' search steps are counted (${JSON.stringify(runs)})`);
   const bound = 3 * chunks.length * Math.ceil(Math.log2(chunks.length));
   for (const r of runs) assert.ok(r.visits <= bound, `phase C took ${r.visits} steps over ${r.passes} passes, past ${bound}`);
 });
@@ -599,7 +637,8 @@ test('phase C: a declined group isn\'t tried again when an accept moves a leaf i
     const m = /\[kv-timing\] phase-c \d+ms passes=(\d+) visits=(\d+)/.exec(l);
     return m ? [{ passes: Number(m[1]), visits: Number(m[2]) }] : [];
   });
-  assert.ok(runs.some((r) => r.passes > k), `premise: phase C took the z_i one accept a pass (${JSON.stringify(runs)})`);
+  // Each Z_i accept ends a pass, and the last pass takes nothing: k + 1 passes only where G is never taken.
+  assert.ok(runs.some((r) => r.passes === k + 1), `premise: phase C took the z_i one accept a pass, and G stayed declined (${JSON.stringify(runs)})`);
   for (const r of runs) assert.ok(r.visits <= 3 * chunks.length, `phase C took ${r.visits} visits over ${r.passes} passes, past ${3 * chunks.length}`);
 });
 
