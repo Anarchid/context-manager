@@ -900,13 +900,16 @@ export interface RenderStats {
    * that isn't provisional was learned under that epoch's pricing, or under
    * an older epoch's and kept, re-stamped, because nothing this store holds
    * was repriced since; either way it's reported under the epoch in force.
+   * The exception is the 1 loaded beside a record from a newer pricing
+   * epoch, or a record the store can't read: neither is used, and that 1
+   * is neither learned nor provisional.
    * `provisional` is true while the multiplier is a guess, which the first
    * provider sample the calibration's band accepts replaces outright, rather
    * than stepping toward it (see
    * `AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH`): one kept from a
    * record without a stamp, the 1 a discard restarts from, or the 1 a store
-   * with no calibration record, or none with a multiplier to use, starts
-   * from. A discard's 1 stays
+   * with no calibration record, or none with a multiplier to use other than
+   * a newer epoch's, starts from. A discard's 1 stays
    * provisional through a later epoch's load, which re-stamps it whatever
    * that epoch repriced.
    * `reset` is present once a multiplier from an older or unknown epoch has
