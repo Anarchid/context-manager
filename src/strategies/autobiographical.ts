@@ -55,7 +55,7 @@ import { persistMintRequestPreimage } from '../mint-preimage.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
-import { Picker, OverBudgetError, UncoveredDropError, type OverBudgetClearedBy, type OverBudgetDiagnostics, type OverBudgetRawPin, type PickerChunk, type PickerInputs, type PickerResult } from '../adaptive/picker.js';
+import { Picker, OverBudgetError, UncoveredDropError, overBudgetStage, type OverBudgetClearedBy, type OverBudgetDiagnostics, type OverBudgetRawPin, type PickerChunk, type PickerInputs, type PickerResult } from '../adaptive/picker.js';
 import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { reportOverlap } from '../adaptive/kv-control.js';
@@ -97,6 +97,7 @@ import {
 } from '../live-image-limits.js';
 import type { MessageId } from '../types/message.js';
 import type { CarrierPolicy, IngressChunkResult } from '../types/strategy.js';
+import type { CompressionRefusal } from '../observer.js';
 import { type Diagnostics, namespaceDiagnostics } from '../diagnostics.js';
 import { holdsSystemChange, isSystemChange, systemChangePositions } from '../system-changes.js';
 import { storedJson } from '../stored-json.js';
@@ -1125,6 +1126,26 @@ type CompressionAttemptOutcome =
   | 'incomplete';
 
 /**
+ * The refusal an outcome is when context-manager itself made it (see
+ * `COMPRESSION_REFUSALS`), or nothing. A provider's refusal, and an error it
+ * returned or a run of them decided, are the provider's decisions, which
+ * context-manager doesn't report; a response's shape is context-manager's
+ * verdict (`assessFallbackCompressionResponse`'s `malformed_*`).
+ */
+function ownCompressionRefusal(outcome: CompressionAttemptOutcome, errorType?: string): CompressionRefusal | undefined {
+  switch (outcome) {
+    case 'admission_rejected': return 'admission-rejected';
+    case 'topology_violation': return 'topology-violation';
+    case 'unusable_empty': return 'empty';
+    case 'incomplete': return 'incomplete';
+    case 'provider_error': return errorType?.startsWith('malformed_') ? 'malformed' : undefined;
+    case 'refusal': return undefined;
+    // A new outcome has to be decided here before this compiles.
+    default: { const undecided: never = outcome; return undecided; }
+  }
+}
+
+/**
  * Typed rejection thrown by `executeMerge` when the merge response fails
  * the terminal-disposition gate. `tick()` catches this specifically to run
  * the bounded-retry/quarantine policy; any other executeMerge throw keeps
@@ -1986,7 +2007,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected chunkRecordsOrphaned = false;
   private _orphanWarned = false;
-  /** Record ids whose compression was refused by the L1 overlap guard. */
+  /** Chunks the L1 overlap guard refused: a chunk's record id, or its message-id key (chunkKey) when it has none. */
   private _overlapBlocked = new Set<string>();
 
   /**
@@ -2811,6 +2832,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private endGeneration(): void {
     this.compressionBranchGeneration++;
     for (const call of this.callsOut) call.abort();
+  }
+
+  /** Tell the host's observer of a compression outcome that is a refusal context-manager made itself (ownCompressionRefusal). */
+  private reportCompressionRefusal(outcome: CompressionAttemptOutcome, errorType?: string): void {
+    const reason = ownCompressionRefusal(outcome, errorType);
+    if (reason !== undefined) this.hostContext?.observer?.compression?.({ reason });
   }
 
   /**
@@ -6737,6 +6764,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     };
     this.mergeQuarantine.set(record.key, record);
     this.persistMergeQuarantine();
+    this.reportCompressionRefusal('topology_violation');
     this.diag.error(
       `[merge-topology] ⛔ refused L${targetLevel} merge over ${sourceIds.length} source(s) ` +
         `(${sourceIds.join(', ')}): ${reason}. The node was NOT minted; entry quarantined ` +
@@ -9127,6 +9155,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const key = chunk.recordId ?? chunkIdKey;
       if (!this._overlapBlocked.has(key)) {
         this._overlapBlocked.add(key);
+        this.hostContext?.observer?.compression?.({ reason: 'overlap-guard' });
         this.diag.error(
           `[autobiographical] OVERLAP GUARD: refusing to compress chunk ` +
           `${chunk.recordId ?? `#${chunk.index}`} — ${overlapIds.length}/${chunk.messages.length} ` +
@@ -10271,6 +10300,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         familyRecord.push(outcome);
         endRungRuns(outcome.curveLabel);
         persistProgress();
+        this.reportCompressionRefusal(outcome.outcome, outcome.errorType);
       };
       /**
        * A failure that is not a rejection says nothing about the request by its
@@ -10601,6 +10631,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               admittedTokens: admission.admittedTokens,
               budgetTokens: admission.budgetTokens,
             });
+            this.reportCompressionRefusal('admission_rejected');
             logCompressionCall({ event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace }, this.ns);
             return;
           }
@@ -10696,6 +10727,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               admittedTokens,
               budgetTokens: contextBudget,
             });
+            this.reportCompressionRefusal('admission_rejected');
             logCompressionCall({
               event: 'compression:curve-attempt', operation: 'compress_l1', metadata: trace,
             }, this.ns);
@@ -10918,6 +10950,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           let modelReportedLeaves = 0;
           const splitStart = Date.now();
           let abortReason: string | undefined;
+          // Which cap ended the rung, typed as the reasons the host is told, so
+          // a cap spelled otherwise here fails to compile rather than going
+          // unreported.
+          let capTripped: Extract<CompressionRefusal, 'chunk-call-cap' | 'window-call-cap'> | undefined;
           const MAX_SPLIT_CALLS = this.config.compressionSplitMaxCallsPerChunk ?? 40;
           const WINDOW_MS = 10 * 60_000;
           const MAX_WINDOW_CALLS = this.config.compressionSplitMaxCallsPer10Min ?? 80;
@@ -10932,13 +10968,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             if (abortReason) return false;
             const subset = chunk.messages.slice(a, b + 1);
             if (attempt) {
-            if (calls >= MAX_SPLIT_CALLS) { abortReason = 'chunk-call-cap'; return false; }
+            if (calls >= MAX_SPLIT_CALLS) { abortReason = capTripped = 'chunk-call-cap'; return false; }
             // This attempt alone has used the whole window: under these caps
             // the rung can't finish, which is its outcome, like the per-attempt
             // cap. Otherwise the window is shared with earlier calls (reached
             // only when the per-attempt cap exceeds the window), and the rest
             // of the attempt waits for it like a rung's start.
-            if (calls >= MAX_WINDOW_CALLS) { abortReason = 'window-call-cap'; return false; }
+            if (calls >= MAX_WINDOW_CALLS) { abortReason = capTripped = 'window-call-cap'; return false; }
             const windowWait = this.splitWindowWait(1, MAX_WINDOW_CALLS, WINDOW_MS);
             if (windowWait) throw windowWait;
             const partTokens = sentTokens.slice(a, b + 1).reduce((n, c) => n + c, 0);
@@ -11022,6 +11058,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             } else {
               trace.outcome = assessment.outcome;
               if (assessment.outcome === 'provider_error') { abortReason = `provider-error:${assessment.errorType ?? 'unclassified'}`; return false; }
+              // Each piece's empty or incomplete answer is the library's verdict
+              // on a call, reported as it's made, whether the rung goes on to
+              // split the piece or ends here. A refusal reports nothing.
+              this.reportCompressionRefusal(assessment.outcome);
             }
             }
             // Refused (or empty): split at a lawful boundary, never inside a tool round.
@@ -11143,6 +11183,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               ...(abortReason ? { errorType: rejectedAs ?? abortReason } : {}),
             };
             noteOutcome(splitOutcome);
+            // A cap's trip ends the rung before a call, a refusal the library
+            // makes itself; its record stays a refusal, which reports nothing.
+            // Each piece's empty or incomplete answer was reported as it came,
+            // and a malformed piece is reported through noteOutcome.
+            if (capTripped !== undefined) {
+              this.hostContext?.observer?.compression?.({ reason: capTripped });
+            }
             this.diag.error(`[autobiographical] split-stitch abandoned for chunk ${chunk.index}: ${reason} after ${calls} call(s), ${parts.length} piece(s) discarded (receipts only)`);
             logCompressionCall({ event: 'compression:split-stitch-abandoned', operation: 'compress_l1', metadata: { quarantine_key: quarantineRecord.key, leaf_hash: leafHash, reason, calls, attempted, piecesDiscarded: parts.length } }, this.ns);
           }
@@ -12510,6 +12557,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             model: this.requireCompressionModel(),
           },
         }, this.ns);
+        this.reportCompressionRefusal(assessment.outcome, errorType);
         throw new MergeDispositionRejection(
           targetLevel, assessment.outcome, requestHash, stopReason, errorType,
         );
@@ -12533,6 +12581,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           `[autobiographical] L${targetLevel} merge generation was all <thinking> preamble — ` +
             `rejecting for retry (${sources.length} sources left unmerged)`,
         );
+        this.reportCompressionRefusal('unusable_empty');
         throw new MergeDispositionRejection(
           targetLevel, 'unusable_empty', requestHash, 'end_turn',
         );
@@ -13242,7 +13291,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
       throw this.overBudgetError(budget, {
-        stage: 'Head/tail reservation exceeded budget',
+        ...overBudgetStage('head-tail-reservation'),
         budget: rejectionBudget,
         actual: headTokens + tailTokens,
         clearedBy: headTokens + floorTokens <= rejectionBudget ? ['smaller-recent-window'] : [],
@@ -13766,7 +13815,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const middleChunkCountDiag = middleChunkCount;
     const emissionOverBudget = (attempted: number): OverBudgetError =>
       this.overBudgetError(budget, {
-        stage: 'Emission overran the plan (planner/emitter estimator drift)',
+        ...overBudgetStage('emission-overran-plan'),
         budget: rejectionBudget,
         actual: attempted + tailTokens,
         clearedBy: planClearedBy(),
@@ -13975,7 +14024,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const tailStats = this.emitRecentNewestFirst(entries, store, messages, effectiveRecentStart, msgCap, rejectionBudget, totalTokens, pse);
     if (tailStats.messages !== messages.length - effectiveRecentStart) {
       throw this.overBudgetError(budget, {
-        stage: 'Tail emission dropped reserved recent-window messages',
+        ...overBudgetStage('tail-emission-dropped'),
         budget: rejectionBudget,
         actual: totalTokens + tailTokens,
         clearedBy: planClearedBy(),
@@ -14036,7 +14085,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       );
       if (!newestRetained) {
         throw this.overBudgetError(budget, {
-          stage: 'Structural repair did not retain the newest turn',
+          ...overBudgetStage('repair-lost-newest-turn'),
           budget: rejectionBudget,
           actual: totalTokens + tailTokens,
           // The newest turn is what's missing: the repair trimmed it as an
@@ -14194,6 +14243,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           `(est=${Math.round(est / 1000)}k real=${Math.round(realTotal / 1000)}k) — ` +
           `not a window-shaped request; multiplier stays ${this._calibration.toFixed(2)}`,
       );
+      this.hostContext?.observer?.calibration?.({ outcome: 'out-of-band', ratio, multiplier: this._calibration });
       return;
     }
 
@@ -14225,6 +14275,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         );
         this.persistCalibration();
       }
+      this.hostContext?.observer?.calibration?.({ outcome: provisional ? 'confirmed' : 'held', ratio, multiplier: current });
       return;
     }
     this.diag.error(
@@ -14235,6 +14286,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._calibration = clamped;
     this.applyCalibration();
     this.persistCalibration();
+    this.hostContext?.observer?.calibration?.({ outcome: provisional ? 'replaced' : 'stepped', ratio, multiplier: clamped });
   }
 
   /** Write the multiplier in force under the current pricing stamp, with the
@@ -16092,7 +16144,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     }
     if (changeTokens > graceLimit) {
       throw this.overBudgetError(budget, {
-        stage: 'Hierarchical: its system changes alone exceed the budget',
+        ...overBudgetStage('hierarchical-system-changes'),
         budget: graceLimit,
         actual: changeTokens,
         clearedBy: [],
@@ -16122,7 +16174,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // messages no summary covers. Refuse honestly beyond grace.
       if (totalTokens + tokens > graceLimit) {
         throw this.overBudgetError(budget, {
-          stage: 'Hierarchical emission overran the budget',
+          ...overBudgetStage('hierarchical-emission-overran'),
           budget: graceLimit,
           actual: totalTokens + tokens,
           // The head is sent whole by definition, and its size is cold
@@ -16187,7 +16239,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const prefix = new Set<MessageId>(refused.raw.map((m) => m.id));
       for (const s of refused.summaries) this.expandSummaryToLeafMessageIds(s, summariesById, prefix);
       return this.overBudgetError(budget, {
-        stage: 'Hierarchical emission overran the budget',
+        ...overBudgetStage('hierarchical-emission-overran'),
         budget: graceLimit,
         actual: refused.actual,
         clearedBy: this.compressionWorkQueued(store, 'hierarchical', prefix) ? ['compression'] : [],
