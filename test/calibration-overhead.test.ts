@@ -88,7 +88,7 @@ describe('estimator calibration and request overhead (#323)', () => {
     strategy.reportRealInputTokens(window + overhead, { system: SYSTEM, tools });
     await cm.compile(BUDGET);
     strategy.reportRealInputTokens(internals._lastCompileEstimate + overhead, { system: SYSTEM, tools });
-    assert.equal(internals._calibration, 1, 'neither the first sample, which sets a store with no record, nor the second, which steps it, moves it from 1');
+    assert.equal(internals._calibration, 1, 'neither sample moves it from 1: the first confirms the provisional 1 of a store with no record, and the second is an EMA step');
     cm.close();
   });
 

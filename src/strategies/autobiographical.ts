@@ -1860,6 +1860,7 @@ function imageGroup(block: ContentBlock): unknown {
  *  continue the run (see reportRealInputTokens). */
 const OUT_OF_BAND_RUN_LENGTH = 3;
 const OUT_OF_BAND_RUN_AGREEMENT = 0.1;
+const DECLARED_PAIR_AGREEMENT = 0.1;
 
 /**
  * Autobiographical chunking strategy.
@@ -13929,7 +13930,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const observed = ratio * current; // back out the multiplier already applied
     // SANITY BAND: a representative sample sits near 1. Anything wilder is a
     // structural mismatch (a request we didn't compile, a partial compile, a
-    // provider quirk) — never evidence about chars-per-token. Log, don't learn.
+    // provider quirk) — never evidence about chars-per-token. Log, don't learn,
+    // except a declared consistent run (below).
     // The band is also checked on the IMPLIED raw multiplier: when the
     // multiplier sits at a clamp edge because the per-class rates were wrong
     // (signed thinking at a flat 600) and the rates are then fixed, every
@@ -13977,22 +13979,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
     // A multiplier learned from samples that didn't declare their overhead
     // holds that overhead as a rate (#323).
-    const markDeclared = declared && !this._calibrationDeclared;
+    const declaredOnUnmarked = declared && !this._calibrationDeclared;
     let replacement: number | null = null;
-    if (markDeclared && !this._calibrationProvisional && !fromRun) {
+    if (declaredOnUnmarked && !this._calibrationProvisional && !fromRun) {
       const candidate = this._declaredCandidate;
       if (candidate === null) {
         this._declaredCandidate = observed;
         this.diag.error(
           `[estimator-calibration] real/est=${ratio.toFixed(2)} implies ${observed.toFixed(2)}: the first sample ` +
             `with its overhead declared, held for the next; if they agree within ` +
-            `${OUT_OF_BAND_RUN_AGREEMENT * 100}% their mean replaces the multiplier, and if not it steps; ` +
+            `${DECLARED_PAIR_AGREEMENT * 100}% their mean replaces the multiplier, and if not it steps; ` +
             `multiplier stays ${current.toFixed(2)} ${counts}`,
         );
         return;
       }
       this._declaredCandidate = null;
-      if (Math.abs(observed / candidate - 1) <= OUT_OF_BAND_RUN_AGREEMENT) replacement = (candidate + observed) / 2;
+      if (Math.abs(observed / candidate - 1) <= DECLARED_PAIR_AGREEMENT) replacement = (candidate + observed) / 2;
     } else if (declared) {
       this._declaredCandidate = null;
     }
@@ -14026,7 +14028,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         );
         if (declared) this._calibrationDeclared = true;
         this.persistCalibration();
-      } else if (markDeclared) {
+      } else if (declaredOnUnmarked) {
         this._calibrationDeclared = true;
         this.persistCalibration();
       }
@@ -14284,10 +14286,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * sample doesn't turn the guess into a learned value, and a later epoch's
    * load re-stamps it, still provisional, rather than discarding it again
    * over the reset it carries. A store with no record starts from a
-   * provisional 1 too (#328). It writes nothing until its first sample: with
-   * no record, each load decides the same. A dry run under a
-   * provisional multiplier above 1 takes the same fallback at the picker's
-   * refusal, which it otherwise only reports.
+   * provisional 1 too (#328). It writes nothing until its first sample. A dry
+   * run under a provisional multiplier above 1 takes the same fallback at the
+   * picker's refusal, which it otherwise only reports.
    *
    * A binary from before a bump still learns after a rollback, and its first
    * applied sample, or two declared samples that confirm and mark its 1,

@@ -493,7 +493,7 @@ describe('estimator calibration band', () => {
     }
   });
 
-  it('a calibration read that throws loads a learned 1, as before: the record it could not read may hold one worth keeping', async () => {
+  it('a calibration read that throws loads 1, not provisional, as before: the record it could not read may hold one worth keeping', async () => {
     const { cm, internals } = await openManager('fresh-unreadable');
     const store = internals.store as unknown as { getStateJson(id: string): unknown };
     const read = store.getStateJson;
@@ -762,8 +762,9 @@ describe('estimator calibration band', () => {
     const dropped = internals.store!.getStateJson(internals.calibrationStateId) as { multiplier?: number; provisional?: boolean; declaredOverhead?: boolean };
     assert.deepStrictEqual([dropped.multiplier, dropped.provisional, dropped.declaredOverhead], [1, true, undefined], 'the record the drop writes');
     strategy.reportRealInputTokens(internals._lastCompileEstimate * 1.01);
-    const saved = internals.store!.getStateJson(internals.calibrationStateId) as { multiplier?: number; declaredOverhead?: boolean };
-    assert.deepStrictEqual([saved.multiplier, saved.declaredOverhead], [1, undefined], 'an undeclared sample confirming the 1 writes no mark either');
+    const saved = internals.store!.getStateJson(internals.calibrationStateId) as { multiplier?: number; provisional?: boolean; declaredOverhead?: boolean };
+    assert.deepStrictEqual([saved.multiplier, saved.provisional, saved.declaredOverhead], [1, undefined, undefined],
+      'an undeclared sample confirming the 1 writes the record, with no mark either');
     cm.close();
   });
 
