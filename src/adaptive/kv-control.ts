@@ -526,6 +526,10 @@ function relevanceCut(
     const olderListed = new Int32Array(n); // the next older listed position, or -1
     const youngerListed = new Int32Array(n); // the next younger listed position, or n
     const listed = new Uint8Array(n);
+    // Phase C's pass and visit counts (KV_TIMING). They come before
+    // `listedCounts`, whose search counts each of its steps as a visit.
+    let passes = 0;
+    let visits = 0;
     // Listed counts by position (a Fenwick tree), so `relist` finds the next
     // older listed chunk in O(log n) rather than by scanning back over every
     // parked or raw one: one accept per pass can relist a group behind a long
@@ -594,8 +598,6 @@ function relevanceCut(
       for (const i of at) if ((F.get(ordered[i].id) ?? 0) >= 1) relist(i);
     };
     const _tc = typeof process !== 'undefined' && process.env?.KV_TIMING ? Date.now() : 0;
-    let passes = 0;
-    let visits = 0;
     let progressed = true;
     while (progressed && ledger.tokens < target) {
       progressed = false;

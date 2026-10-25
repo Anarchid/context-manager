@@ -606,10 +606,11 @@ test('phase C: a declined group isn\'t tried again when an accept moves a leaf i
 /**
  * R6-1's other half: where relist puts a chunk back. Its predecessor query,
  * `listedCounts(n).olderThan(i)`, must give the largest listed position below
- * i, or -1 when there's none, as the scan back did, in O(log n) steps. No
- * plan test sees a wrong answer here, since the walk only reorders which
- * group it tries first; this one checks the query against the scan over
- * random lists and unlists.
+ * i, or -1 when there's none, as the scan back did, in O(log n) steps. Which
+ * group the walk tries first decides which group takes the headroom, so a
+ * wrong answer could change a plan, though no sweep we ran found one that
+ * does; this test checks the query against the scan over random lists and
+ * unlists.
  */
 test('phase C: the walk list\'s predecessor query gives the next older listed position, as scanning back would, in O(log n) steps (R6-1)', () => {
   let seed = 156;
