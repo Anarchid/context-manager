@@ -13377,6 +13377,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       totalBudget,
       targetBudget: totalBudget * (1 - slack),
       slack,
+      // The line the plan check below refuses above.
+      rejectionBudget,
     };
 
     const headSetForPicker = new Set<ChunkId>(headMessageIds);
@@ -13603,8 +13605,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.handleProducedOps(shadowResult.produced, { speculative: true });
         } else if (shadowResult.exhausted) {
           this.diag.warn(
-            `autobio: production target ${prodBudget} unreachable even fully folded ` +
-              `(${shadowResult.finalTokens} tokens); lowering the live budget to it ` +
+            `autobio: production target ${prodBudget} unreachable: the solver's plan for it ` +
+              `is ${shadowResult.finalTokens} tokens; lowering the live budget to it ` +
               `would hard-fail with OverBudgetError`,
           );
         }
