@@ -20024,12 +20024,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * then `applyImageStripping`, so a message stored after the batch counts
    * toward the images as in a compile. The tool pass that comes between them
    * (postProcessToolEntries) is left out: it pairs by the window around these
-   * messages. What sending prunes from a message's tool blocks reaches it
-   * through `cappedForSend`. So the hierarchical select leaves out a newest
-   * message that holds a `tool_use` with no result after it, and the
-   * adaptive select refuses that compile, where the render gives the message
-   * as the cap leaves it; and both drop a `tool_result` whose call isn't
-   * sent before it.
+   * messages, so the hierarchical select leaves out a newest message that
+   * holds a `tool_use` with no result after it, and the adaptive select
+   * refuses that compile, where the render gives the message as the cap
+   * leaves it; and both drop a `tool_result` whose call isn't sent before
+   * it. What sending prunes from a message's tool blocks reaches the render
+   * through `cappedForSend`.
    *
    * Both selects send raw every message the view holds that no summary
    * covers, whichever region holds it: the head window, the middle (the
@@ -20049,6 +20049,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *   and a window, or across a reset head window's end with the history
    *   from before the reset between them, goes out in more than one entry.
    *   Here such a body comes back whole, as the windows join it.
+   *
+   * The form is the compile's, but not always the place: after a head-window
+   * reset, the head is sent ahead of the history from before the reset, and
+   * so is each system change stored before the head (headPositions), so
+   * those messages aren't sent last.
    *
    * Under adaptive resolution it loads the calibration as a dry select
    * does, so the store's estimates, by which the image depth is measured,

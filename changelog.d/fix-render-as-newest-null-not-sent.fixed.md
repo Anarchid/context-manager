@@ -13,9 +13,10 @@
   send together comes back whole, as the windows join it. The adaptive
   middle sends its shards' text alone, uncut, and a body across the middle
   and a window, or across a reset head window's end, goes out in more than
-  one entry. After a head-window reset the head is sent
-  before the history from before the reset, so its messages render in the
-  head's form but aren't sent last. A render no longer releases a
+  one entry. After a head-window reset the head is sent before the history
+  from before the reset, and so is each system change stored before the
+  head, so those messages render in the form the compile sends but aren't
+  sent last. A render no longer releases a
   compression hold that has timed out, since where a window starts no
   longer changes what it gives; the next add, compile, tick or hold query
   releases it, as each did before.
