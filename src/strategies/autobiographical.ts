@@ -13654,21 +13654,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       try {
         // With the line a compile at prodBudget refuses above, as the live
         // pick has its own, so the solver plans as that compile would.
+        const prodLine = Math.floor(prodBudget * (1 + overBudgetGraceRatio));
         const shadowResult = this.buildPicker(pickerInputs).run(pickerInputs, {
           totalBudget: prodBudget,
           targetBudget: prodBudget * (1 - slack),
           slack,
-          rejectionBudget: Math.floor(prodBudget * (1 + overBudgetGraceRatio)),
+          rejectionBudget: prodLine,
         });
         if (shadowResult.produced.length > 0) {
           this.handleProducedOps(shadowResult.produced, { speculative: true });
         } else if (shadowResult.exhausted) {
+          const plan =
+            `the solver's plan for it is ${shadowResult.finalTokens} tokens, over its soft target of ` +
+            `${Math.floor(prodBudget * (1 - slack))}, and it can fold no further with the summaries ` +
+            `the store has now and asks for none`;
           this.diag.warn(
-            `autobio: production target ${prodBudget} unreachable: the solver's plan for it ` +
-              `is ${shadowResult.finalTokens} tokens, over its soft target of ` +
-              `${Math.floor(prodBudget * (1 - slack))}, with nothing left to fold or produce; ` +
-              `a compile at that budget refuses a plan over ` +
-              `${Math.floor(prodBudget * (1 + overBudgetGraceRatio))} tokens with OverBudgetError`,
+            shadowResult.finalTokens > prodLine
+              ? `autobio: production target ${prodBudget} unreachable with the summaries the store has ` +
+                  `now: ${plan}; the plan check of a compile at that budget refuses a plan over ` +
+                  `${prodLine} tokens with OverBudgetError`
+              : `autobio: production target ${prodBudget}: ${plan}, but the plan is within the ` +
+                  `${prodLine} tokens the plan check of a compile at that budget refuses above`,
           );
         }
       } catch (err) {
