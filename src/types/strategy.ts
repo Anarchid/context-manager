@@ -1650,7 +1650,18 @@ export interface AutobiographicalConfig {
 
   /** Enable hierarchical 3-level compression. Set to false for single-level legacy compression. */
   hierarchical?: boolean;
-  /** Number of unmerged summaries before merging to the next level (default: 6) */
+  /**
+   * How many summaries the newest run of a level holds before they merge
+   * into one at the next level (default: 6), one fewer where that would
+   * leave a single summary behind, or the whole run where one fewer would be
+   * a group of one (three at a threshold of 2). An older run that can't grow, cut off by
+   * a hole or a hold, merges once it holds two, in groups as even as they
+   * can be that leave none of it alone; one whose hole a retried chunk or
+   * merge will fill grows as the newest does. A demand from the picker
+   * queues one of these groups too, a growing run's shorter rest included.
+   * Below 2, the merge check queues the oldest run's first `mergeThreshold`
+   * and a demand the longest in-range run's, which the merge refuses (#285).
+   */
   mergeThreshold?: number;
   /**
    * Bounded retry policy for L_n merges whose LLM response was rejected by
@@ -1666,9 +1677,8 @@ export interface AutobiographicalConfig {
    * Operator merge holds: summary ids that are never offered as merge
    * sources (a held summary that hasn't merged stays on the frontier, and
    * no summary above it forms). Held ids split the frontier into runs like
-   * a hole, so later history still merges around them. They still count as
-   * unmerged summaries: a held L1 toward `maxSpeculativeL1s`, and every
-   * held summary toward its level's `mergeThreshold`. The run of
+   * a hole, so later history still merges around them. A held L1 still
+   * counts as unmerged toward `maxSpeculativeL1s`. The run of
    * same-level summaries just before a held one can't grow past it, so it
    * merges as a run between two summaries does, which can be at two, below
    * `mergeThreshold`. Lifting a hold doesn't undo
@@ -2015,9 +2025,9 @@ export interface AutobiographicalConfig {
    * a compression hold over its sources. Chunks still form and queue, and
    * queued chunks don't count toward the cap.
    *
-   * With no L1 merge queued, the cap holds nothing. No merge forms below
-   * `mergeThreshold` unmerged L1s, so a cap below `mergeThreshold - 1` lets
-   * them rise to the threshold. Unmerged L1s that can never merge count
+   * With no L1 merge queued, the cap holds nothing. The newest run of L1s
+   * merges only once it holds `mergeThreshold`, so under a cap below
+   * `mergeThreshold - 1` it still rises to the threshold. Unmerged L1s that can never merge count
    * toward the cap without holding production. Under `hierarchical: false`
    * tick runs no merge, so the cap holds nothing.
    *
@@ -2201,7 +2211,8 @@ export type LegacySummaryLevel = 1 | 2 | 3;
 /**
  * A summary entry in the hierarchical memory pyramid.
  * L1: compressed from raw message chunks.
- * L_{k>1}: merged from mergeThreshold L_{k-1}s.
+ * L_{k>1}: merged from a run of L_{k-1}s: a group from the oldest end of
+ * the newest run, or a group of two or more from an older run.
  */
 export interface SummaryEntry {
   /** Unique ID (e.g., "L1-0", "L2-3") */
