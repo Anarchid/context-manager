@@ -6892,11 +6892,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *    it up.
    *
    *  - `level >= 2`: the picker has asked for an L_n covering a contiguous
-   *    range. We gather unmerged L_{n-1} summaries by
-   *    `enqueueMergeForRange`'s rule (a source counts when either of its
-   *    ends lies in the range; with a range end that has no position, every
-   *    source counts), de-duplicated against entries already in
-   *    `mergeQueue`, and enqueue a merge. The merge fires on the next `tick()`.
+   *    range, which `enqueueMergeForRange` queues. The merge fires on the
+   *    next `tick()`.
    *
    * The handler is conservative: it never enqueues a singleton or empty
    * merge, and it never re-enqueues an id that's already pending. That
@@ -6996,12 +6993,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     if (pushed) this.orderCompressionQueue();
   }
 
-  /**
-   * With a range end neither in the store listing nor owned by a chunk,
-   * which has no position, every source counts.
-   * No-op if fewer than 2 viable sources are available (a singleton merge
-   * would just rename a summary without consolidating).
-   */
   protected enqueueMergeForRange(
     targetLevel: number,
     firstMsgId: MessageId,

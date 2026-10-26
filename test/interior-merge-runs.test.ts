@@ -585,6 +585,13 @@ describe('demands (a picker\'s produce requests)', () => {
     assert.deepEqual(p.queued(), [['n0', 'n1', 'n2', 'n3', 'n4', 'n5']]);
   });
 
+  it('queue a newest run shorter than the threshold whole, as a growing run\'s rest', () => {
+    const p = probe();
+    p.setSummaries(run('n', 3, 0));
+    p.produce(2, 'm-0', 'm-9');
+    assert.deepEqual(p.queued(), [['n0', 'n1', 'n2']]);
+  });
+
 });
 
 describe('the stray list, getStrandedSummaries()', () => {
