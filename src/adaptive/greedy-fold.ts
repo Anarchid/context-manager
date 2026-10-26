@@ -42,9 +42,7 @@ export interface GreedyChunkView {
   ancestorAt(level: number): SummaryNode | null;
 }
 
-/** One greedy decision. A raise is `passedOver` when the step took it
- *  through a chunk it tried after passing another over for having no summary
- *  above it, a raise the same rule without passing over might not make. */
+/** One greedy decision. */
 export type GreedyOp =
   | { kind: 'raise'; groupRoot: SummaryId; passedOver: boolean }
   | { kind: 'produce'; request: ProduceRequest };
@@ -81,24 +79,17 @@ export type GreedyStep = (state: GreedyState, budget: FoldingBudget) => GreedyOp
  * at most maxLevel times.
  *
  * Each step function in `steps` is a rule for a whole solve, tried in order.
- * The first is the solver's rule. Each later one is a rule the solver used
- * before: the same rule without passing a chunk over. A solve that passed a
- * chunk over is the solution if its last plan fits the hard budget
- * (`totalBudget`). A solve that passed none over made exactly the moves a
- * later rule's solve would make, so it stands for them: it is the solution if
- * the caller accepts its last plan (within `rejectionBudget`), and no later
- * solve runs. So where the first rule's plan doesn't fit, the plan is the one
- * the earlier rule makes from the levels the store carries, which at the
- * first compile after upgrading is the plan the store got before.
- * A raise can grow the plan: it moves only the group's unprotected middle
- * leaves, and the summary's recall takes their place, so where the rest of
- * the group is pinned, locked or in the head or tail window, the summary can
- * cost more than what it replaces. So otherwise the solution is the plan with
- * the fewest tokens that a solve passed through, the starting plan included,
- * with the produce that solve asked for, the first solve's winning a tie.
- * Where that plan is the solve's last, the solve's own state is the solution;
- * otherwise its raises are replayed up to it. The caller refuses it if it's
- * over the caller's line.
+ * The first is the solver's rule: its solve is the solution if its last plan
+ * fits the hard budget (`totalBudget`). Each later one is a rule the solver
+ * used before: it is the solution if the caller accepts it (within
+ * `rejectionBudget`). A raise can grow the plan: it moves only the group's
+ * unprotected middle leaves, and the summary's recall takes their place, so
+ * where the rest of the group is pinned, locked or in the head or tail
+ * window, the summary can cost more than what it replaces. So otherwise the
+ * solution is the plan with the fewest tokens that any solve passed through,
+ * the starting plan included, with the produce that solve asked for, the
+ * first solve's winning a tie. The caller refuses it if it's over the
+ * caller's line.
  */
 export function runGreedy(inputs: PickerInputs, budget: FoldingBudget, steps: readonly GreedyStep[]): FoldingSolution {
   const accepted = budget.rejectionBudget ?? budget.totalBudget;
@@ -108,12 +99,10 @@ export function runGreedy(inputs: PickerInputs, budget: FoldingBudget, steps: re
     const line = solve.passedOver ? budget.totalBudget : accepted;
     if (solve.engine.tokenCount() <= line) return solutionOf(solve.engine, solve.produced, budget);
     solves.push(solve);
-    // It made a later rule's moves, so a later solve would repeat it.
     if (!solve.passedOver) break;
   }
   let best = solves[0]!;
   for (const solve of solves) if (solve.fewest.tokens < best.fewest.tokens) best = solve;
-  // Its last plan is its fewest: the solve's own state is that plan.
   if (best.fewest.raises === best.raises.length) return solutionOf(best.engine, best.produced, budget);
   const replayed = new GreedyEngine(inputs);
   for (const groupRoot of best.raises.slice(0, best.fewest.raises)) replayed.applyRaise(groupRoot);
@@ -121,9 +110,8 @@ export function runGreedy(inputs: PickerInputs, budget: FoldingBudget, steps: re
 }
 
 /** A whole solve under one step rule: its last plan, the produce it asked
- *  for, the raises it applied, the fewest-token plan it passed through, as
- *  the number of those raises that made it, and whether any raise passed a
- *  chunk over. */
+ *  for, the raises it applied, and the fewest-token plan it passed through,
+ *  as the number of those raises that made it. */
 interface Solve {
   engine: GreedyEngine;
   produced: ProduceRequest[];

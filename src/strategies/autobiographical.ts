@@ -13664,9 +13664,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (shadowResult.produced.length > 0) {
           this.handleProducedOps(shadowResult.produced, { speculative: true });
         } else if (shadowResult.exhausted) {
-          // Unreachable only over the line the plan check at that budget refuses above; within
-          // it, the plan check would let such a compile through. Both say "now", since the
-          // strategy also makes merges of its own, which can add summaries the solver lacked.
           const plan =
             `the solver's plan for it is ${shadowResult.finalTokens} tokens, over its soft target of ` +
             `${Math.floor(prodBudget * (1 - slack))}, and it can fold no further with the summaries ` +

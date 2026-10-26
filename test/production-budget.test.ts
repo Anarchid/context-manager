@@ -12,9 +12,8 @@
  *  - guards: no shadow pick when the target is unset, non-positive, or not
  *    below the live budget;
  *  - a throwing shadow pick never breaks the live compile;
- *  - an exhausted shadow with nothing to produce warns loudly instead of
- *    failing silently at descent time, and calls the target unreachable only
- *    when its plan is over the line a compile at the target refuses above;
+ *  - an unreachable target (exhausted shadow with nothing to produce) warns
+ *    loudly instead of failing silently at descent time;
  *  - speculative demand does not punch through the L1 holdback window;
  *  - `[kv-overlap]` reports the compile's own plan, once, and never the
  *    shadow pick's, which no compile renders.
@@ -243,11 +242,6 @@ describe('AutobiographicalStrategy — productionBudgetTokens', () => {
   });
 
   it('a target whose exhausted plan is within the line its compile refuses above is not called unreachable', async () => {
-    // The plan the shadow pick is left with here is head + tail alone, the
-    // same at any target: read it off the unreachable warning at a tiny one.
-    // Then take the target whose line, with a 2% grace, is exactly that plan:
-    // the plan is over the target and on its line, so within it. One token
-    // less of target puts the line under the plan.
     const grace = 0.02;
     const planAt = async (target: number): Promise<string[]> => {
       cleanup();

@@ -801,9 +801,6 @@ for (const [name, make] of greedySolvers) {
     assert.equal(result.finalResolutions.get('a0'), 2, 'a0 rises through P');
   });
 
-  // The same store and lines: no chunk is passed over, so the first solve
-  // made the oldest-only solve's moves, and its plan is judged at the
-  // caller's line without a second solve.
   test(`picker (${name}): a solve that passed no chunk over is the only one, judged at the caller's line`, () => {
     const { value, engines } = greedyEngines(() => runQuietly(make(), growingRaise(false), {
       totalBudget: 196, targetBudget: 120, slack: 76 / 196, rejectionBudget: 200,
@@ -812,9 +809,6 @@ for (const [name, make] of greedySolvers) {
     assert.equal(engines, 1);
   });
 
-  // a0 rises through A, 200 to 130, and nothing is left to raise, over a
-  // line of 100: the solve's last plan is its fewest, so it is the solution
-  // as the solve left it, with no plan replayed.
   test(`picker (${name}): where the fewest-token plan is a solve's last, it is the solution with no replay`, () => {
     const inputs = greedyStore([['a0', 'A']], [['A', 1, ['a0'], 30]]);
     inputs.chunks[1]!.rawTokens = 100;
@@ -825,10 +819,6 @@ for (const [name, make] of greedySolvers) {
     assert.equal(engines, 1);
   });
 
-  // growingRaise's store with P costing 30, as A does: a0 rises through A
-  // (200 to 130), then through P (130 stays 130), over a line of 100. The
-  // last plan ties the fewest but isn't it, so the solution is the earlier
-  // plan, a0 through A, replayed, as when both solves ran.
   test(`picker (${name}): where a solve's last plan only ties its fewest, the earlier plan is the solution`, () => {
     const store = growingRaise(false);
     const inputs = { ...store, summaries: new Map(store.summaries).set('P', { ...store.summaries.get('P')!, tokens: 30 }) };
@@ -893,7 +883,6 @@ test('picker (flat-profile): where no plan is within the line, the fewest-token 
   assert.equal(result.finalResolutions.get('a0'), 1, 'a0 stays at A');
   assert.equal(result.finalResolutions.get('c0'), 1, 'c0 rises through C');
   assert.deepEqual(result.produced, [{ level: 2, range: { firstChunkId: 's0', lastChunkId: 's0' } }]);
-  // The oldest-only solve's 180 is its last plan: the two solves, and no replay.
   assert.equal(engines, 2);
 });
 
@@ -995,9 +984,6 @@ test('picker (flat-profile): passing over a chunk, a step takes the next chunk a
   assert.deepEqual(unrealizable, []);
 });
 
-// How many greedy solves and replays `run` started: each greedy engine reads
-// every unpinned chunk's level once as it starts (greedy-fold.ts), and
-// nothing else in a greedy solver does.
 function greedyEngines<T>(run: () => T): { value: T; engines: number } {
   const original = SummaryTree.prototype.renderableLevel;
   const chunks = new Set<string>();
