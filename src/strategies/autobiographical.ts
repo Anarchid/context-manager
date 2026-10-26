@@ -20040,9 +20040,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * these steps give a message's form wherever the compile places it, and
    * no id the view holds comes back as null. Two kinds of message differ.
    * - A message a summary covers comes back raw, while the compile sends its
-   *   summary where its plan folds it. Rendered raw, its images also count
+   *   summary where its plan folds it. Under the hierarchical select without
+   *   `imageStripHysteresisRatio`, its images, rendered raw, also count
    *   toward the image limits of the messages older than it, where the
-   *   compile, sending its summary, doesn't count them.
+   *   compile, sending its summary, doesn't count them. The adaptive select,
+   *   and every path under `imageStripHysteresisRatio`, count every stored
+   *   message's images, folded or not, as the render does.
    * - A body whose shards the compile doesn't send together. The adaptive
    *   middle, kv-unified's included, sends a raw run of a body's shards as
    *   their text alone, uncut. A body whose shards sit across the middle
