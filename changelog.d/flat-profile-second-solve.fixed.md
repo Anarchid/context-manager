@@ -3,7 +3,7 @@
   ended over the hard budget, the solver solved again taking only the oldest
   chunk. A solve that passed no chunk over had already made exactly that rule's
   moves, so the second solve repeated it move for move, about doubling the
-  planner's work for such compiles, those that go through within
+  planner's work for such compiles, those the plan check lets through within
   `overBudgetGraceRatio` included, and for the shadow pick at
   `productionBudgetTokens` when it hasn't converged. Such a solve's own plan is
   now judged at the line the compile refuses above, and the solver doesn't
@@ -15,7 +15,7 @@
   it.
 - The `productionBudgetTokens` warning calls the target unreachable only when
   the solver's plan is over the line a compile at that budget refuses above
-  (`overBudgetGraceRatio`). Within that line, where such a compile goes
-  through, it says the plan is over the soft target but within the line. Both
-  forms say the solver can fold no further with the summaries the store has
-  now.
+  (`overBudgetGraceRatio`). Within that line, where the plan check lets such a
+  compile through, it says the plan is over the soft target but within the
+  line. Both forms say the solver can fold no further with the summaries the
+  store has now.
