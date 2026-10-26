@@ -31,7 +31,8 @@ export class OldestFirstStrategy implements FoldingSolver {
 
 /** The step's rule: pass over a chunk with no summary above it. Where a
  *  solve that passes over ends over the hard budget, the solve that takes
- *  only the oldest chunk, this solver's rule before, is tried (runGreedy). */
+ *  only the oldest chunk, this solver's rule before, is tried, unless the
+ *  first passed none over and so made its moves already (runGreedy). */
 const passingOver: GreedyStep = (state, budget) => oldestFirstStep(state, budget, true);
 const oldestOnly: GreedyStep = (state, budget) => oldestFirstStep(state, budget, false);
 
@@ -50,7 +51,9 @@ function oldestFirstStep(state: GreedyState, budget: FoldingBudget, passOver: bo
   // chunk's group.
   const oldest = middle[0];
   let parent: SummaryNode | null = null;
+  let tried = oldest;
   for (const chunk of middle) {
+    tried = chunk;
     parent = state.nextAncestor(chunk);
     if (parent || !passOver) break;
   }
@@ -66,5 +69,5 @@ function oldestFirstStep(state: GreedyState, budget: FoldingBudget, passOver: bo
     return { kind: 'produce', request: { level: targetLevel, range } };
   }
 
-  return { kind: 'raise', groupRoot: parent.id };
+  return { kind: 'raise', groupRoot: parent.id, passedOver: tried !== oldest };
 }

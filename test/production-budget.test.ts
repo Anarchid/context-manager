@@ -12,8 +12,9 @@
  *  - guards: no shadow pick when the target is unset, non-positive, or not
  *    below the live budget;
  *  - a throwing shadow pick never breaks the live compile;
- *  - an unreachable target (exhausted shadow with nothing to produce) warns
- *    loudly instead of failing silently at descent time;
+ *  - an exhausted shadow with nothing to produce warns loudly instead of
+ *    failing silently at descent time, and calls the target unreachable only
+ *    when its plan is over the line a compile at the target refuses above;
  *  - speculative demand does not punch through the L1 holdback window;
  *  - `[kv-overlap]` reports the compile's own plan, once, and never the
  *    shadow pick's, which no compile renders.
@@ -239,6 +240,47 @@ describe('AutobiographicalStrategy — productionBudgetTokens', () => {
       `expected an unreachable-target warning, got: ${JSON.stringify(warnings)}`,
     );
     manager.close();
+  });
+
+  it('a target whose exhausted plan is within the line its compile refuses above is not called unreachable', async () => {
+    // The plan the shadow pick is left with here is head + tail alone, the
+    // same at any target: read it off the unreachable warning at a tiny one.
+    // Then take the target whose line, with a 2% grace, is exactly that plan:
+    // the plan is over the target and on its line, so within it. One token
+    // less of target puts the line under the plan.
+    const grace = 0.02;
+    const planAt = async (target: number): Promise<string[]> => {
+      cleanup();
+      warnings = [];
+      const strategy = makeStrategy({
+        recentWindowTokens: 100_000,
+        productionBudgetTokens: target,
+        overBudgetGraceRatio: grace,
+      });
+      const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+      addConversation(manager, 10);
+      await manager.compile({ maxTokens: 50_000, reserveForResponse: 200 });
+      manager.close();
+      return warnings.filter((w) => w.includes('production target'));
+    };
+    const tiny = await planAt(100);
+    const plan = Number(/plan for it is (\d+) tokens/.exec(tiny.join(' '))?.[1]);
+    assert.ok(plan > 100, `expected the plan's size in ${JSON.stringify(tiny)}`);
+    let target = Math.ceil(plan / (1 + grace));
+    while (Math.floor((target - 1) * (1 + grace)) >= plan) target--;
+    while (Math.floor(target * (1 + grace)) < plan) target++;
+    assert.equal(Math.floor(target * (1 + grace)), plan, `no target has its line at ${plan}`);
+    assert.ok(target < plan);
+
+    const onLine = await planAt(target);
+    assert.equal(onLine.length, 1, `expected one line, got: ${JSON.stringify(onLine)}`);
+    assert.ok(!onLine[0]!.includes('unreachable'), onLine[0]);
+    assert.ok(onLine[0]!.includes(`plan for it is ${plan} tokens`), onLine[0]);
+    assert.ok(onLine[0]!.includes(`within the ${plan} tokens`), onLine[0]);
+
+    const overLine = await planAt(target - 1);
+    assert.equal(overLine.length, 1, `expected one line, got: ${JSON.stringify(overLine)}`);
+    assert.ok(overLine[0]!.includes('unreachable'), overLine[0]);
   });
 
   it('speculative demand does not punch through the L1 holdback window', async () => {

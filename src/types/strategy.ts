@@ -2129,9 +2129,11 @@ export interface AutobiographicalConfig {
    * fold-storm, a single KV invalidation ("produce first, fold once").
    * If the shadow pick runs out of folds and produce requests with its plan
    * still over the target's soft line, the compile warns, giving the plan's
-   * size and the line above which a compile at the target is refused with
-   * OverBudgetError: lowering the live budget to the target fails only while
-   * the plan is over that line. Shadow demand is
+   * size and the line above which the plan check of a compile at the target
+   * refuses it with OverBudgetError, and calls the target unreachable with
+   * the summaries the store has then only when the plan is over that line:
+   * the plan check refuses a compile at the target only while it is, though
+   * a later stage can refuse it as at any budget. Shadow demand is
    * speculative and never bypasses the `l1HoldbackChunks` window. Must be
    * positive; no effect unless lower than the live compile budget.
    */

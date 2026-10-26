@@ -12,13 +12,16 @@
   newer summaries. Under `oldest-first` that includes ordinary stores, whose
   oldest chunk reaches the top of its lineage. Other stores that compile today
   are planned as before.
-- When a solve that passes over ends over the hard budget, the solver solves
-  again taking only the oldest chunk, as before this release, and returns that
-  plan wherever the compile accepts it (within the budget and its
-  `overBudgetGraceRatio`), which is the plan the store got before. So where
+- When a solve that passes over ends over the hard budget, the solver falls
+  back on taking only the oldest chunk, as before this release: it returns
+  that rule's plan, from the levels the store carries, wherever the compile
+  accepts it (within the budget and its `overBudgetGraceRatio`). At the first
+  compile after upgrading, that is the plan the store got before, so where
   the plan that passes over doesn't fit, a store that compiled before still
-  compiles, with the same plan. Otherwise it returns the plan with the fewest
-  tokens that either solve passed through, with that solve's request for a
+  compiles, with the plan it had. A solve that passed no chunk over made
+  exactly that rule's moves, so its own plan is judged at that line, and the
+  solver doesn't solve again. Otherwise it returns the plan with the fewest
+  tokens that a solve passed through, with that solve's request for a
   missing summary, and the compile refuses it if it is over. A raise folds
   only the group's unprotected leaves, and the summary takes their place, so
   where the rest of the group was pinned, locked or in the head or tail, a
