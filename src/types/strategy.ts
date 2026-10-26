@@ -8,7 +8,6 @@ import type {
   PendingWork,
 } from './context.js';
 import type { OverBudgetClearedBy } from '../adaptive/picker.js';
-import type { ContextObserver } from '../observer.js';
 import { DEFAULT_IMAGE_BYTE_CEILING, DEFAULT_IMAGE_CEILING } from '../live-image-limits.js';
 
 /**
@@ -115,12 +114,6 @@ export interface StrategyContext {
    * CompressionWithdrawn).
    */
   membrane?: Membrane;
-  /**
-   * The host's observer (`ContextManagerConfig.observer`), already isolated:
-   * a strategy reports its compression refusals and calibration samples to it
-   * and needs no guard of its own. Absent when the host gave none.
-   */
-  observer?: ContextObserver;
   /** Current sequence number */
   currentSequence: Sequence;
   /**
@@ -2371,9 +2364,14 @@ export interface ProtectedRange {
    * (`foldingStrategy: 'kv-stable'` and `'kv-unified'`, with
    * `adaptiveResolution`). There a level above 0 doesn't keep the range raw:
    * it is still compressed, since only a summary can supply that level.
-   * Under kv-unified, a pinned level on a message between the head window
-   * and the recent window that no summary supplies yet is a constraint
-   * conflict, and every compile fails until one does. Under
+   * Under kv-unified, until a summary over a message supplies it, the message
+   * is held at the deepest level below it that a summary over the message
+   * does supply, raw when none does, and it moves to the pinned level once
+   * that exists; kv-unified logs when it starts and stops holding a pin. A
+   * message of system changes stays raw whatever the pins, so a pin over one
+   * neither holds nor moves it, and the log doesn't count it. On
+   * a message in the folded middle, a lock at another level still conflicts
+   * with the pin, whether or not the pinned level exists yet. Under
    * any other selector, and without adaptive resolution, the range is raw (a
    * safe superset). The canonical L1 compression prompt shows raw what the
    * configured selector keeps raw, where its budgets allow (see
@@ -2398,8 +2396,8 @@ export interface ProtectedRange {
 export interface PinLevelOptions {
   name?: string;
   /** Pin at this level (0 = raw): fixes the cut through the L_k node, with
-   *  kv-stable's exceptions for a chunk its summaries don't reach there
-   *  (`ProtectedRange.level`). */
+   *  kv-stable's exceptions for a chunk its summaries don't reach there and,
+   *  under kv-unified, once a summary supplies it (`ProtectedRange.level`). */
   level?: number;
   /** Fold no deeper than this level (hard cap; `0` ≡ classic pin-raw). */
   maxLevel?: number;
