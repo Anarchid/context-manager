@@ -10,8 +10,9 @@
   solve again. Where a solve's fewest-token plan is its last, that plan is no
   longer replayed. Plans, token counts and summary requests are unchanged.
 - 0.22.1's entry said that fallback returns the plan the store got before. It
-  returns the oldest-only rule's plan from the levels the store carries, which
-  is the plan the store had at the first compile after upgrading.
+  returns the oldest-only rule's plan from the levels the store carries. That
+  is the plan the store got before the upgrade only at the first compile after
+  it.
 - The `productionBudgetTokens` warning calls the target unreachable only when
   the solver's plan is over the line a compile at that budget refuses above
   (`overBudgetGraceRatio`). Within that line, where such a compile goes
