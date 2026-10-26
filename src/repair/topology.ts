@@ -697,7 +697,6 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
       return { kind, id: kind === 'refolded' ? `${span.first}..${span.last}` : s.releasedFrom ?? s.pendingFrom ?? s.id, level: s.level ?? 1, leaves, span };
     };
     const leftKeys = new Map<(typeof plan.strandedLeft)[number], string>();
-    const partneredKeys = new Map<(typeof plan.partnered)[number], string>();
     for (let now = project(), more = true; more;) {
       more = false;
       for (const x of straysOf(now.state)) {
@@ -727,7 +726,6 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
         if (freed === 'no neighbour to free' || freed === 'neighbours before rebuildSince') { left(freed); continue; }
         const taken = { ...entry, dissolved: freed };
         plan.partnered.push(taken);
-        partneredKeys.set(taken, strayKey(x));
         now = project();
         more = true;
         break;
@@ -738,7 +736,6 @@ export function planTopologyRepair(inputs: RepairInputs, options: RepairOptions 
       const strays = straysOf(now.state);
       const current = new Set(strays.map(strayKey));
       plan.strandedLeft = plan.strandedLeft.filter((listed) => current.has(leftKeys.get(listed)!));
-      plan.partnered = plan.partnered.filter((taken) => !current.has(partneredKeys.get(taken)!));
       const listed = new Set(plan.strandedLeft.map((x) => leftKeys.get(x)!));
       for (const x of strays) {
         if (listed.has(strayKey(x))) continue;

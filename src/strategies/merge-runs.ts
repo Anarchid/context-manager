@@ -140,7 +140,7 @@ export function runsAtLevel<S extends RunSummary>(
   // whichever comes first, so it waits only for a retry pending before that.
   const waitsFor = (end: number, next: number): boolean => {
     const bound = Math.min(next, heldFirsts.find((p) => p > end) ?? Infinity) - 1;
-    return bound > end && pending.some((p) => p.level <= level && p.first <= bound && p.last >= end + 1);
+    return pending.some((p) => p.level <= level && p.first <= bound && p.last >= end + 1);
   };
   const runs: MergeRun<S>[] = [];
   let run: Placed<S>[] = [];
