@@ -35,7 +35,6 @@ import type {
   SelectOptions,
   PreviewResult,
   RenderedSummaryInfo,
-  ThinkingBinding,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
 import { getSummaryParentId } from '../types/strategy.js';
@@ -2543,11 +2542,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Non-committing "what would the context look like at these settings".
+   * Null on the hierarchical path when its select succeeds, since that path
+   * has no fold plan to preview; an over-budget select there is still
+   * reported as an infeasible preview.
    *
-   * Runs a dry-run select at `budget`, optionally with a scoped config swap for
-   * knobs that are otherwise recipe-and-restart only (tail, head window, chunk
-   * size, merge threshold, folding strategy...). Commits nothing: no resolution
-   * persistence, no compression enqueue, no transition bookkeeping.
+   * Runs a dry-run select at `budget`, with the select options it is given
+   * (`opts`, all but `dryRun`, which is always set), optionally with a scoped
+   * config swap for knobs that are otherwise recipe-and-restart only (tail,
+   * head window, chunk size, merge threshold, folding strategy...). Commits
+   * nothing: no resolution persistence, no compression enqueue, no
+   * transition bookkeeping.
    *
    * Two things this deliberately does NOT do:
    *  - It does not apply anything. Applying is `updateHotContextSettings` (for
@@ -2567,8 +2571,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     log: ContextLogView,
     budget: TokenBudget,
     overrides?: AutobiographicalOptions,
-    opts?: { render?: boolean; thinkingBinding?: ThinkingBinding },
-  ): PreviewResult {
+    opts?: { render?: boolean } & Omit<SelectOptions, 'dryRun'>,
+  ): PreviewResult | null {
     this.requireLoadedBranch('previewContext');
     if (this._previewInFlight) {
       throw new Error('previewContext is already running; previews must not overlap');
@@ -2602,7 +2606,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       let rendered: ContextEntry[] | undefined;
       try {
-        const out = this.select(store, log, budget, { dryRun: true, thinkingBinding: opts?.thinkingBinding });
+        const { render: _render, ...selectOptions } = opts ?? {};
+        const out = this.select(store, log, budget, { ...selectOptions, dryRun: true });
         // Only retained on request: these are full rendered entries and can be
         // megabytes on a large store.
         if (opts?.render) rendered = out;
@@ -2642,12 +2647,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Cast on read: control-flow narrowing still has this pinned to
       // `undefined` from the reset above, but selectAdaptive fills it in.
       const preview = this._lastPreview as PreviewResult | undefined;
-      if (!preview) {
-        // selectHierarchical path: no picker, so no fold plan to preview.
-        throw new Error(
-          'previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview',
-        );
-      }
+      // The hierarchical path has no picker, so no fold plan to preview.
+      if (!preview) return null;
       // Segment breakdown for the hypothetical compile, which select() kept
       // apart from the live one. Lets a caller show the previewed
       // head/middle/tail split without re-deriving it.
@@ -15571,7 +15572,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /** Validate the audited transition input at the last possible boundary.
-   * Any malformed, unknown, or expired relaxation restores the normal weight. */
+   * Any malformed, unknown, or expired relaxation restores the normal weight.
+   * A dry run logs neither line, since a preview isn't the live state. */
   protected kvUnifiedContinuityMultiplier(
     relaxation?: SelectOptions['kvUnifiedContinuityRelaxation'],
   ): number {
@@ -15588,13 +15590,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       Number.isFinite(relaxation.expiresAt) &&
       (relaxation.multiplier === 1 || relaxation.expiresAt > Date.now());
     if (!validReason || !validMultiplier || !active) {
-      this.diag.warn('[kv-continuity-relaxation] invalid or expired input; continuity remains at 1');
+      if (!this._dryRunSelect) this.diag.warn('[kv-continuity-relaxation] invalid or expired input; continuity remains at 1');
       return 1;
     }
-    this.diag.error(
-      `[kv-continuity-relaxation] reason=${relaxation.reason} ` +
-      `multiplier=${relaxation.multiplier} expiresAt=${new Date(relaxation.expiresAt).toISOString()}`,
-    );
+    if (!this._dryRunSelect) {
+      this.diag.error(
+        `[kv-continuity-relaxation] reason=${relaxation.reason} ` +
+        `multiplier=${relaxation.multiplier} expiresAt=${new Date(relaxation.expiresAt).toISOString()}`,
+      );
+    }
     return relaxation.multiplier;
   }
 

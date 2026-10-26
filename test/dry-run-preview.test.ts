@@ -629,3 +629,109 @@ describe('AutobiographicalStrategy — a plain dry compile commits nothing', () 
     }
   });
 });
+
+describe('previewContext — the compile it previews', () => {
+  before(cleanup);
+  after(cleanup);
+  beforeEach(cleanup);
+
+  it('returns null on the hierarchical path, as ContextManager.previewContext is documented to', async () => {
+    const strategy = makeStrategy({ adaptiveResolution: false });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      addConversation(manager);
+      const budget = { maxTokens: 100_000, reserveForResponse: 200 };
+      // The select itself succeeds: a committing compile at this budget does.
+      await manager.compile(budget);
+      assert.strictEqual(manager.previewContext(budget), null);
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('runs its dry select with the select options a compile takes', async () => {
+    class OptionsSpy extends SpyStrategy {
+      seen: Array<{ hash?: string; relaxation?: unknown }> = [];
+      protected buildPicker(
+        inputs: PickerInputs,
+        preparedBudget?: { totalBudget: number; targetBudget: number },
+        immutablePrefixHash?: string,
+        continuityRelaxation?: unknown,
+      ): Picker {
+        this.seen.push({ hash: immutablePrefixHash, relaxation: continuityRelaxation });
+        return (AutobiographicalStrategy.prototype as unknown as {
+          buildPicker(this: unknown, ...args: unknown[]): Picker;
+        }).buildPicker.call(this, inputs, preparedBudget, immutablePrefixHash, continuityRelaxation);
+      }
+    }
+    const strategy = new OptionsSpy({
+      compressionModel: 'mock',
+      headWindowTokens: 0,
+      targetChunkTokens: 100,
+      recentWindowTokens: 200,
+      adaptiveResolution: true,
+      autoTickOnNewMessage: false,
+    });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      addConversation(manager);
+      const budget = { maxTokens: 100_000, reserveForResponse: 200 };
+      const relaxation = { reason: 'infrastructure' as const, multiplier: 0.5, expiresAt: Date.now() + 60_000 };
+      strategy.seen = [];
+      const preview = manager.previewContext(budget, undefined, {
+        kvUnifiedImmutablePrefixHash: 'prefix-hash-1',
+        kvUnifiedContinuityRelaxation: relaxation,
+      });
+      assert.ok(preview, 'the adaptive path previews');
+      assert.deepStrictEqual(strategy.seen, [{ hash: 'prefix-hash-1', relaxation }],
+        'the dry select builds its picker with the options the preview was given');
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('stays dry when its options carry dryRun: false', async () => {
+    const strategy = makeStrategy();
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      addConversation(manager);
+      await manager.compile({ maxTokens: 100_000, reserveForResponse: 200 });
+      const tight = { maxTokens: 2_000, reserveForResponse: 200 };
+      strategy.producedCalls = 0;
+      // The type keeps dryRun out of opts; a caller that passes it anyway
+      // still gets a dry select.
+      manager.previewContext(tight, undefined, { dryRun: false } as never);
+      assert.strictEqual(strategy.producedCalls, 0, 'the preview enqueued no produce ops');
+      // Control: a committing compile at that budget does.
+      await manager.compile(tight).catch(() => undefined);
+      assert.ok(strategy.producedCalls > 0, 'premise: a committing compile at this budget enqueues produce ops');
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('logs no continuity-relaxation line from a dry select', () => {
+    const strategy = makeStrategy();
+    const lines: string[] = [];
+    (strategy as unknown as { diag: unknown }).diag = {
+      error: (m: string) => lines.push(`error ${m}`),
+      warn: (m: string) => lines.push(`warn ${m}`),
+    };
+    const self = strategy as unknown as {
+      _dryRunSelect: boolean;
+      kvUnifiedContinuityMultiplier(r?: unknown): number;
+    };
+    const valid = { reason: 'infrastructure', multiplier: 0.5, expiresAt: Date.now() + 60_000 };
+    const expired = { reason: 'infrastructure', multiplier: 0.5, expiresAt: Date.now() - 1 };
+    self._dryRunSelect = true;
+    assert.strictEqual(self.kvUnifiedContinuityMultiplier(valid), 0.5);
+    assert.strictEqual(self.kvUnifiedContinuityMultiplier(expired), 1);
+    assert.deepStrictEqual(lines, [], 'a dry select logs neither line');
+    self._dryRunSelect = false;
+    assert.strictEqual(self.kvUnifiedContinuityMultiplier(valid), 0.5);
+    assert.strictEqual(self.kvUnifiedContinuityMultiplier(expired), 1);
+    assert.strictEqual(lines.length, 2, 'a committing select logs each');
+    assert.match(lines[0]!, /^error \[kv-continuity-relaxation\] reason=infrastructure multiplier=0\.5/);
+    assert.match(lines[1]!, /^warn \[kv-continuity-relaxation\] invalid or expired input/);
+  });
+});

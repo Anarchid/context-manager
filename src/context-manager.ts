@@ -33,7 +33,6 @@ import type {
   TimeRangeSummaryEntry,
   HotContextSettingsUpdate,
   RequestIdentity,
-  ThinkingBinding,
   SelectOptions,
   PreviewResult,
   HotContextSettingsStatus,
@@ -1943,15 +1942,21 @@ export class ContextManager {
   /**
    * Non-committing preview of the layout at a hypothetical budget and/or
    * settings. Commits nothing — see `AutobiographicalStrategy.previewContext`.
-   * Returns null when the active strategy has no fold plan to preview.
-   * `opts.thinkingBinding` previews a compile with that option: a binding
-   * one prices a summary's carriers as such a compile renders them (see
-   * `SelectOptions.thinkingBinding`); without it, as configured.
+   * Returns null when the active strategy has no fold plan to preview: one
+   * without `previewContext`, or `AutobiographicalStrategy`'s hierarchical
+   * path when its select succeeds (over the budget, that path still returns
+   * an infeasible preview). `opts` takes the select options a compile takes,
+   * all but `dryRun`, which is always set, and passes them to the dry select.
+   * Unlike `compile`, it doesn't refuse a binding option without its
+   * participant or identity up front. `opts.thinkingBinding` previews a
+   * compile with that option: a binding one prices a summary's carriers as
+   * such a compile renders them (see `SelectOptions.thinkingBinding`);
+   * without it, as configured.
    */
   previewContext(
     budget: TokenBudget,
     overrides?: Record<string, unknown>,
-    opts?: { render?: boolean; thinkingBinding?: ThinkingBinding },
+    opts?: { render?: boolean } & Omit<SelectOptions, 'dryRun'>,
   ): PreviewResult | null {
     this.requireInitialized('previewContext');
     const s = this.strategy as unknown as {
@@ -1960,8 +1965,8 @@ export class ContextManager {
         log: ReturnType<ContextLog['createView']>,
         budget: TokenBudget,
         overrides?: Record<string, unknown>,
-        opts?: { render?: boolean; thinkingBinding?: ThinkingBinding },
-      ) => PreviewResult;
+        opts?: { render?: boolean } & Omit<SelectOptions, 'dryRun'>,
+      ) => PreviewResult | null;
     };
     if (typeof s.previewContext !== 'function') return null;
     return s.previewContext(
