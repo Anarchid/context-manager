@@ -1485,6 +1485,14 @@ export interface AutobiographicalConfig {
    * behaviour. (Found 2026-07-26 bringing up Evander, claude-3-opus-20240229.)
    */
   compressionMaxTokens?: number;
+  /**
+   * Resident-specific compatibility for models that emit the complete memory
+   * as one CLOSED literal `<thinking>…</thinking>` TEXT wrapper. When true,
+   * compression only unwraps that exact whole-response shape into ordinary
+   * summary prose. Default false. Native thinking blocks and unclosed/mixed
+   * wrappers are never recovered.
+   */
+  recoverLiteralThinkingWrappedCompression?: boolean;
   /** Maximum tokens per individual message in compiled output. Messages exceeding
    *  this limit have their text/tool_result content truncated. A value that
    *  isn't a positive number, such as 0 or NaN, means no limit. */

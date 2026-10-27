@@ -445,6 +445,80 @@ describe('Merge terminal-disposition gate', () => {
     await fx.manager.close();
   });
 
+  it('opt-in recovers one closed whole-response thinking wrapper as ordinary summary prose', async () => {
+    const wrapped = '<thinking>\nI remember the field and the people who kept it.\n</thinking>';
+    const mock = scripted([{ stop: 'end_turn', text: wrapped }]);
+    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+
+    await fx.strategy.tick(ctx(fx.manager));
+
+    assert.equal(mock.calls.length, 1, 'no plain-prose retry needed');
+    const parent = fx.strategy.summariesView().find((s) => s.level === 2);
+    assert.equal(parent?.content, 'I remember the field and the people who kept it.');
+    assert.deepEqual(
+      parent?.responseContent,
+      [{ type: 'text', text: 'I remember the field and the people who kept it.' }],
+      'replay uses normalized public prose, not the pseudo-thinking wrapper',
+    );
+    assert.equal(fx.strategy.mergeQueueView().length, 0);
+    await fx.manager.close();
+  });
+
+  it('opt-in preamble-plus-public-suffix uses only the legacy suffix path', async () => {
+    const mock = scripted([{
+      stop: 'end_turn',
+      text: '<thinking>private-shaped preamble</thinking>the public memory body',
+    }]);
+    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+    await fx.strategy.tick(ctx(fx.manager));
+    const parent = fx.strategy.summariesView().find((s) => s.level === 2);
+    assert.equal(parent?.content, 'the public memory body');
+    assert.equal(parent?.responseContent, undefined, 'legacy text-only suffix stores no replay carrier');
+    assert.equal((parent?.content.match(/the public memory body/g) ?? []).length, 1);
+    await fx.manager.close();
+  });
+
+  it('opt-in recovers the short <think> spelling too', async () => {
+    const mock = scripted([{ stop: 'end_turn', text: '<think>short-form memory</think>' }]);
+    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+    await fx.strategy.tick(ctx(fx.manager));
+    assert.equal(fx.strategy.summariesView().find((s) => s.level === 2)?.content, 'short-form memory');
+    await fx.manager.close();
+  });
+
+  it('opt-in rejects multiple whole wrappers instead of persisting a residual tag', async () => {
+    const mock = scripted([{
+      stop: 'end_turn',
+      text: '<thinking>first</thinking><thinking>second</thinking>',
+    }]);
+    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+
+    await fx.strategy.tick(ctx(fx.manager));
+
+    assert.equal(fx.strategy.summariesView().filter((s) => s.level === 2).length, 0);
+    assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1);
+    await fx.manager.close();
+  });
+
+  it('opt-in never recovers a wrapper when native thinking blocks are also present', async () => {
+    const wrapped = '<thinking>\npublic pseudo-thinking body\n</thinking>';
+    const mock = scripted([{ raw: {
+      stopReason: 'end_turn',
+      content: [
+        { type: 'thinking', thinking: 'native private reasoning', signature: 'signed' },
+        { type: 'text', text: wrapped },
+      ],
+      usage: { inputTokens: 100, outputTokens: 40 },
+    } }]);
+    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+
+    await fx.strategy.tick(ctx(fx.manager));
+
+    assert.equal(fx.strategy.summariesView().filter((s) => s.level === 2).length, 0);
+    assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1);
+    await fx.manager.close();
+  });
+
   it('a thinking-wrapped merge generation is rejected and the retry carries the plain-prose line', async () => {
     // Opus-3-class summarizers wrap the entire memory in a literal
     // <thinking> tag (evander 2026-08-06). The text passes the disposition

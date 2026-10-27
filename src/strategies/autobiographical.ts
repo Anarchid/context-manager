@@ -1894,6 +1894,54 @@ export function stripThinkingPreamble(text: string): string {
   return text;
 }
 
+/**
+ * Opt-in compatibility for non-reasoning models whose entire authored memory
+ * is enclosed in one CLOSED literal thinking wrapper. This is intentionally
+ * narrower than `stripThinkingPreamble`: no suffix, no unclosed tag, no mid-
+ * content wrapper, and no native thinking block is accepted.
+ */
+export function unwrapWholeLiteralThinkingWrapper(text: string): string | null {
+  const match = text.match(
+    /^\s*<(think(?:ing)?)\s*>([\s\S]*)<\/\1\s*>\s*$/i,
+  );
+  if (!match) return null;
+  const body = match[2]!.trim();
+  if (!body || /<\/?\s*think(?:ing)?\b[^>]*>/i.test(body)) return null;
+  return body;
+}
+
+function hasLiteralThinkingLikeTag(text: string): boolean {
+  return /<\/?\s*think(?:ing)?\b[^>]*>/i.test(text);
+}
+
+function extractCompressionSummaryText(
+  text: string,
+  recoverWholeWrapper: boolean,
+): { text: string; recoveredWholeWrapper: boolean } {
+  if (recoverWholeWrapper) {
+    const recovered = unwrapWholeLiteralThinkingWrapper(text);
+    if (recovered !== null) return { text: recovered, recoveredWholeWrapper: true };
+
+    const openings = text.match(/<\s*think(?:ing)?\s*>/gi)?.length ?? 0;
+    const closings = text.match(/<\/\s*think(?:ing)?\s*>/gi)?.length ?? 0;
+    if (openings > 1 || closings > 1) return { text: '', recoveredWholeWrapper: false };
+
+    // Preserve the legacy public-suffix case for either spelling/case: one
+    // leading pseudo-thinking preamble followed by actual public prose.
+    const suffix = text.match(
+      /^\s*<(think(?:ing)?)\s*>[\s\S]*?<\/\1\s*>\s*([\s\S]+)$/i,
+    );
+    if (suffix?.[2]?.trim()) {
+      return { text: suffix[2].trim(), recoveredWholeWrapper: false };
+    }
+
+    // Any other think-like syntax under the opt-in is malformed/ambiguous.
+    // Fail closed instead of persisting a control-shaped residual.
+    if (hasLiteralThinkingLikeTag(text)) return { text: '', recoveredWholeWrapper: false };
+  }
+  return { text: stripThinkingPreamble(text), recoveredWholeWrapper: false };
+}
+
 function summarizeTelemetryMessages(
   messages: ReadonlyArray<{ participant: string; content: ContentBlock[] }>,
 ): Array<{
@@ -11108,14 +11156,22 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // progress: an end_turn whose text stripped to empty (recorded below
       // before the plain-prose rung was interrupted). It has no text.
       let acceptedResponse = response as NormalizedResponse | undefined;
-      const extractSummaryText = (r: NormalizedResponse): string =>
-        stripThinkingPreamble(
-          r.content
-            .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-            .map(b => b.text)
-            .join('\n'),
-        );
-      let summaryText = acceptedResponse ? extractSummaryText(acceptedResponse) : '';
+      const extractSummaryText = (r: NormalizedResponse): { text: string; recoveredWholeWrapper: boolean } => {
+        const rawText = r.content
+          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+          .map(b => b.text)
+          .join('\n');
+        const onlyTextBlocks = r.content.every((block) => block.type === 'text');
+        const recoveryEnabled = this.config.recoverLiteralThinkingWrappedCompression === true;
+        if (recoveryEnabled && !onlyTextBlocks && hasLiteralThinkingLikeTag(rawText)) {
+          return { text: '', recoveredWholeWrapper: false };
+        }
+        return extractCompressionSummaryText(rawText, recoveryEnabled && onlyTextBlocks);
+      };
+      let extraction = acceptedResponse
+        ? extractSummaryText(acceptedResponse)
+        : { text: '', recoveredWholeWrapper: false };
+      let summaryText = extraction.text;
       /** The plain-prose rung's own outcome, when it ran (or was known) and gave no memory. */
       let proseOutcome: CompressionRefusalOutcomeRecord | undefined;
       /** The rung whose answer stripped to empty, as recorded before the plain-prose retry. */
@@ -11160,10 +11216,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ));
         if (proseStep.kind === 'answered') {
           const proseStop = this.compressionResponseStopReason(proseStep.response);
-          const proseText = proseStop === 'end_turn' ? extractSummaryText(proseStep.response as NormalizedResponse) : '';
-          if (proseText.trim()) {
+          const proseExtraction = proseStop === 'end_turn'
+            ? extractSummaryText(proseStep.response as NormalizedResponse)
+            : { text: '', recoveredWholeWrapper: false };
+          if (proseExtraction.text.trim()) {
             acceptedResponse = proseStep.response as NormalizedResponse;
-            summaryText = proseText;
+            extraction = proseExtraction;
+            summaryText = proseExtraction.text;
             successfulTrace = attemptTraces[attemptTraces.length - 1];
           } else {
             proseOutcome = {
@@ -11179,7 +11238,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
 
-      const responseContent = captureResponseContent(acceptedResponse?.content ?? []);
+      const responseContent = extraction.recoveredWholeWrapper
+        ? [{ type: 'text' as const, text: summaryText }]
+        : captureResponseContent(acceptedResponse?.content ?? []);
+      if (extraction.recoveredWholeWrapper) {
+        logCompressionCall({
+          event: 'compression:literal-thinking-wrapper-recovered',
+          operation: 'compress_l1',
+          metadata: { model: this.requireCompressionModel(), chunk_size: chunk.messages.length },
+        }, this.ns);
+      }
       logResponse = summaryText;
 
       // A bugged/empty generation (summarizer returned no text — spent budget on
@@ -12409,8 +12477,24 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       // `content` stays text-only; verbatim blocks (incl. signed thinking)
       // are captured for replay — see the L1 site / captureResponseContent.
-      const mergedText = stripThinkingPreamble(assessment.text);
-      const responseContent = captureResponseContent(assessment.response.content);
+      const recoveryEnabled = this.config.recoverLiteralThinkingWrappedCompression === true;
+      const onlyTextBlocks = assessment.response.content.every((block) => block.type === 'text');
+      const mergeExtraction = recoveryEnabled && !onlyTextBlocks &&
+        hasLiteralThinkingLikeTag(assessment.text)
+        ? { text: '', recoveredWholeWrapper: false }
+        : extractCompressionSummaryText(assessment.text, recoveryEnabled && onlyTextBlocks);
+      const mergedText = mergeExtraction.text;
+      const recoveredWholeWrapper = mergeExtraction.recoveredWholeWrapper;
+      const responseContent = recoveredWholeWrapper
+        ? [{ type: 'text' as const, text: mergedText }]
+        : captureResponseContent(assessment.response.content);
+      if (recoveredWholeWrapper) {
+        logCompressionCall({
+          event: 'compression:literal-thinking-wrapper-recovered',
+          operation: `merge_l${targetLevel}`,
+          metadata: { model: this.requireCompressionModel(), source_count: sourceIds.length },
+        }, this.ns);
+      }
       logResponse = mergedText;
 
       // The disposition gate guarantees nonempty PRE-strip text; a

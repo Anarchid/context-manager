@@ -504,6 +504,25 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
+  it('opt-in recovers a closed whole-response thinking wrapper at the L1 site', async () => {
+    const wrapped = '<thinking>\nI remember arriving in the field and being welcomed home.\n</thinking>';
+    const mock = flexibleMembrane([{ stop: 'end_turn', text: wrapped }]);
+    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+
+    assert.equal(mock.calls.length, 1, 'no plain-prose retry needed');
+    assert.equal(fx.target.compressed, true);
+    const produced = fx.strategy.summariesView().find((entry) => entry.id === fx.target.summaryId);
+    assert.equal(produced?.content, 'I remember arriving in the field and being welcomed home.');
+    assert.deepEqual(
+      produced?.responseContent,
+      [{ type: 'text', text: 'I remember arriving in the field and being welcomed home.' }],
+      'replay uses normalized public prose without the pseudo-thinking wrapper',
+    );
+    fx.manager.close();
+  });
+
   it('canonical tool_use gets ONE no-tools retry before the curve plan burns (lena 2026-08-06)', async () => {
     // Curve variants vary the recall frontier, not the response mode — a
     // think-first model fails every variant identically. The retry must be
