@@ -211,7 +211,7 @@ export interface CompileResult {
    * entries: the same accounting `getRenderStats()` gives a live compile.
    * They describe the selection rather than the exact request: injections
    * merged in afterwards aren't counted in its buckets or `total` (`request`
-   * prices them when the compile is given the request's head), an entry
+   * prices them when the compile is given the request's overhead), an entry
    * that mixes tool calls and results counts once though the compile splits
    * it into several messages,
    * and the select's last structural passes, which can trim an orphaned tool

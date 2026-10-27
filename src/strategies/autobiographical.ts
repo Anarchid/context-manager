@@ -2028,7 +2028,7 @@ const OUT_OF_BAND_RUN_AGREEMENT = 0.1;
 const DECLARED_PAIR_AGREEMENT = 0.1;
 const CALIBRATION_CEILING = 1.8;
 
-type SelectPricing = { head: ContentBlock[]; injections?: ReadonlyArray<ContentBlock[]> };
+type SelectPricing = { overhead: ContentBlock[]; injections?: ReadonlyArray<ContentBlock[]> };
 
 function requestOverheadContent(overhead: RequestOverhead): ContentBlock[] {
   const content: ContentBlock[] = [];
@@ -7866,7 +7866,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private selectPricing: SelectPricing | null = null;
 
   private selectPricingOf(opts: SelectOptions | undefined): SelectPricing | null {
-    return opts?.requestHead ? { head: requestOverheadContent(opts.requestHead), injections: opts.messageInjections } : null;
+    return opts?.requestOverhead ? { overhead: requestOverheadContent(opts.requestOverhead), injections: opts.messageInjections } : null;
   }
 
   private selectPath(store: MessageStoreView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
@@ -8797,7 +8797,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const pricing = this.selectPricing;
     if (pricing) {
       r.request = {
-        headTokens: this.priceContent(pricing.head),
+        overheadTokens: this.priceContent(pricing.overhead),
         injectedTokens: this.priceMessageInjections(pricing.injections),
       };
     }

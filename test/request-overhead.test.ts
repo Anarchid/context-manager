@@ -8,7 +8,7 @@ import type { ContextInjection, RenderStats } from '../src/types/index.js';
 import type { RequestOverhead } from '../src/index.js';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 
-const dir = mkdtempSync(join(tmpdir(), 'request-head-'));
+const dir = mkdtempSync(join(tmpdir(), 'request-overhead-'));
 const BUDGET = { maxTokens: 100_000, reserveForResponse: 2_000 };
 const TIGHT = { maxTokens: 1_800, reserveForResponse: 200 };
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -83,7 +83,7 @@ const TOOLS: ToolDefinition[] = Array.from({ length: 6 }, (_, i) => ({
   description: 'Does one thing on the server. '.repeat(30),
   inputSchema: { type: 'object', properties: { id: { type: 'string', description: 'The id.' } }, required: ['id'] },
 }));
-const HEAD: RequestOverhead = { system: `You are a resident. ${'Be precise. '.repeat(60)}`, tools: TOOLS };
+const OVERHEAD: RequestOverhead = { system: `You are a resident. ${'Be precise. '.repeat(60)}`, tools: TOOLS };
 const INJECTIONS: ContextInjection[] = [
   { namespace: 'retrieval', position: 'afterUser', content: [{ type: 'text', text: `Recalled: ${'a fact worth keeping. '.repeat(40)}` }] },
   { namespace: 'notes', position: 'beforeUser', content: [{ type: 'text', text: `Note: ${'something to mind. '.repeat(20)}` }] },
@@ -103,9 +103,9 @@ async function seededAt(name: string, multiplier: number, shape: Shape = {}) {
 
 let atOneStores = 0;
 
-async function pricesAtOne(): Promise<{ headTokens: number; injectedTokens: number }> {
+async function pricesAtOne(): Promise<{ overheadTokens: number; injectedTokens: number }> {
   const { cm } = await openManager(`at-one-${++atOneStores}`);
-  const { renderStats } = await cm.compile(BUDGET, INJECTIONS, { requestHead: HEAD });
+  const { renderStats } = await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD });
   assert.equal(renderStats!.calibration!.multiplier, 1, 'premise: a fresh store prices at 1');
   cm.close();
   return renderStats!.request!;
@@ -113,57 +113,57 @@ async function pricesAtOne(): Promise<{ headTokens: number; injectedTokens: numb
 
 const strip = (s: RenderStats) => ({ ...s, planVsActual: s.planVsActual && { ...s.planVsActual, compileMs: 0, solveMs: 0 } });
 
-const HEAD_BLOCKS = 2;
+const OVERHEAD_BLOCKS = 2;
 const INJECTED_BLOCKS = MESSAGE_INJECTIONS.reduce((n, content) => n + content.length, 0);
 
-function assertPricedAt(stats: RenderStats, atOne: { headTokens: number; injectedTokens: number }, where: string): void {
+function assertPricedAt(stats: RenderStats, atOne: { overheadTokens: number; injectedTokens: number }, where: string): void {
   const m = stats.calibration!.multiplier;
   const request = stats.request!;
   const rounding = (blocks: number) => (blocks * (1 + m)) / 2;
-  assert.ok(Math.abs(request.headTokens - m * atOne.headTokens) <= rounding(HEAD_BLOCKS), `${where}: head ${request.headTokens} at ${m}, ${atOne.headTokens} at 1`);
+  assert.ok(Math.abs(request.overheadTokens - m * atOne.overheadTokens) <= rounding(OVERHEAD_BLOCKS), `${where}: overhead ${request.overheadTokens} at ${m}, ${atOne.overheadTokens} at 1`);
   assert.ok(Math.abs(request.injectedTokens - m * atOne.injectedTokens) <= rounding(INJECTED_BLOCKS), `${where}: injections ${request.injectedTokens} at ${m}, ${atOne.injectedTokens} at 1`);
 }
 
-describe('the request head priced by the compile (RenderStats.request)', () => {
-  it('reports the head and the message injections at the prices a calibration sample compares', async () => {
+describe('the request overhead priced by the compile (RenderStats.request)', () => {
+  it('reports the overhead and the message injections at the prices a calibration sample compares', async () => {
     const { cm, strategy } = await openManager('sample-agrees');
-    const { renderStats } = await cm.compile(BUDGET, INJECTIONS, { requestHead: HEAD });
+    const { renderStats } = await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD });
     const request = renderStats!.request!;
-    assert.ok(request.headTokens > 0 && request.injectedTokens > 0, JSON.stringify(request));
+    assert.ok(request.overheadTokens > 0 && request.injectedTokens > 0, JSON.stringify(request));
     assert.equal(renderStats!.calibration!.provisional, true, 'premise: a store with no record starts provisional, so its first sample replaces the multiplier outright');
-    const total = renderStats!.total.tokens + request.headTokens + request.injectedTokens;
-    strategy.reportRealInputTokens(1.5 * total, HEAD);
-    const next = await cm.compile(BUDGET, INJECTIONS, { requestHead: HEAD });
+    const total = renderStats!.total.tokens + request.overheadTokens + request.injectedTokens;
+    strategy.reportRealInputTokens(1.5 * total, OVERHEAD);
+    const next = await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD });
     assert.equal(next.renderStats!.calibration!.multiplier, 1.5,
-      'a provider total of 1.5 times the reported window, head and injections reads exactly 1.5 only if the sample prices them as the render stats do');
+      'a provider total of 1.5 times the reported window, overhead and injections reads exactly 1.5 only if the sample prices them as the render stats do');
     cm.close();
   });
 
-  it('prices the head and the injections at the compile\'s multiplier', async () => {
+  it('prices the overhead and the injections at the compile\'s multiplier', async () => {
     const atOne = await pricesAtOne();
     const { cm } = await seededAt('at-one-and-a-half', 1.5);
-    const stats = (await cm.compile(BUDGET, INJECTIONS, { requestHead: HEAD })).renderStats!;
+    const stats = (await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD })).renderStats!;
     assert.equal(stats.calibration!.multiplier, 1.5, 'premise: the seeded multiplier is in force');
     assertPricedAt(stats, atOne, 'live');
     cm.close();
   });
 
-  it('prices the system prompt and the tool definitions each, and an empty head at zero', async () => {
-    const { cm } = await openManager('head-parts');
-    const price = async (requestHead: RequestOverhead) => (await cm.compile(BUDGET, undefined, { requestHead })).renderStats!.request!;
-    assert.deepStrictEqual(await price({}), { headTokens: 0, injectedTokens: 0 }, 'an empty head with no injections');
-    const system = (await price({ system: HEAD.system })).headTokens;
-    const tools = (await price({ tools: HEAD.tools })).headTokens;
+  it('prices the system prompt and the tool definitions each, and an empty overhead at zero', async () => {
+    const { cm } = await openManager('overhead-parts');
+    const price = async (requestOverhead: RequestOverhead) => (await cm.compile(BUDGET, undefined, { requestOverhead })).renderStats!.request!;
+    assert.deepStrictEqual(await price({}), { overheadTokens: 0, injectedTokens: 0 }, 'an empty overhead with no injections');
+    const system = (await price({ system: OVERHEAD.system })).overheadTokens;
+    const tools = (await price({ tools: OVERHEAD.tools })).overheadTokens;
     assert.ok(system > 0 && tools > 0, `system ${system}, tools ${tools}`);
-    assert.equal((await price(HEAD)).headTokens, system + tools);
+    assert.equal((await price(OVERHEAD)).overheadTokens, system + tools);
     cm.close();
   });
 
-  it('refuses a head whose tool definitions can\'t be serialised, before anything is selected', async () => {
-    const refused = await openManager('bad-head');
-    const twin = await openManager('bad-head-twin');
+  it('refuses an overhead whose tool definitions can\'t be serialised, before anything is selected', async () => {
+    const refused = await openManager('bad-overhead');
+    const twin = await openManager('bad-overhead-twin');
     const counts = { name: 'counts', description: 'Counts.', inputSchema: { type: 'object', properties: { n: { type: 'integer', default: BigInt(1) } } } };
-    await assert.rejects(refused.cm.compile(TIGHT, INJECTIONS, { requestHead: { tools: [counts as unknown as ToolDefinition] } }), TypeError);
+    await assert.rejects(refused.cm.compile(TIGHT, INJECTIONS, { requestOverhead: { tools: [counts as unknown as ToolDefinition] } }), TypeError);
     const after = await refused.cm.compile(TIGHT, INJECTIONS);
     const first = await twin.cm.compile(TIGHT, INJECTIONS);
     assert.ok(first.renderStats!.planVsActual!.moves > 0, 'premise: a first compile at this budget moves fold levels');
@@ -173,27 +173,27 @@ describe('the request head priced by the compile (RenderStats.request)', () => {
     twin.cm.close();
   });
 
-  it('is absent from a compile given no head, whatever compiled before it', async () => {
-    const { cm } = await openManager('no-head');
+  it('is absent from a compile given no overhead, whatever compiled before it', async () => {
+    const { cm } = await openManager('no-overhead');
     assert.strictEqual((await cm.compile(BUDGET)).renderStats!.request, undefined, 'a first compile');
     assert.strictEqual((await cm.compile(BUDGET, INJECTIONS)).renderStats!.request, undefined, 'with message injections');
-    await cm.compile(BUDGET, INJECTIONS, { requestHead: HEAD });
-    assert.strictEqual((await cm.compile(BUDGET, INJECTIONS)).renderStats!.request, undefined, 'after a compile with a head');
+    await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD });
+    assert.strictEqual((await cm.compile(BUDGET, INJECTIONS)).renderStats!.request, undefined, 'after a compile with an overhead');
     assert.strictEqual(cm.getRenderStats()!.request, undefined, 'getRenderStats after it');
-    await cm.compile(BUDGET, INJECTIONS, { requestHead: HEAD, dryRun: true });
-    assert.strictEqual((await cm.compile(BUDGET, INJECTIONS)).renderStats!.request, undefined, 'after a dry compile with a head');
-    await assert.rejects(cm.compile({ maxTokens: 300, reserveForResponse: 100 }, INJECTIONS, { requestHead: HEAD }), (e: Error) => e.name === 'OverBudgetError');
-    assert.strictEqual((await cm.compile(BUDGET, INJECTIONS)).renderStats!.request, undefined, 'after a refused compile with a head');
+    await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, dryRun: true });
+    assert.strictEqual((await cm.compile(BUDGET, INJECTIONS)).renderStats!.request, undefined, 'after a dry compile with an overhead');
+    await assert.rejects(cm.compile({ maxTokens: 300, reserveForResponse: 100 }, INJECTIONS, { requestOverhead: OVERHEAD }), (e: Error) => e.name === 'OverBudgetError');
+    assert.strictEqual((await cm.compile(BUDGET, INJECTIONS)).renderStats!.request, undefined, 'after a refused compile with an overhead');
     assert.strictEqual((await cm.compile(BUDGET, INJECTIONS, { dryRun: true })).renderStats!.request, undefined, 'a dry compile');
     assert.strictEqual(cm.previewContext(TIGHT, undefined, { render: true, messageInjections: MESSAGE_INJECTIONS })!.stats!.request, undefined, 'a preview');
     cm.close();
-    const hierarchical = await openManager('no-head-hierarchical', { adaptiveResolution: false });
-    await hierarchical.cm.compile(BUDGET, INJECTIONS, { requestHead: HEAD });
-    assert.strictEqual((await hierarchical.cm.compile(BUDGET, INJECTIONS)).renderStats!.request, undefined, 'the hierarchical path, after a compile with a head');
+    const hierarchical = await openManager('no-overhead-hierarchical', { adaptiveResolution: false });
+    await hierarchical.cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD });
+    assert.strictEqual((await hierarchical.cm.compile(BUDGET, INJECTIONS)).renderStats!.request, undefined, 'the hierarchical path, after a compile with an overhead');
     hierarchical.cm.close();
   });
 
-  it('is absent from a subclass\'s own render-stats pass after a compile with a head', async () => {
+  it('is absent from a subclass\'s own render-stats pass after a compile with an overhead', async () => {
     class OwnPass extends AutobiographicalStrategy {
       ownPass(): RenderStats | null {
         this.rsBegin();
@@ -203,11 +203,11 @@ describe('the request head priced by the compile (RenderStats.request)', () => {
     const strategy = new OwnPass({ compressionModel: 'zz-model', targetChunkTokens: 120, headWindowTokens: 0, recentWindowTokens: 400, adaptiveResolution: true });
     const cm = await ContextManager.open({ path: join(dir, 'own-pass'), strategy, membrane: summarizer as never });
     cm.addMessage('User', [{ type: 'text', text: 'hello '.repeat(400) }]);
-    assert.ok((await cm.compile(BUDGET, INJECTIONS, { requestHead: HEAD })).renderStats!.request, 'premise: the compile priced its head');
+    assert.ok((await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD })).renderStats!.request, 'premise: the compile priced its overhead');
     assert.strictEqual(strategy.ownPass()!.request, undefined, 'after a live compile');
-    await cm.compile(BUDGET, INJECTIONS, { requestHead: HEAD, dryRun: true });
+    await cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD, dryRun: true });
     assert.strictEqual(strategy.ownPass()!.request, undefined, 'after a dry compile');
-    await assert.rejects(cm.compile({ maxTokens: 300, reserveForResponse: 100 }, INJECTIONS, { requestHead: HEAD }), (e: Error) => e.name === 'OverBudgetError');
+    await assert.rejects(cm.compile({ maxTokens: 300, reserveForResponse: 100 }, INJECTIONS, { requestOverhead: OVERHEAD }), (e: Error) => e.name === 'OverBudgetError');
     assert.strictEqual(strategy.ownPass()!.request, undefined, 'after a refused compile');
     cm.close();
   });
@@ -215,15 +215,15 @@ describe('the request head priced by the compile (RenderStats.request)', () => {
   it('comes with every compile that returns render stats, at its multiplier: live, dry, a preview and hierarchical', async () => {
     const atOne = await pricesAtOne();
     const { cm } = await seededAt('paths-adaptive', 1.5);
-    const live = (await cm.compile(TIGHT, INJECTIONS, { requestHead: HEAD })).renderStats!;
+    const live = (await cm.compile(TIGHT, INJECTIONS, { requestOverhead: OVERHEAD })).renderStats!;
     assert.equal(live.calibration!.multiplier, 1.5, 'premise: the seeded multiplier is in force');
     assertPricedAt(live, atOne, 'live');
     assert.deepStrictEqual(cm.getRenderStats()!.request, live.request, 'getRenderStats after the live compile');
-    assertPricedAt((await cm.compile(TIGHT, INJECTIONS, { requestHead: HEAD, dryRun: true })).renderStats!, atOne, 'a dry compile');
-    assertPricedAt(cm.previewContext(TIGHT, undefined, { render: true, requestHead: HEAD, messageInjections: MESSAGE_INJECTIONS })!.stats!, atOne, 'a preview');
+    assertPricedAt((await cm.compile(TIGHT, INJECTIONS, { requestOverhead: OVERHEAD, dryRun: true })).renderStats!, atOne, 'a dry compile');
+    assertPricedAt(cm.previewContext(TIGHT, undefined, { render: true, requestOverhead: OVERHEAD, messageInjections: MESSAGE_INJECTIONS })!.stats!, atOne, 'a preview');
     cm.close();
     const hierarchical = await openManager('paths-hierarchical', { adaptiveResolution: false });
-    const hs = (await hierarchical.cm.compile(TIGHT, INJECTIONS, { requestHead: HEAD })).renderStats!;
+    const hs = (await hierarchical.cm.compile(TIGHT, INJECTIONS, { requestOverhead: OVERHEAD })).renderStats!;
     assert.equal(hs.calibration!.multiplier, 1, 'premise: a fresh store prices at 1');
     assertPricedAt(hs, atOne, 'the hierarchical path');
     hierarchical.cm.close();
@@ -236,10 +236,10 @@ describe('the request head priced by the compile (RenderStats.request)', () => {
     ['hierarchical', { adaptiveResolution: false }, 1_200],
   ];
   for (const [label, shape, maxTokens] of shapes) {
-    it(`selects identically with and without a head (${label})`, async () => {
+    it(`selects identically with and without an overhead (${label})`, async () => {
       const budget = { maxTokens, reserveForResponse: 200 };
       const without = await openManager(`same-without-${label}`, shape);
-      const withHead = await openManager(`same-with-${label}`, shape);
+      const withOverhead = await openManager(`same-with-${label}`, shape);
       for (let round = 0; round < 3; round++) {
         const a = await without.cm.compile(budget, INJECTIONS, prefixFor(shape));
         const lower = await without.cm.compile({ ...budget, maxTokens: maxTokens - 200 }, INJECTIONS, { ...prefixFor(shape), dryRun: true })
@@ -248,17 +248,17 @@ describe('the request head priced by the compile (RenderStats.request)', () => {
             throw e;
           });
         assert.notDeepStrictEqual(lower, a.messages, `premise, round ${round}: 200 tokens less budget selects otherwise or refuses`);
-        const b = await withHead.cm.compile(budget, INJECTIONS, { ...prefixFor(shape), requestHead: HEAD });
+        const b = await withOverhead.cm.compile(budget, INJECTIONS, { ...prefixFor(shape), requestOverhead: OVERHEAD });
         assert.deepStrictEqual(b.messages, a.messages, `round ${round}: the messages`);
         const { request: _priced, ...bStats } = b.renderStats!;
-        assert.deepStrictEqual(strip(bStats as RenderStats), strip(a.renderStats!), `round ${round}: the render stats besides the head's price`);
-        for (const { cm } of [without, withHead]) {
+        assert.deepStrictEqual(strip(bStats as RenderStats), strip(a.renderStats!), `round ${round}: the render stats besides the overhead's price`);
+        for (const { cm } of [without, withOverhead]) {
           cm.addMessage('User', [{ type: 'text', text: `more ${round}: further traffic about the work `.repeat(4) }]);
           for (let k = 0; k < 200 && !cm.isReady(); k++) await cm.tick();
         }
       }
       without.cm.close();
-      withHead.cm.close();
+      withOverhead.cm.close();
     });
   }
 });
@@ -270,7 +270,7 @@ describe('the calibration ceiling (RenderStats.calibration.ceiling)', () => {
     assert.equal((await cm.compile(BUDGET)).renderStats!.calibration!.ceiling, 1.8);
     cm.close();
     const reopened = await seededAt('ceiling', 2.5);
-    const stats = (await reopened.cm.compile(BUDGET, INJECTIONS, { requestHead: HEAD })).renderStats!;
+    const stats = (await reopened.cm.compile(BUDGET, INJECTIONS, { requestOverhead: OVERHEAD })).renderStats!;
     assert.equal(stats.calibration!.multiplier, stats.calibration!.ceiling);
     assertPricedAt(stats, atOne, 'the record above the ceiling');
     reopened.cm.close();

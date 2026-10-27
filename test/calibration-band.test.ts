@@ -700,13 +700,13 @@ describe('estimator calibration band', () => {
     assert.equal(reopened.internals._calibration, 1, 'put back after the dry compile too');
     // The real compile: refused at 1.45, dropped, resolved at 1; the drop is
     // logged and persisted, and visible as the reset.
-    const head = { system: 'You are a resident. '.repeat(60) };
-    const atOne = await openManager('fallback-head-price');
-    const headAtOne = (await atOne.cm.compile(BUDGET, undefined, { requestHead: head })).renderStats!.request!.headTokens;
+    const overhead = { system: 'You are a resident. '.repeat(60) };
+    const atOne = await openManager('fallback-overhead-price');
+    const overheadAtOne = (await atOne.cm.compile(BUDGET, undefined, { requestOverhead: overhead })).renderStats!.request!.overheadTokens;
     atOne.cm.close();
-    const { result: live, lines } = await calibrationWarnings(() => reopened.cm.compile(tight, undefined, { requestHead: head }));
+    const { result: live, lines } = await calibrationWarnings(() => reopened.cm.compile(tight, undefined, { requestOverhead: overhead }));
     assert.equal(live.renderStats, reopened.cm.getRenderStats(), "the live result's stats are the retry's, the getter's");
-    assert.equal(live.renderStats!.request!.headTokens, headAtOne, 'the retry prices the head at the multiplier it dropped to');
+    assert.equal(live.renderStats!.request!.overheadTokens, overheadAtOne, 'the retry prices the overhead at the multiplier it dropped to');
     assert.equal(live.renderStats!.total.messages, live.messages.length);
     assert.equal(reopened.internals._calibration, 1);
     const cal = reopened.cm.getRenderStats()!.calibration!;
