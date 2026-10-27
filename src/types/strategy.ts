@@ -544,6 +544,16 @@ export interface SelectOptions {
    * ContextManager.compile fills it from its injections; `system` ones go
    * into the caller's system prompt instead. */
   messageInjections?: ReadonlyArray<ContentBlock[]>;
+  /** The overhead of the request the compile is for: the system prompt and
+   * tool definitions it sends besides the window and its message-position
+   * injections. Its system prompt is the one the request sends, with the
+   * system-position injections passed to this compile appended: the compile
+   * hands those back unchanged (`systemInjections`) and prices none of them.
+   * AutobiographicalStrategy prices it, and the message injections, for
+   * `RenderStats.request`, and selects exactly as it would without it. An
+   * overhead whose tool definitions can't be serialised as JSON is refused
+   * before anything is selected. */
+  requestOverhead?: RequestOverhead;
 }
 
 /**
@@ -853,18 +863,21 @@ export function isSummaryOverviewStrategy(s: ContextStrategy): s is SummaryOverv
 }
 
 /**
- * What a request carried besides the compiled window and the compile's
- * message-position injections (which the compile prices itself), as the
- * caller sent it (see `AutobiographicalStrategy.reportRealInputTokens`). The
+ * A request's overhead: what it carries besides the compiled window and the
+ * compile's message-position injections (which the compile prices itself).
+ * A compile takes the overhead its request will send
+ * (`SelectOptions.requestOverhead`) and reports its price
+ * (`RenderStats.request`); a calibration sample takes the overhead the
+ * request sent (see `AutobiographicalStrategy.reportRealInputTokens`). The
  * provider counts it in the input total and the compile estimate doesn't, so
  * a calibration sample that leaves it out learns it as a per-token rate.
- * Passing it says this is everything the request sent besides those; a
- * caller that can't see the request's head passes nothing.
+ * Passing it says this is everything the request sends besides those; a
+ * caller that can't see the request's overhead passes nothing.
  */
 export interface RequestOverhead {
-  /** The system prompt the request sent. */
+  /** The system prompt the request sends. */
   system?: string;
-  /** The tool definitions the request sent. */
+  /** The tool definitions the request sends. */
   tools?: ReadonlyArray<ToolDefinition>;
 }
 
@@ -947,7 +960,29 @@ export interface RenderStats {
     pricingEpoch: number;
     provisional?: true;
     reset?: CalibrationReset;
+    /** The largest multiplier the strategy applies: it applies none above
+     *  it. AutobiographicalStrategy reports it whenever it reports
+     *  `calibration`. */
+    ceiling?: number;
   };
+
+  /**
+   * What the request carries besides the rendered context, in the units of
+   * `total` at this compile's multiplier and priced as a calibration sample
+   * prices it (`AutobiographicalStrategy.reportRealInputTokens`):
+   * `overheadTokens` for `SelectOptions.requestOverhead`, and
+   * `injectedTokens` for the compile's message-position injections
+   * (`SelectOptions.messageInjections`), 0 when it has none. Present only when
+   * the select was given an overhead, so a compile without one has no price
+   * here rather than a price of 0. The overhead's price is the store's
+   * estimate of the system prompt and of the tool definitions as JSON
+   * (`JSON.stringify`), not the provider's count of what its formatter sends.
+   * System-position injections are priced only as part of that system
+   * prompt: the compile hands the ones it was passed back unchanged
+   * (`systemInjections`) for the caller to append, so the overhead's system
+   * prompt is the one sent, with them appended.
+   */
+  request?: { overheadTokens: number; injectedTokens: number };
 
   /**
    * Planner/emitter reconciliation for this compile. `planned` is the picker's

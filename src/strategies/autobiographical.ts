@@ -2064,6 +2064,16 @@ function imageGroup(block: ContentBlock): unknown {
 const OUT_OF_BAND_RUN_LENGTH = 3;
 const OUT_OF_BAND_RUN_AGREEMENT = 0.1;
 const DECLARED_PAIR_AGREEMENT = 0.1;
+const CALIBRATION_CEILING = 1.8;
+
+type SelectPricing = { overhead: ContentBlock[]; injections?: ReadonlyArray<ContentBlock[]> };
+
+function requestOverheadContent(overhead: RequestOverhead): ContentBlock[] {
+  const content: ContentBlock[] = [];
+  if (overhead.system) content.push({ type: 'text', text: overhead.system });
+  if (overhead.tools && overhead.tools.length > 0) content.push({ type: 'text', text: JSON.stringify(overhead.tools) });
+  return content;
+}
 
 /**
  * A summary getStrandedSummaries lists: alone in a run at its level that is
@@ -7809,6 +7819,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // written, an earlier select's must not pose as this one's.
     this._lastSelectStats = null;
     this.requireLoadedBranch('select');
+    const pricing = this.selectPricingOf(opts);
     this._selectStartedAt = performance.now();
     this._selectMessages = store.length();
     const lastRenderStats = this._lastRenderStats;
@@ -7829,6 +7840,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._ceilingNotes = { images: false, bytes: false };
       let entries: ContextEntry[];
       this.thinkingBound = opts?.thinkingBinding?.binds === true;
+      this.selectPricing = pricing;
       try {
         entries = this.withToolPruning(store, () => this.selectPath(store, budget, opts));
       } catch (err) {
@@ -7836,6 +7848,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         throw err;
       } finally {
         this.thinkingBound = false;
+        this.selectPricing = null;
         if (this._lastRenderStats !== lastRenderStats) this._lastSelectStats = this._lastRenderStats;
       }
       // Only a render this select returns says the ceiling line: one it
@@ -7874,6 +7887,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const restore = this.saveDryRunState(store);
     this._dryRunSelect = true;
     this.thinkingBound = opts?.thinkingBinding?.binds === true;
+    this.selectPricing = pricing;
     try {
       this.rebuildChunks(store);
       if (_diag) this.diag.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
@@ -7883,7 +7897,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       if (this._lastRenderStats !== lastRenderStats) this._lastSelectStats = this._lastRenderStats;
       restore();
       this.thinkingBound = false;
+      this.selectPricing = null;
     }
+  }
+
+  private selectPricing: SelectPricing | null = null;
+
+  private selectPricingOf(opts: SelectOptions | undefined): SelectPricing | null {
+    return opts?.requestOverhead ? { overhead: requestOverheadContent(opts.requestOverhead), injections: opts.messageInjections } : null;
   }
 
   private selectPath(store: MessageStoreView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
@@ -8809,7 +8830,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       pricingEpoch: AutobiographicalStrategy.CALIBRATION_PRICING_EPOCH,
       ...(this._calibrationProvisional ? { provisional: true as const } : {}),
       ...(this._calibrationReset ? { reset: this._calibrationReset } : {}),
+      ceiling: CALIBRATION_CEILING,
     };
+    const pricing = this.selectPricing;
+    if (pricing) {
+      r.request = {
+        overheadTokens: this.priceContent(pricing.overhead),
+        injectedTokens: this.priceMessageInjections(pricing.injections),
+      };
+    }
     this._lastRenderStats = r;
     this._rs = null;
     return r;
@@ -14091,11 +14120,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._lastCompileEstimate =
         rs.head.tokens + rs.tail.tokens + rs.middleRaw.tokens +
         rs.summaries.l1.tokens + rs.summaries.l2.tokens + rs.summaries.l3.tokens;
-      let injected = 0;
-      for (const content of opts?.messageInjections ?? []) {
-        injected += store.estimateTokens({ content } as unknown as StoredMessage);
-      }
-      this._lastCompileInjected = injected;
+      this._lastCompileInjected = this.priceMessageInjections(opts?.messageInjections);
       this._calibrationArmed = true; // exactly one sample per compile
     }
     return merged;
@@ -14191,7 +14216,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // implied multiplier is inside the clamp range is window-shaped by
     // construction and must be learned from.
     const ratioInBand = ratio >= 0.6 && ratio <= 1.8;
-    const observedInBand = observed >= 0.6 && observed <= 1.8;
+    const observedInBand = observed >= 0.6 && observed <= CALIBRATION_CEILING;
     // CONSISTENT RUN (#323). At 1.00 the ratio and the implied multiplier are
     // the same number, so a store whose true ratio is past the band (every
     // epoch discard restarts there) rejects every sample and never learns.
@@ -14259,7 +14284,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const provisional = this._calibrationProvisional;
     this._calibrationProvisional = null;
     const next = replacement ?? (provisional || fromRun ? observed : ema + alpha * (observed - ema));
-    const clamped = Math.min(1.8, Math.max(0.6, next));
+    const clamped = Math.min(CALIBRATION_CEILING, Math.max(0.6, next));
     this._calibrationEma = clamped;
     // DEAD BAND. The multiplier is applied only once the EMA has moved more
     // than 2% from the applied value. Every applied change reprices every
@@ -14302,12 +14327,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  prices its own (priceRequest in the compression path), at the current
    *  multiplier, so it adds to the window estimate in the same units. */
   private priceRequestOverhead(overhead: RequestOverhead): number {
+    return this.priceContent(requestOverheadContent(overhead));
+  }
+
+  private priceContent(content: ContentBlock[]): number {
     const store = this._storeView;
     if (!store) return 0;
-    const content: ContentBlock[] = [];
-    if (overhead.system) content.push({ type: 'text', text: overhead.system });
-    if (overhead.tools && overhead.tools.length > 0) content.push({ type: 'text', text: JSON.stringify(overhead.tools) });
     return content.length > 0 ? store.estimateTokens({ content } as unknown as StoredMessage) : 0;
+  }
+
+  private priceMessageInjections(injections: ReadonlyArray<ContentBlock[]> | undefined): number {
+    const store = this._storeView;
+    if (!store) return 0;
+    let tokens = 0;
+    for (const content of injections ?? []) tokens += store.estimateTokens({ content } as unknown as StoredMessage);
+    return tokens;
   }
 
   /** Write the multiplier in force under the current pricing stamp, with the
@@ -14580,7 +14614,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the cut's own estimate passing it. Whether the old price limited a
     // message depends on the multiplier it was priced under, so this asks
     // whether its estimate could have passed the cap plus 50 at the clamp's
-    // ceiling of 1.8, bounded from its estimate at the applied multiplier.
+    // ceiling (CALIBRATION_CEILING), bounded from its estimate at the applied multiplier.
     // The store rounds each top-level block's estimate on its own, so that
     // estimate is within half a token a block of the applied multiplier
     // times the blocks' unrounded sum, and at the ceiling each block's
@@ -14601,7 +14635,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return messages.some((m) => {
         if (strategy.estimateTextOnlyTokens(m) > cap) return true;
         const rounding = 0.5 * m.content.length;
-        return (1.8 * (store.estimateTokens(m) + rounding)) / factor + rounding > cap + 50;
+        return (CALIBRATION_CEILING * (store.estimateTokens(m) + rounding)) / factor + rounding > cap + 50;
       });
     },
     // 4: a tool result the per-tool limit replaces, or a tool_use input over
@@ -14688,10 +14722,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // such a multiplier provisional.
           const epoch = stamped ? saved.pricing! : 1;
           const fromEpoch = stamped ? epoch : null;
-          const pinned = saved.multiplier! >= 1.8 || saved.multiplier! <= 0.6;
+          const pinned = saved.multiplier! >= CALIBRATION_CEILING || saved.multiplier! <= 0.6;
           const repriced = epoch < current && this.calibrationRepricedSince(epoch, store.getAll(), store);
           if (epoch === current) {
-            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            this._calibration = Math.min(CALIBRATION_CEILING, Math.max(0.6, saved.multiplier!));
             this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
             this._calibrationDeclared = saved.declaredOverhead === true;
             // A discard's 1 that no sample has confirmed yet was persisted as
@@ -14712,7 +14746,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // with it, as it does through the learner's writes, and so does a
             // provisional flag: a discard's 1 that no sample has confirmed is
             // still a guess.
-            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            this._calibration = Math.min(CALIBRATION_CEILING, Math.max(0.6, saved.multiplier!));
             this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
             this._calibrationDeclared = saved.declaredOverhead === true;
             if (saved.provisional === true) {
@@ -14749,7 +14783,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 ? `learned under pricing epoch ${epoch} (current ${current}), in a store holding content repriced since`
                 : !repriced
                   ? `from a record with no pricing stamp (0.13.0 or earlier), pinned at the ` +
-                    `${saved.multiplier! >= 1.8 ? 'ceiling' : 'floor'} of its clamp: it corrected per-class rates ` +
+                    `${saved.multiplier! >= CALIBRATION_CEILING ? 'ceiling' : 'floor'} of its clamp: it corrected per-class rates ` +
                     `that were off by more than the clamp allows, and says nothing about this release's`
                   : `from a record with no pricing stamp (0.13.0 or earlier), in a store holding content ` +
                     `repriced since (current epoch ${current})`;
@@ -14776,7 +14810,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             // the multiplier may be epoch 1's and still right, or older and
             // stale, and the record can't say. Keep it as provisional, and
             // write nothing: the stamp is the first sample's to give.
-            this._calibration = Math.min(1.8, Math.max(0.6, saved.multiplier!));
+            this._calibration = Math.min(CALIBRATION_CEILING, Math.max(0.6, saved.multiplier!));
             this._calibrationReset = isCalibrationReset(saved.reset) ? saved.reset : null;
             this._calibrationProvisional = { fromEpoch: null };
             if (commit) {
