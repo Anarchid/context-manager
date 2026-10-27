@@ -576,6 +576,16 @@ describe('Merge terminal-disposition gate', () => {
       '</thinking> the memory after a stray tag',
       '</thinking> the memory after a stray tag',
     ],
+    [
+      'a preamble followed by prose that ends with a close tag keeps the prose',
+      '<thinking>plan</thinking>The model printed </thinking>',
+      'The model printed </thinking>',
+    ],
+    [
+      'a preamble followed by prose and a later wrapper keeps the prose verbatim, as with the option off',
+      '<thinking>plan</thinking>The memory body.\n<thinking>afterthought</thinking>',
+      'The memory body.\n<thinking>afterthought</thinking>',
+    ],
   ] as const) {
     it(`opt-in merge: ${label}`, async () => {
       const mock = scripted([{ stop: 'end_turn', text }]);
@@ -584,6 +594,22 @@ describe('Merge terminal-disposition gate', () => {
       await fx.strategy.tick(ctx(fx.manager));
 
       assert.equal(fx.strategy.summariesView().find((s) => s.level === 2)?.content, stored);
+      await fx.manager.close();
+    });
+  }
+
+  for (const [label, text] of [
+    ['an opening tag never closed', '<thinking>unfinished memory'],
+    ['a leading wrapper followed at once by another tag', '<thinking>a</thinking> <think>b'],
+  ] as const) {
+    it(`opt-in merge: ${label} is rejected`, async () => {
+      const mock = scripted([{ stop: 'end_turn', text }]);
+      const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+
+      await fx.strategy.tick(ctx(fx.manager));
+
+      assert.equal(fx.strategy.summariesView().filter((s) => s.level === 2).length, 0);
+      assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1);
       await fx.manager.close();
     });
   }

@@ -1922,11 +1922,12 @@ const LEADING_THINK_TAG = /^\s*<\/?\s*think(?:ing)?\b[^>]*>/i;
  * read by shape:
  * - one closed wrapper around the whole answer, with no tag in its body: the
  *   prose inside it is the memory;
- * - a whole-answer wrapper whose body holds more tags (nested, or several
- *   wrappers back to back): control-shaped, so the answer counts as empty
- *   and takes the retry;
  * - one leading wrapper followed by prose: the prose, verbatim, mentions of
- *   tags in it included, unless it starts with another tag (empty);
+ *   tags in it included;
+ * - a leading wrapper with another opening tag inside it (nesting), or
+ *   followed at once by another tag (wrappers back to back), or by nothing:
+ *   what would be kept is control-shaped, so the answer counts as empty and
+ *   takes the retry;
  * - an opening tag that is never closed: empty, as `stripThinkingPreamble`
  *   reads an unclosed leading `<thinking>`.
  * Every other answer goes to `stripThinkingPreamble`, as with the option off.
@@ -1938,13 +1939,12 @@ function extractCompressionSummaryText(
   if (recoverWholeWrapper && LEADING_THINK_OPEN.test(text)) {
     const recovered = unwrapWholeLiteralThinkingWrapper(text);
     if (recovered !== null) return { text: recovered, recoveredWholeWrapper: true };
-    if (/^\s*<(think(?:ing)?)\s*>[\s\S]*<\/\1\s*>\s*$/i.test(text)) {
-      return { text: '', recoveredWholeWrapper: false }; // wrapped whole, tags inside
-    }
-    const suffix = text.match(/^\s*<(think(?:ing)?)\s*>[\s\S]*?<\/\1\s*>([\s\S]*)$/i);
-    if (!suffix) return { text: '', recoveredWholeWrapper: false }; // never closed
-    const rest = suffix[2]!.trim();
-    if (!rest || LEADING_THINK_TAG.test(rest)) {
+    const lead = text.match(/^\s*<(think(?:ing)?)\s*>([\s\S]*?)<\/\1\s*>([\s\S]*)$/i);
+    if (!lead) return { text: '', recoveredWholeWrapper: false }; // never closed
+    const rest = lead[3]!.trim();
+    // A tag inside the leading wrapper is nesting; a tag right after it is a
+    // second wrapper. Either way what would be kept is control-shaped.
+    if (/<\s*think(?:ing)?\b[^>]*>/i.test(lead[2]!) || !rest || LEADING_THINK_TAG.test(rest)) {
       return { text: '', recoveredWholeWrapper: false };
     }
     return { text: rest, recoveredWholeWrapper: false };
@@ -11250,13 +11250,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // A recovered answer has text blocks alone, so it stores no carrier, as
       // any text-only answer; replay reads its unwrapped `content`.
       const responseContent = captureResponseContent(acceptedResponse?.content ?? []);
-      if (extraction.recoveredWholeWrapper) {
-        logCompressionCall({
-          event: 'compression:literal-thinking-wrapper-recovered',
-          operation: 'compress_l1',
-          metadata: { model: this.requireCompressionModel(), chunk_size: chunk.messages.length },
-        }, this.ns);
-      }
       logResponse = summaryText;
 
       // A bugged/empty generation (summarizer returned no text — spent budget on
@@ -11385,6 +11378,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       chunk.compressed = true;
       chunk.summaryId = entry.id;
       this.markChunkRecordCompressed(chunk.recordId, entry.id);
+      if (extraction.recoveredWholeWrapper) {
+        logCompressionCall({
+          event: 'compression:literal-thinking-wrapper-recovered',
+          operation: 'compress_l1',
+          metadata: { model: this.requireCompressionModel(), chunk_size: chunk.messages.length, summary_id: entry.id },
+        }, this.ns);
+      }
       this._compressionCount++;
       logSummaryId = entry.id;
       // The L1 is pushed and its chunk record marked: it has landed, on the
@@ -12494,13 +12494,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // A recovered answer has text blocks alone, so it stores no carrier,
       // as any text-only answer; replay reads its unwrapped `content`.
       const responseContent = captureResponseContent(assessment.response.content);
-      if (recoveredWholeWrapper) {
-        logCompressionCall({
-          event: 'compression:literal-thinking-wrapper-recovered',
-          operation: `merge_l${targetLevel}`,
-          metadata: { model: this.requireCompressionModel(), source_count: sourceIds.length },
-        }, this.ns);
-      }
       logResponse = mergedText;
 
       // The disposition gate guarantees nonempty PRE-strip text; a
@@ -12571,6 +12564,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // level up that lists it, unless another instance's merge lists it too:
       // see loadPersistedState.)
       this.pushSummary(newEntry);
+      if (recoveredWholeWrapper) {
+        logCompressionCall({
+          event: 'compression:literal-thinking-wrapper-recovered',
+          operation: `merge_l${targetLevel}`,
+          metadata: { model: this.requireCompressionModel(), source_count: sourceIds.length, summary_id: newEntry.id },
+        }, this.ns);
+      }
 
       for (const source of sources) {
         this.setMergedInto(source, newEntry.id);
