@@ -528,12 +528,26 @@ export interface SelectOptions {
    * host for kv-unified cache relevance. */
   kvUnifiedImmutablePrefixHash?: string;
   /** Audited, expiring continuity relaxation for disruptive transitions.
-   * Invalid or expired values fail closed to normal continuity weight. */
+   * Invalid or expired values fail closed to normal continuity weight. A
+   * committing select logs the relaxation it applies, or that it rejected
+   * one; a dry select logs neither, since a dry run isn't the live state. */
   kvUnifiedContinuityRelaxation?: {
     reason: 'surgery' | 'budget-transition' | 'infrastructure';
     multiplier: number;
     expiresAt: number;
   };
+}
+
+/**
+ * `AutobiographicalStrategy.previewContext` on the hierarchical path, whose
+ * select succeeded but which has no fold plan to preview.
+ * `ContextManager.previewContext` returns null for it.
+ */
+export class NoFoldPlanToPreviewError extends Error {
+  constructor() {
+    super('previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview');
+    this.name = 'NoFoldPlanToPreviewError';
+  }
 }
 
 /**
