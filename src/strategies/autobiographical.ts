@@ -1894,6 +1894,44 @@ export function stripThinkingPreamble(text: string): string {
   return text;
 }
 
+/**
+ * Opt-in compatibility for non-reasoning models whose entire authored memory
+ * is enclosed in one CLOSED literal thinking wrapper. This is intentionally
+ * narrower than `stripThinkingPreamble`: no suffix, no unclosed tag, no mid-
+ * content wrapper, and no native thinking block is accepted.
+ */
+export function unwrapWholeLiteralThinkingWrapper(text: string): string | null {
+  const match = text.match(
+    /^\s*<(think(?:ing)?)\s*>([\s\S]*)<\/\1\s*>\s*$/i,
+  );
+  if (!match) return null;
+  const body = match[2]!.trim();
+  if (!body || /<\/?\s*think(?:ing)?\b[^>]*>/i.test(body)) return null;
+  return body;
+}
+
+/**
+ * The summary text of a compression or merge answer. With
+ * `recoverWholeWrapper` (the opt-in, and only for an answer of text blocks
+ * alone), one closed `<thinking>` or `<think>` wrapper around the whole
+ * answer, with no tag in its body, is kept as the prose inside it. Every
+ * other answer goes to `stripThinkingPreamble`, as with the option off. So
+ * the option never drops a memory the default reading stores; the one shape
+ * it reads differently is a whole wrapper, stored as the prose inside it
+ * (the default strips a `<thinking>` one to nothing and keeps a `<think>` one
+ * verbatim, tags included).
+ */
+function extractCompressionSummaryText(
+  text: string,
+  recoverWholeWrapper: boolean,
+): { text: string; recoveredWholeWrapper: boolean } {
+  if (recoverWholeWrapper) {
+    const recovered = unwrapWholeLiteralThinkingWrapper(text);
+    if (recovered !== null) return { text: recovered, recoveredWholeWrapper: true };
+  }
+  return { text: stripThinkingPreamble(text), recoveredWholeWrapper: false };
+}
+
 function summarizeTelemetryMessages(
   messages: ReadonlyArray<{ participant: string; content: ContentBlock[] }>,
 ): Array<{
@@ -11108,21 +11146,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // progress: an end_turn whose text stripped to empty (recorded below
       // before the plain-prose rung was interrupted). It has no text.
       let acceptedResponse = response as NormalizedResponse | undefined;
-      const extractSummaryText = (r: NormalizedResponse): string =>
-        stripThinkingPreamble(
-          r.content
-            .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-            .map(b => b.text)
-            .join('\n'),
-        );
-      let summaryText = acceptedResponse ? extractSummaryText(acceptedResponse) : '';
+      const extractSummaryText = (r: NormalizedResponse): { text: string; recoveredWholeWrapper: boolean } => {
+        const rawText = r.content
+          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+          .map(b => b.text)
+          .join('\n');
+        // The opt-in reads an answer of text blocks alone; one with native
+        // reasoning beside its text is read as before.
+        const onlyTextBlocks = r.content.every((block) => block.type === 'text');
+        const recoveryEnabled = this.config.recoverLiteralThinkingWrappedCompression === true;
+        return extractCompressionSummaryText(rawText, recoveryEnabled && onlyTextBlocks);
+      };
+      let extraction = acceptedResponse
+        ? extractSummaryText(acceptedResponse)
+        : { text: '', recoveredWholeWrapper: false };
+      let summaryText = extraction.text;
       /** The plain-prose rung's own outcome, when it ran (or was known) and gave no memory. */
       let proseOutcome: CompressionRefusalOutcomeRecord | undefined;
       /** The rung whose answer stripped to empty, as recorded before the plain-prose retry. */
       let emptyRung: { curveLabel: string; requestHash: string } | undefined;
 
       // A generation whose whole text was a literal <thinking> wrapper strips
-      // to empty (Opus-3-class habit — see PLAIN_PROSE_RETRY_LINE). The memory
+      // to empty (Opus-3-class habit — see PLAIN_PROSE_RETRY_LINE), unless
+      // recoverLiteralThinkingWrappedCompression recovered it above. The memory
       // content exists; ask once, explicitly, for it as plain prose before
       // giving up. Retry-only: first attempts stay byte-canonical.
       const sourceOnlyFinalWon = successfulTrace?.curveLabel === 'source-only-final';
@@ -11160,10 +11206,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ));
         if (proseStep.kind === 'answered') {
           const proseStop = this.compressionResponseStopReason(proseStep.response);
-          const proseText = proseStop === 'end_turn' ? extractSummaryText(proseStep.response as NormalizedResponse) : '';
-          if (proseText.trim()) {
+          const proseExtraction = proseStop === 'end_turn'
+            ? extractSummaryText(proseStep.response as NormalizedResponse)
+            : { text: '', recoveredWholeWrapper: false };
+          if (proseExtraction.text.trim()) {
             acceptedResponse = proseStep.response as NormalizedResponse;
-            summaryText = proseText;
+            extraction = proseExtraction;
+            summaryText = proseExtraction.text;
             successfulTrace = attemptTraces[attemptTraces.length - 1];
           } else {
             proseOutcome = {
@@ -11179,6 +11228,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
 
+      // A recovered answer has text blocks alone, so it stores no carrier, as
+      // any text-only answer; replay reads its unwrapped `content`.
       const responseContent = captureResponseContent(acceptedResponse?.content ?? []);
       logResponse = summaryText;
 
@@ -11308,6 +11359,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       chunk.compressed = true;
       chunk.summaryId = entry.id;
       this.markChunkRecordCompressed(chunk.recordId, entry.id);
+      if (extraction.recoveredWholeWrapper) {
+        logCompressionCall({
+          event: 'compression:literal-thinking-wrapper-recovered',
+          operation: 'compress_l1',
+          metadata: { model: this.requireCompressionModel(), chunk_size: chunk.messages.length, summary_id: entry.id },
+        }, this.ns);
+      }
       this._compressionCount++;
       logSummaryId = entry.id;
       // The L1 is pushed and its chunk record marked: it has landed, on the
@@ -12409,7 +12467,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       // `content` stays text-only; verbatim blocks (incl. signed thinking)
       // are captured for replay — see the L1 site / captureResponseContent.
-      const mergedText = stripThinkingPreamble(assessment.text);
+      const recoveryEnabled = this.config.recoverLiteralThinkingWrappedCompression === true;
+      const onlyTextBlocks = assessment.response.content.every((block) => block.type === 'text');
+      const mergeExtraction = extractCompressionSummaryText(assessment.text, recoveryEnabled && onlyTextBlocks);
+      const mergedText = mergeExtraction.text;
+      const recoveredWholeWrapper = mergeExtraction.recoveredWholeWrapper;
+      // A recovered answer has text blocks alone, so it stores no carrier,
+      // as any text-only answer; replay reads its unwrapped `content`.
       const responseContent = captureResponseContent(assessment.response.content);
       logResponse = mergedText;
 
@@ -12481,6 +12545,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // level up that lists it, unless another instance's merge lists it too:
       // see loadPersistedState.)
       this.pushSummary(newEntry);
+      if (recoveredWholeWrapper) {
+        logCompressionCall({
+          event: 'compression:literal-thinking-wrapper-recovered',
+          operation: `merge_l${targetLevel}`,
+          metadata: { model: this.requireCompressionModel(), source_count: sourceIds.length, summary_id: newEntry.id },
+        }, this.ns);
+      }
 
       for (const source of sources) {
         this.setMergedInto(source, newEntry.id);

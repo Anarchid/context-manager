@@ -1485,6 +1485,16 @@ export interface AutobiographicalConfig {
    * behaviour. (Found 2026-07-26 bringing up Evander, claude-3-opus-20240229.)
    */
   compressionMaxTokens?: number;
+  /**
+   * Compatibility for models without native reasoning that write the whole
+   * memory inside one closed literal `<thinking>…</thinking>` or
+   * `<think>…</think>` text wrapper. When true, a compression or merge answer
+   * of text blocks alone that is exactly that shape, with no tag in its body,
+   * is stored as the prose inside it. Every other answer is read as with the
+   * option off. Default false. It applies to answers from then on; chunks
+   * already in quarantine stay there until their records are cleared.
+   */
+  recoverLiteralThinkingWrappedCompression?: boolean;
   /** Maximum tokens per individual message in compiled output. Messages exceeding
    *  this limit have their text/tool_result content truncated. A value that
    *  isn't a positive number, such as 0 or NaN, means no limit. */
