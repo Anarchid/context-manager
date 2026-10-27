@@ -1915,9 +1915,11 @@ export function unwrapWholeLiteralThinkingWrapper(text: string): string | null {
  * `recoverWholeWrapper` (the opt-in, and only for an answer of text blocks
  * alone), one closed `<thinking>` or `<think>` wrapper around the whole
  * answer, with no tag in its body, is kept as the prose inside it. Every
- * other answer goes to `stripThinkingPreamble`, as with the option off, so
- * the option only ever adds a memory: it never drops or changes one the
- * default reading stores.
+ * other answer goes to `stripThinkingPreamble`, as with the option off. So
+ * the option never drops a memory the default reading stores; the one shape
+ * it reads differently is a whole wrapper, stored as the prose inside it
+ * (the default strips a `<thinking>` one to nothing and keeps a `<think>` one
+ * verbatim, tags included).
  */
 function extractCompressionSummaryText(
   text: string,
@@ -11165,7 +11167,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let emptyRung: { curveLabel: string; requestHash: string } | undefined;
 
       // A generation whose whole text was a literal <thinking> wrapper strips
-      // to empty (Opus-3-class habit — see PLAIN_PROSE_RETRY_LINE). The memory
+      // to empty (Opus-3-class habit — see PLAIN_PROSE_RETRY_LINE), unless
+      // recoverLiteralThinkingWrappedCompression recovered it above. The memory
       // content exists; ask once, explicitly, for it as plain prose before
       // giving up. Retry-only: first attempts stay byte-canonical.
       const sourceOnlyFinalWon = successfulTrace?.curveLabel === 'source-only-final';

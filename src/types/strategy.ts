@@ -1486,11 +1486,13 @@ export interface AutobiographicalConfig {
    */
   compressionMaxTokens?: number;
   /**
-   * Resident-specific compatibility for models that emit the complete memory
-   * as one CLOSED literal `<thinking>…</thinking>` TEXT wrapper. When true,
-   * compression only unwraps that exact whole-response shape into ordinary
-   * summary prose. Default false. Native thinking blocks and unclosed/mixed
-   * wrappers are never recovered.
+   * Compatibility for models without native reasoning that write the whole
+   * memory inside one closed literal `<thinking>…</thinking>` or
+   * `<think>…</think>` text wrapper. When true, a compression or merge answer
+   * of text blocks alone that is exactly that shape, with no tag in its body,
+   * is stored as the prose inside it. Every other answer is read as with the
+   * option off. Default false. It applies to answers from then on; chunks
+   * already in quarantine stay there until their records are cleared.
    */
   recoverLiteralThinkingWrappedCompression?: boolean;
   /** Maximum tokens per individual message in compiled output. Messages exceeding
