@@ -79,7 +79,7 @@ How it works, with each option's default in parentheses:
 - Each `tick()` does at most one piece of compression work: it compresses the next waiting chunk, or else runs the next waiting merge. So call it regularly, for instance after each turn. For a chunk, the strategy asks `compressionModel`, through membrane, what it recalls from that part of the conversation. The answer is a level-1 summary, which takes the chunk's place in compiled context. Set `autoTickOnNewMessage: true` (false) to start a tick in the background on each new message instead of calling `tick()` yourself.
 - `compressionModel` has no default. Without it, the strategy refuses to write summaries, because a substitute model writing in the agent's voice would corrupt the record. Without a membrane, `tick()` only logs a warning.
 - A summary renders where its messages were, as a short exchange: a `Context Manager` turn with a header such as `[Recall L1-3]`, answered with the summary in a turn from `summaryParticipant` (`Claude`). With adaptive resolution (below), the `Context Manager` turn holds `summaryContextLabel` ("What do you remember from earlier?") instead.
-- Summaries merge into one a level up once `mergeThreshold` (6) of them sit unmerged at a level. With `hierarchical` (true) set to false, they stay at one level.
+- Summaries merge into one a level up once `mergeThreshold` (6) of them sit unmerged together at the newest end of a level, taking one fewer where that would leave a single summary behind (the whole run, where one fewer would be a group of one, as at a threshold of 2). An older run that can't grow, cut off by a hole such as a chunk the summarizer refused, merges once it holds two, in even groups that leave none of it alone. With `hierarchical` (true) set to false, they stay at one level.
 - `headWindowTokens` (0) keeps the start of the conversation raw as well, for instructions that should stay verbatim.
 - With `adaptiveResolution: true` (false), each compile chooses how deeply to fold each part of history to fit the budget. `foldingStrategy` names the solver: `flat-profile` (the default), `oldest-first`, `kv-stable` or `kv-unified`. `kv-unified` needs an explicit `kvUnified` policy.
 
@@ -97,10 +97,6 @@ Every option is documented on `AutobiographicalConfig` in `src/types/strategy.ts
 ## Branches
 
 Chronicle keeps the store's history, so a conversation can branch. `branchAt(messageId)` creates a branch as of a message, and `switchBranch(name)` moves to it. `fork()` creates a branch at the current head and switches to it. The strategy's state, summaries included, follows the branch.
-
-## Observing a manager's work
-
-Pass `observer` to `ContextManager.open` to be told, as it happens, of each compile (`compile`: compiled, refused or failed, its whole duration, the thrown error, and the compile's render stats), of each refusal context-manager itself makes of compression (`compression`: by a reason from `COMPRESSION_REFUSALS`), and of each calibration sample (`calibration`: by an outcome from `CALIBRATION_SAMPLE_OUTCOMES`). The manager hands the observer to its strategy too. Each callback is optional and called synchronously. What it throws or rejects never reaches the work: the manager logs a callback's first failure once through its diagnostics, under its namespace, and drops the rest, so a compile's result is the same with an observer as without one. Outside that is a returned promise no JavaScript can give a handler, such as one whose `constructor` or species can't be used, or a proxy around one: its rejection goes unhandled, which ends a Node process by default. A record's error and render stats are the objects the caller gets, so treat them as read-only. A refused compile's `OverBudgetError` names its stage in `stageId`, from `OVER_BUDGET_STAGES`. A record can hold text from the store, such as a refusal's message, which names pins, so choose what you keep or send from it.
 
 ## Inspecting and repairing stores
 
