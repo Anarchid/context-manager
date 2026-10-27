@@ -544,6 +544,12 @@ export interface SelectOptions {
    * ContextManager.compile fills it from its injections; `system` ones go
    * into the caller's system prompt instead. */
   messageInjections?: ReadonlyArray<ContentBlock[]>;
+  /** The head of the request the compile is for: the system prompt and tool
+   * definitions it sends besides the window and its message-position
+   * injections. AutobiographicalStrategy prices it, and the message
+   * injections, for `RenderStats.request`, and selects exactly as it would
+   * without it. */
+  requestHead?: RequestOverhead;
 }
 
 /**
@@ -853,18 +859,21 @@ export function isSummaryOverviewStrategy(s: ContextStrategy): s is SummaryOverv
 }
 
 /**
- * What a request carried besides the compiled window and the compile's
- * message-position injections (which the compile prices itself), as the
- * caller sent it (see `AutobiographicalStrategy.reportRealInputTokens`). The
- * provider counts it in the input total and the compile estimate doesn't, so
- * a calibration sample that leaves it out learns it as a per-token rate.
- * Passing it says this is everything the request sent besides those; a
- * caller that can't see the request's head passes nothing.
+ * A request's head: what it carries besides the compiled window and the
+ * compile's message-position injections (which the compile prices itself).
+ * A compile takes the head its request will send (`SelectOptions.requestHead`)
+ * and reports its price (`RenderStats.request`); a calibration sample takes
+ * the head the request sent (see
+ * `AutobiographicalStrategy.reportRealInputTokens`). The provider counts it
+ * in the input total and the compile estimate doesn't, so a calibration
+ * sample that leaves it out learns it as a per-token rate. Passing it says
+ * this is everything the request sends besides those; a caller that can't
+ * see the request's head passes nothing.
  */
 export interface RequestOverhead {
-  /** The system prompt the request sent. */
+  /** The system prompt the request sends. */
   system?: string;
-  /** The tool definitions the request sent. */
+  /** The tool definitions the request sends. */
   tools?: ReadonlyArray<ToolDefinition>;
 }
 
@@ -947,7 +956,25 @@ export interface RenderStats {
     pricingEpoch: number;
     provisional?: true;
     reset?: CalibrationReset;
+    /** The largest multiplier the strategy applies: one learned or loaded
+     *  above it is applied at it. AutobiographicalStrategy reports it
+     *  whenever it reports `calibration`. */
+    ceiling?: number;
   };
+
+  /**
+   * What the request carries besides the rendered context, in the units of
+   * `total` at this compile's multiplier and priced as a calibration sample
+   * prices it (`AutobiographicalStrategy.reportRealInputTokens`):
+   * `headTokens` for `SelectOptions.requestHead`, and `injectedTokens` for
+   * the compile's message-position injections (`SelectOptions.messageInjections`),
+   * 0 when it has none. Present only when the select was given a head, so a
+   * compile without one has no price here rather than a price of 0. The
+   * head's price is the store's estimate of the system prompt and of the tool
+   * definitions as JSON (`JSON.stringify`), not the provider's count of what
+   * its formatter sends.
+   */
+  request?: { headTokens: number; injectedTokens: number };
 
   /**
    * Planner/emitter reconciliation for this compile. `planned` is the picker's
