@@ -14543,7 +14543,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // the cut's own estimate passing it. Whether the old price limited a
     // message depends on the multiplier it was priced under, so this asks
     // whether its estimate could have passed the cap plus 50 at the clamp's
-    // ceiling of 1.8, bounded from its estimate at the applied multiplier.
+    // ceiling (CALIBRATION_CEILING), bounded from its estimate at the applied multiplier.
     // The store rounds each top-level block's estimate on its own, so that
     // estimate is within half a token a block of the applied multiplier
     // times the blocks' unrounded sum, and at the ceiling each block's

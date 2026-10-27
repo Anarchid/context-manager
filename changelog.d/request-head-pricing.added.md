@@ -5,10 +5,10 @@
   compile's message-position injections. Both are in the units of `total` at
   the compile's multiplier, priced as a calibration sample prices them. A compile
   given no head reports no `request`, and a head changes nothing the compile
-  selects. The head's price is the store's estimate of the system prompt and
-  of the tool definitions as JSON, not the provider's count. This is the
-  report #323 asked for in its second fix.
+  selects. A head whose tool definitions can't be serialised as JSON is
+  refused before anything is selected. The head's price is the store's
+  estimate of the system prompt and of the tool definitions as JSON, not the
+  provider's count. This is the report #323 asked for in its second fix.
 - `RenderStats.calibration.ceiling`: the largest multiplier the strategy
-  applies, 1.8, reported with every calibration. A multiplier learned above
-  it is applied at it, and a stored one above it is applied at it or not
-  at all, as before.
+  applies, 1.8, reported with every calibration. It applies none above it,
+  as before.

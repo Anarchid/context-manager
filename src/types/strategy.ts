@@ -548,7 +548,8 @@ export interface SelectOptions {
    * definitions it sends besides the window and its message-position
    * injections. AutobiographicalStrategy prices it, and the message
    * injections, for `RenderStats.request`, and selects exactly as it would
-   * without it. */
+   * without it. A head whose tool definitions can't be serialised as JSON
+   * is refused before anything is selected. */
   requestHead?: RequestOverhead;
 }
 
@@ -956,9 +957,8 @@ export interface RenderStats {
     pricingEpoch: number;
     provisional?: true;
     reset?: CalibrationReset;
-    /** The largest multiplier the strategy applies: one learned above it is
-     *  applied at it, and a stored one above it is applied at it or not at
-     *  all. AutobiographicalStrategy reports it whenever it reports
+    /** The largest multiplier the strategy applies: it applies none above
+     *  it. AutobiographicalStrategy reports it whenever it reports
      *  `calibration`. */
     ceiling?: number;
   };
