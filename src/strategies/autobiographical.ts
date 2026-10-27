@@ -1910,34 +1910,40 @@ export function unwrapWholeLiteralThinkingWrapper(text: string): string | null {
   return body;
 }
 
-function hasLiteralThinkingLikeTag(text: string): boolean {
-  return /<\/?\s*think(?:ing)?\b[^>]*>/i.test(text);
-}
+/** A think-like tag (`<thinking>`, `<think>`, either case, or a close tag) at the start of the text. */
+const LEADING_THINK_TAG = /^\s*<\/?\s*think(?:ing)?\b[^>]*>/i;
 
+/**
+ * The summary text of a compression or merge answer. With
+ * `recoverWholeWrapper` (the opt-in, and only for an answer of text blocks
+ * alone), one closed literal wrapper around the whole answer is kept as the
+ * prose inside it. An answer that opens with a think-like tag otherwise keeps
+ * the public prose after one leading wrapper, as `stripThinkingPreamble` does,
+ * unless what would be kept is still tag-shaped: another wrapper, or a close
+ * tag that ends something the preamble opened. That residual is control-shaped,
+ * so the answer counts as empty and takes the retry. An answer that doesn't
+ * open with a tag is left to `stripThinkingPreamble`, which treats a mention
+ * of a tag mid-content as content.
+ */
 function extractCompressionSummaryText(
   text: string,
   recoverWholeWrapper: boolean,
 ): { text: string; recoveredWholeWrapper: boolean } {
-  if (recoverWholeWrapper) {
+  if (recoverWholeWrapper && LEADING_THINK_TAG.test(text)) {
     const recovered = unwrapWholeLiteralThinkingWrapper(text);
     if (recovered !== null) return { text: recovered, recoveredWholeWrapper: true };
 
-    const openings = text.match(/<\s*think(?:ing)?\s*>/gi)?.length ?? 0;
-    const closings = text.match(/<\/\s*think(?:ing)?\s*>/gi)?.length ?? 0;
-    if (openings > 1 || closings > 1) return { text: '', recoveredWholeWrapper: false };
-
-    // Preserve the legacy public-suffix case for either spelling/case: one
-    // leading pseudo-thinking preamble followed by actual public prose.
-    const suffix = text.match(
-      /^\s*<(think(?:ing)?)\s*>[\s\S]*?<\/\1\s*>\s*([\s\S]+)$/i,
-    );
-    if (suffix?.[2]?.trim()) {
-      return { text: suffix[2].trim(), recoveredWholeWrapper: false };
+    // One leading wrapper of either spelling, then what follows it.
+    const suffix = text.match(/^\s*<(think(?:ing)?)\s*>[\s\S]*?<\/\1\s*>([\s\S]*)$/i);
+    if (!suffix) return { text: '', recoveredWholeWrapper: false }; // a leading tag that opens no closed wrapper
+    const rest = suffix[2]!.trim();
+    if (!rest) return { text: '', recoveredWholeWrapper: false };
+    const opens = rest.match(/<\s*think(?:ing)?\b[^>]*>/gi)?.length ?? 0;
+    const closes = rest.match(/<\/\s*think(?:ing)?\s*>/gi)?.length ?? 0;
+    if (LEADING_THINK_TAG.test(rest) || closes > opens) {
+      return { text: '', recoveredWholeWrapper: false };
     }
-
-    // Any other think-like syntax under the opt-in is malformed/ambiguous.
-    // Fail closed instead of persisting a control-shaped residual.
-    if (hasLiteralThinkingLikeTag(text)) return { text: '', recoveredWholeWrapper: false };
+    return { text: rest, recoveredWholeWrapper: false };
   }
   return { text: stripThinkingPreamble(text), recoveredWholeWrapper: false };
 }
@@ -11161,11 +11167,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
           .map(b => b.text)
           .join('\n');
+        // The opt-in reads an answer of text blocks alone; one with native
+        // reasoning beside its text is read as before.
         const onlyTextBlocks = r.content.every((block) => block.type === 'text');
         const recoveryEnabled = this.config.recoverLiteralThinkingWrappedCompression === true;
-        if (recoveryEnabled && !onlyTextBlocks && hasLiteralThinkingLikeTag(rawText)) {
-          return { text: '', recoveredWholeWrapper: false };
-        }
         return extractCompressionSummaryText(rawText, recoveryEnabled && onlyTextBlocks);
       };
       let extraction = acceptedResponse
@@ -11238,9 +11243,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
       }
 
-      const responseContent = extraction.recoveredWholeWrapper
-        ? [{ type: 'text' as const, text: summaryText }]
-        : captureResponseContent(acceptedResponse?.content ?? []);
+      // A recovered answer has text blocks alone, so it stores no carrier, as
+      // any text-only answer; replay reads its unwrapped `content`.
+      const responseContent = captureResponseContent(acceptedResponse?.content ?? []);
       if (extraction.recoveredWholeWrapper) {
         logCompressionCall({
           event: 'compression:literal-thinking-wrapper-recovered',
@@ -12479,15 +12484,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // are captured for replay — see the L1 site / captureResponseContent.
       const recoveryEnabled = this.config.recoverLiteralThinkingWrappedCompression === true;
       const onlyTextBlocks = assessment.response.content.every((block) => block.type === 'text');
-      const mergeExtraction = recoveryEnabled && !onlyTextBlocks &&
-        hasLiteralThinkingLikeTag(assessment.text)
-        ? { text: '', recoveredWholeWrapper: false }
-        : extractCompressionSummaryText(assessment.text, recoveryEnabled && onlyTextBlocks);
+      const mergeExtraction = extractCompressionSummaryText(assessment.text, recoveryEnabled && onlyTextBlocks);
       const mergedText = mergeExtraction.text;
       const recoveredWholeWrapper = mergeExtraction.recoveredWholeWrapper;
-      const responseContent = recoveredWholeWrapper
-        ? [{ type: 'text' as const, text: mergedText }]
-        : captureResponseContent(assessment.response.content);
+      // A recovered answer has text blocks alone, so it stores no carrier,
+      // as any text-only answer; replay reads its unwrapped `content`.
+      const responseContent = captureResponseContent(assessment.response.content);
       if (recoveredWholeWrapper) {
         logCompressionCall({
           event: 'compression:literal-thinking-wrapper-recovered',

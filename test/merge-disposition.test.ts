@@ -455,10 +455,10 @@ describe('Merge terminal-disposition gate', () => {
     assert.equal(mock.calls.length, 1, 'no plain-prose retry needed');
     const parent = fx.strategy.summariesView().find((s) => s.level === 2);
     assert.equal(parent?.content, 'I remember the field and the people who kept it.');
-    assert.deepEqual(
+    assert.equal(
       parent?.responseContent,
-      [{ type: 'text', text: 'I remember the field and the people who kept it.' }],
-      'replay uses normalized public prose, not the pseudo-thinking wrapper',
+      undefined,
+      'a text-only answer stores no carrier; replay reads the unwrapped content',
     );
     assert.equal(fx.strategy.mergeQueueView().length, 0);
     await fx.manager.close();
@@ -510,6 +510,46 @@ describe('Merge terminal-disposition gate', () => {
       ],
       usage: { inputTokens: 100, outputTokens: 40 },
     } }]);
+    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+
+    await fx.strategy.tick(ctx(fx.manager));
+
+    assert.equal(fx.strategy.summariesView().filter((s) => s.level === 2).length, 0);
+    assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1);
+    await fx.manager.close();
+  });
+
+  it('opt-in merge: native reasoning plus a leading preamble keeps the public suffix, as with the option off', async () => {
+    const mock = scripted([{ raw: {
+      stopReason: 'end_turn',
+      content: [
+        { type: 'thinking', thinking: 'native private reasoning', signature: 'signed' },
+        { type: 'text', text: '<thinking>pseudo preamble</thinking>the merged public body' },
+      ],
+      usage: { inputTokens: 100, outputTokens: 40 },
+    } }]);
+    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+
+    await fx.strategy.tick(ctx(fx.manager));
+
+    assert.equal(fx.strategy.summariesView().find((s) => s.level === 2)?.content, 'the merged public body');
+    assert.equal(fx.strategy.mergeQueueView().length, 0);
+    await fx.manager.close();
+  });
+
+  it('opt-in merge: a mention of a thinking tag mid-content is content', async () => {
+    const text = 'We talked about why a model would write <thinking> as plain text.';
+    const mock = scripted([{ stop: 'end_turn', text }]);
+    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+
+    await fx.strategy.tick(ctx(fx.manager));
+
+    assert.equal(fx.strategy.summariesView().find((s) => s.level === 2)?.content, text);
+    await fx.manager.close();
+  });
+
+  it('opt-in merge: a nested wrapper leaves a dangling close tag, so the answer is rejected', async () => {
+    const mock = scripted([{ stop: 'end_turn', text: '<thinking>A <thinking>B</thinking> C</thinking>' }]);
     const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
 
     await fx.strategy.tick(ctx(fx.manager));

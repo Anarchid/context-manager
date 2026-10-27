@@ -1,12 +1,14 @@
 - `recoverLiteralThinkingWrappedCompression` on `AutobiographicalConfig` (off
   by default): for a model without native reasoning that writes a whole
   compression or merge answer inside one closed literal `<thinking>…</thinking>`
-  text wrapper, the strategy keeps the prose inside it as the memory, where it
-  stripped the answer to nothing and went on to the plain-prose retry. Only that
-  exact shape is recovered: one wrapper around the whole answer, in a response
-  with text blocks only. A single leading wrapper followed by public prose keeps
-  the prose after it, as before. Any other think-like markup under the option,
-  more than one wrapper or one beside a native reasoning block, leaves the
-  answer empty, so it takes the retry and quarantine path rather than storing
-  control-shaped text. A recovered answer is stored and replayed as its plain
-  prose, and logs `compression:literal-thinking-wrapper-recovered`.
+  (or `<think>…</think>`) text wrapper, the strategy keeps the prose inside it
+  as the memory, where it stripped the answer to nothing and went on to the
+  plain-prose retry. It reads only an answer of text blocks alone; one with
+  native reasoning beside its text is read as before. An answer that opens with
+  a leading wrapper followed by public prose keeps that prose, as before, unless
+  what would be kept is still tag-shaped (another wrapper, or a close tag that
+  ends something the preamble opened): that answer counts as empty and takes the
+  retry, rather than storing control-shaped text. A mention of a thinking tag
+  mid-content stays content. A recovered answer is stored as its plain prose,
+  with no replay carrier, as any text-only answer, and logs
+  `compression:literal-thinking-wrapper-recovered`.

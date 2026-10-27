@@ -515,11 +515,60 @@ describe('compression refusal recall curves', () => {
     assert.equal(fx.target.compressed, true);
     const produced = fx.strategy.summariesView().find((entry) => entry.id === fx.target.summaryId);
     assert.equal(produced?.content, 'I remember arriving in the field and being welcomed home.');
-    assert.deepEqual(
+    assert.equal(
       produced?.responseContent,
-      [{ type: 'text', text: 'I remember arriving in the field and being welcomed home.' }],
-      'replay uses normalized public prose without the pseudo-thinking wrapper',
+      undefined,
+      'a text-only answer stores no carrier; replay reads the unwrapped content',
     );
+    fx.manager.close();
+  });
+
+  it('opt-in at L1: a fail-closed canonical answer, then a plain-prose retry that comes back whole-wrapped, stores the retry\'s prose', async () => {
+    const mock = flexibleMembrane([
+      { stop: 'end_turn', text: '<thinking>first</thinking><thinking>second</thinking>' },
+      { stop: 'end_turn', text: '<thinking>\nThe retry\'s memory, wrapped whole.\n</thinking>' },
+    ]);
+    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+
+    assert.equal(mock.calls.length, 2, 'the canonical, then the plain-prose rung');
+    assert.equal(fx.target.compressed, true);
+    const produced = fx.strategy.summariesView().find((entry) => entry.id === fx.target.summaryId);
+    assert.equal(produced?.content, "The retry's memory, wrapped whole.");
+    assert.equal(produced?.responseContent, undefined);
+    fx.manager.close();
+  });
+
+  it('opt-in at L1: a mention of a thinking tag mid-content is content', async () => {
+    const text = 'I noticed the model printed </thinking> in its output, and we laughed about it.';
+    const mock = flexibleMembrane([{ stop: 'end_turn', text }]);
+    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+
+    assert.equal(mock.calls.length, 1);
+    const produced = fx.strategy.summariesView().find((entry) => entry.id === fx.target.summaryId);
+    assert.equal(produced?.content, text);
+    fx.manager.close();
+  });
+
+  it('opt-in at L1: with native reasoning beside the text, a leading preamble is stripped as before and the prose after it kept', async () => {
+    const mock = flexibleMembrane([{ raw: {
+      stopReason: 'end_turn',
+      content: [
+        { type: 'thinking', thinking: 'native private reasoning', signature: 'signed' },
+        { type: 'text', text: '<thinking>pseudo preamble</thinking>the public memory body' },
+      ],
+      usage: { inputTokens: 100, outputTokens: 40 },
+    } }]);
+    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+
+    await fx.strategy.run(fx.target, managerContext(fx.manager));
+
+    assert.equal(mock.calls.length, 1);
+    const produced = fx.strategy.summariesView().find((entry) => entry.id === fx.target.summaryId);
+    assert.equal(produced?.content, 'the public memory body');
     fx.manager.close();
   });
 
