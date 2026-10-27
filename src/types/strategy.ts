@@ -1204,7 +1204,7 @@ export interface CompressionQuarantineSpan {
 }
 
 /** Delimiter convention applied to recall answer content. See `recallEnvelope`. */
-export type RecallEnvelopeMode = 'none' | 'xml';
+export type RecallEnvelopeMode = 'none' | 'xml' | 'bare';
 
 /** Where a summary's signed reasoning carriers are replayed. See `carrierPolicy`. */
 export type CarrierPolicy = 'full' | 'live-strip';
@@ -1435,11 +1435,13 @@ export interface AutobiographicalConfig {
    *    a recalled memory is marked as explicitly as its start (instances have
    *    been observed reading past it into unrelated content). Attributes come
    *    from the summary record; one the record cannot answer for is omitted.
+   *  - `'bare'` — the same fence with no attributes, `<cm-recall>` …
+   *    `</cm-recall>`, on every path `'xml'` takes.
    *
    * The envelope is a collision-tolerant delimiter convention, not parseable
    * XML: answer text is model prose and is never entity-escaped.
    *
-   * Q-side labels are identical under both modes.
+   * The envelope never wraps a Q-side label.
    *
    * WHY THE DEFAULT IS OFF. Recall answers are built at one shared choke
    * point, and the presented window is not its only consumer: the same

@@ -1,0 +1,1 @@
+- `recallEnvelope: 'bare'` fences each recall answer with `<cm-recall>` and `</cm-recall>` and no attributes, on every path `'xml'` takes, and the recall cap prices the bare pair. `'none'` and `'xml'` render as before.

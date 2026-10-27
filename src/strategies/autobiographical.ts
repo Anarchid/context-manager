@@ -57,7 +57,7 @@ import {
   DEFAULT_TOOL_PROSE_RESULT,
   type ToolProseHoistOptions,
 } from '../tool-prose-hoist.js';
-import { recallEnvelopeAddedText, wrapRecallAnswerContent } from '../recall-envelope.js';
+import { isRecallEnveloped, recallEnvelopeAddedText, wrapRecallAnswerContent } from '../recall-envelope.js';
 import { defaultTokenEstimator, MessageStore } from '../message-store.js';
 import { persistMintRequestPreimage } from '../mint-preimage.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
@@ -4080,10 +4080,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * after it where the agent's own turn follows (RECALL_RESUME_TEXT). Rough
    * but defensive.
    *
-   * Under `recallEnvelope: 'xml'` the answer body also carries the envelope
-   * tags, so the estimate prices that summary's ACTUAL envelope string on top
-   * — attributes included, and zero when the envelope is off. A second magic
-   * constant would drift from the tag the moment either changed.
+   * Under `recallEnvelope: 'xml'` or `'bare'` the answer body also carries
+   * the envelope tags, so the estimate prices that summary's ACTUAL envelope
+   * string on top — attributes included under `'xml'`, and zero when the
+   * envelope is off. A second magic constant would drift from the tag the
+   * moment either changed.
    */
   protected capRecallPairs(
     summariesChronological: SummaryEntry[],
@@ -16024,7 +16025,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _answerCostCache = new Map<string, { estimate: number; cost: number }>();
 
   protected recallAnswerCost(s: SummaryEntry): { estimate: number; cost: number } {
-    const recallEnvelope = this.config.recallEnvelope === 'xml' ? 'xml' : 'none';
+    const recallEnvelope = isRecallEnveloped(this.config.recallEnvelope) ? this.config.recallEnvelope : 'none';
     const carrierPolicy = this.liveCarrierPolicy();
     const calibration = this._storeView?.getTokenCalibration?.() ?? 1;
     const key = JSON.stringify([s.id, s.tokens, recallEnvelope, carrierPolicy, calibration]);
@@ -16813,7 +16814,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const combinedRefs = combinedRender.refs;
           // The summaries the answer holds: every one the flat cap left
           // something of, since it passes every carrier through, cut text or
-          // not (capContent), and under the xml envelope those its cap
+          // not (capContent), and under an envelope those its cap
           // admitted, which ends at the first summary it cuts.
           const admittedIds = new Set(combinedRefs.map((ref) => ref.id));
           const admitted = selectedSummaries.filter((s) => admittedIds.has(s.id));
@@ -19845,7 +19846,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ...releaseTrailingReasoning(content),
       { type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT },
     ];
-    if (this.config.recallEnvelope !== 'xml') {
+    if (!isRecallEnveloped(this.config.recallEnvelope)) {
       let content: ContentBlock[] = [];
       // Which summary each text block of the full answer belongs to (-1 for
       // separators), so a flat truncation can be read back per summary.
@@ -20027,7 +20028,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * The envelope is therefore NOT charged against `maxMessageTokens`; a
    * capped enveloped answer runs over the cap by its own tag text, and the
-   * legacy combined answer under `recallEnvelope: 'xml'` also by the omission
+   * legacy combined answer under an envelope (`'xml'` or `'bare'`) also by the omission
    * marker it writes after its last envelope when summaries that hold anything
    * are left out, unless that answer's own cut already wrote it inside its
    * envelope. That is
