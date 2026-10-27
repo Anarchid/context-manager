@@ -956,9 +956,10 @@ export interface RenderStats {
     pricingEpoch: number;
     provisional?: true;
     reset?: CalibrationReset;
-    /** The largest multiplier the strategy applies: one learned or loaded
-     *  above it is applied at it. AutobiographicalStrategy reports it
-     *  whenever it reports `calibration`. */
+    /** The largest multiplier the strategy applies: one learned above it is
+     *  applied at it, and a stored one above it is applied at it or not at
+     *  all. AutobiographicalStrategy reports it whenever it reports
+     *  `calibration`. */
     ceiling?: number;
   };
 

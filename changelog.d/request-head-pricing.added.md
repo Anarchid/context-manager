@@ -9,5 +9,6 @@
   of the tool definitions as JSON, not the provider's count. This is the
   report #323 asked for in its second fix.
 - `RenderStats.calibration.ceiling`: the largest multiplier the strategy
-  applies, 1.8, reported with every calibration. A multiplier learned or
-  loaded above it is applied at it, as before.
+  applies, 1.8, reported with every calibration. A multiplier learned above
+  it is applied at it, and a stored one above it is applied at it or not
+  at all, as before.

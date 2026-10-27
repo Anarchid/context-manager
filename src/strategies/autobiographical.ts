@@ -2028,7 +2028,14 @@ const OUT_OF_BAND_RUN_AGREEMENT = 0.1;
 const DECLARED_PAIR_AGREEMENT = 0.1;
 const CALIBRATION_CEILING = 1.8;
 
-type SelectPricing = { store: MessageStoreView; head: RequestOverhead; injections?: ReadonlyArray<ContentBlock[]> };
+type SelectPricing = { head: ContentBlock[]; injections?: ReadonlyArray<ContentBlock[]> };
+
+function requestOverheadContent(overhead: RequestOverhead): ContentBlock[] {
+  const content: ContentBlock[] = [];
+  if (overhead.system) content.push({ type: 'text', text: overhead.system });
+  if (overhead.tools && overhead.tools.length > 0) content.push({ type: 'text', text: JSON.stringify(overhead.tools) });
+  return content;
+}
 
 /**
  * A summary getStrandedSummaries lists: alone in a run at its level that is
@@ -7774,6 +7781,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // written, an earlier select's must not pose as this one's.
     this._lastSelectStats = null;
     this.requireLoadedBranch('select');
+    const pricing = this.selectPricingOf(opts);
     this._selectStartedAt = performance.now();
     this._selectMessages = store.length();
     const lastRenderStats = this._lastRenderStats;
@@ -7794,7 +7802,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._ceilingNotes = { images: false, bytes: false };
       let entries: ContextEntry[];
       this.thinkingBound = opts?.thinkingBinding?.binds === true;
-      this.selectPricing = this.selectPricingOf(store, opts);
+      this.selectPricing = pricing;
       try {
         entries = this.withToolPruning(store, () => this.selectPath(store, budget, opts));
       } catch (err) {
@@ -7841,7 +7849,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const restore = this.saveDryRunState(store);
     this._dryRunSelect = true;
     this.thinkingBound = opts?.thinkingBinding?.binds === true;
-    this.selectPricing = this.selectPricingOf(store, opts);
+    this.selectPricing = pricing;
     try {
       this.rebuildChunks(store);
       if (_diag) this.diag.error(`[cm-cache] select: rebuildChunks ${Date.now() - _t0}ms`);
@@ -7857,8 +7865,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private selectPricing: SelectPricing | null = null;
 
-  private selectPricingOf(store: MessageStoreView, opts: SelectOptions | undefined): SelectPricing | null {
-    return opts?.requestHead ? { store, head: opts.requestHead, injections: opts.messageInjections } : null;
+  private selectPricingOf(opts: SelectOptions | undefined): SelectPricing | null {
+    return opts?.requestHead ? { head: requestOverheadContent(opts.requestHead), injections: opts.messageInjections } : null;
   }
 
   private selectPath(store: MessageStoreView, budget: TokenBudget, opts?: SelectOptions): ContextEntry[] {
@@ -8789,8 +8797,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const pricing = this.selectPricing;
     if (pricing) {
       r.request = {
-        headTokens: this.priceRequestOverhead(pricing.store, pricing.head),
-        injectedTokens: this.priceMessageInjections(pricing.store, pricing.injections),
+        headTokens: this.priceContent(pricing.head),
+        injectedTokens: this.priceMessageInjections(pricing.injections),
       };
     }
     this._lastRenderStats = r;
@@ -14041,7 +14049,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._lastCompileEstimate =
         rs.head.tokens + rs.tail.tokens + rs.middleRaw.tokens +
         rs.summaries.l1.tokens + rs.summaries.l2.tokens + rs.summaries.l3.tokens;
-      this._lastCompileInjected = this.priceMessageInjections(store, opts?.messageInjections);
+      this._lastCompileInjected = this.priceMessageInjections(opts?.messageInjections);
       this._calibrationArmed = true; // exactly one sample per compile
     }
     return merged;
@@ -14112,7 +14120,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // The overhead in the window's units (current calibrated), so the implied
     // multiplier below is real / raw(window + overhead) and doesn't depend on
     // the multiplier it's measured at: one sample states it.
-    const overheadTokens = declared && this._storeView ? this.priceRequestOverhead(this._storeView, overhead!) : 0;
+    const overheadTokens = declared ? this.priceRequestOverhead(overhead!) : 0;
     const injected = this._lastCompileInjected;
     const est = window + injected + overheadTokens;
     const parts = [
@@ -14247,14 +14255,19 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  prompt and its tool definitions as sent, priced as a compression request
    *  prices its own (priceRequest in the compression path), at the current
    *  multiplier, so it adds to the window estimate in the same units. */
-  private priceRequestOverhead(store: MessageStoreView, overhead: RequestOverhead): number {
-    const content: ContentBlock[] = [];
-    if (overhead.system) content.push({ type: 'text', text: overhead.system });
-    if (overhead.tools && overhead.tools.length > 0) content.push({ type: 'text', text: JSON.stringify(overhead.tools) });
+  private priceRequestOverhead(overhead: RequestOverhead): number {
+    return this.priceContent(requestOverheadContent(overhead));
+  }
+
+  private priceContent(content: ContentBlock[]): number {
+    const store = this._storeView;
+    if (!store) return 0;
     return content.length > 0 ? store.estimateTokens({ content } as unknown as StoredMessage) : 0;
   }
 
-  private priceMessageInjections(store: MessageStoreView, injections: ReadonlyArray<ContentBlock[]> | undefined): number {
+  private priceMessageInjections(injections: ReadonlyArray<ContentBlock[]> | undefined): number {
+    const store = this._storeView;
+    if (!store) return 0;
     let tokens = 0;
     for (const content of injections ?? []) tokens += store.estimateTokens({ content } as unknown as StoredMessage);
     return tokens;
@@ -14699,7 +14712,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
                 ? `learned under pricing epoch ${epoch} (current ${current}), in a store holding content repriced since`
                 : !repriced
                   ? `from a record with no pricing stamp (0.13.0 or earlier), pinned at the ` +
-                    `${saved.multiplier! >= 1.8 ? 'ceiling' : 'floor'} of its clamp: it corrected per-class rates ` +
+                    `${saved.multiplier! >= CALIBRATION_CEILING ? 'ceiling' : 'floor'} of its clamp: it corrected per-class rates ` +
                     `that were off by more than the clamp allows, and says nothing about this release's`
                   : `from a record with no pricing stamp (0.13.0 or earlier), in a store holding content ` +
                     `repriced since (current epoch ${current})`;
