@@ -1910,44 +1910,22 @@ export function unwrapWholeLiteralThinkingWrapper(text: string): string | null {
   return body;
 }
 
-/** An opening `<thinking>` or `<think>` tag, either case, no attributes, at the start of the text. */
-const LEADING_THINK_OPEN = /^\s*<think(?:ing)?\s*>/i;
-/** Any think-like tag, open or close, either spelling or case, at the start of the text. */
-const LEADING_THINK_TAG = /^\s*<\/?\s*think(?:ing)?\b[^>]*>/i;
-
 /**
  * The summary text of a compression or merge answer. With
  * `recoverWholeWrapper` (the opt-in, and only for an answer of text blocks
- * alone), an answer that opens with a plain `<thinking>` or `<think>` tag is
- * read by shape:
- * - one closed wrapper around the whole answer, with no tag in its body: the
- *   prose inside it is the memory;
- * - one leading wrapper followed by prose: the prose, verbatim, mentions of
- *   tags in it included;
- * - a leading wrapper with another opening tag inside it (nesting), or
- *   followed at once by another tag (wrappers back to back), or by nothing:
- *   what would be kept is control-shaped, so the answer counts as empty and
- *   takes the retry;
- * - an opening tag that is never closed: empty, as `stripThinkingPreamble`
- *   reads an unclosed leading `<thinking>`.
- * Every other answer goes to `stripThinkingPreamble`, as with the option off.
+ * alone), one closed `<thinking>` or `<think>` wrapper around the whole
+ * answer, with no tag in its body, is kept as the prose inside it. Every
+ * other answer goes to `stripThinkingPreamble`, as with the option off, so
+ * the option only ever adds a memory: it never drops or changes one the
+ * default reading stores.
  */
 function extractCompressionSummaryText(
   text: string,
   recoverWholeWrapper: boolean,
 ): { text: string; recoveredWholeWrapper: boolean } {
-  if (recoverWholeWrapper && LEADING_THINK_OPEN.test(text)) {
+  if (recoverWholeWrapper) {
     const recovered = unwrapWholeLiteralThinkingWrapper(text);
     if (recovered !== null) return { text: recovered, recoveredWholeWrapper: true };
-    const lead = text.match(/^\s*<(think(?:ing)?)\s*>([\s\S]*?)<\/\1\s*>([\s\S]*)$/i);
-    if (!lead) return { text: '', recoveredWholeWrapper: false }; // never closed
-    const rest = lead[3]!.trim();
-    // A tag inside the leading wrapper is nesting; a tag right after it is a
-    // second wrapper. Either way what would be kept is control-shaped.
-    if (/<\s*think(?:ing)?\b[^>]*>/i.test(lead[2]!) || !rest || LEADING_THINK_TAG.test(rest)) {
-      return { text: '', recoveredWholeWrapper: false };
-    }
-    return { text: rest, recoveredWholeWrapper: false };
   }
   return { text: stripThinkingPreamble(text), recoveredWholeWrapper: false };
 }

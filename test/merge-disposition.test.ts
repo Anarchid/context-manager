@@ -486,20 +486,6 @@ describe('Merge terminal-disposition gate', () => {
     await fx.manager.close();
   });
 
-  it('opt-in rejects multiple whole wrappers instead of persisting a residual tag', async () => {
-    const mock = scripted([{
-      stop: 'end_turn',
-      text: '<thinking>first</thinking><thinking>second</thinking>',
-    }]);
-    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
-
-    await fx.strategy.tick(ctx(fx.manager));
-
-    assert.equal(fx.strategy.summariesView().filter((s) => s.level === 2).length, 0);
-    assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1);
-    await fx.manager.close();
-  });
-
   it('opt-in never recovers a wrapper when native thinking blocks are also present', async () => {
     const wrapped = '<thinking>\npublic pseudo-thinking body\n</thinking>';
     const mock = scripted([{ raw: {
@@ -537,80 +523,60 @@ describe('Merge terminal-disposition gate', () => {
     await fx.manager.close();
   });
 
-  it('opt-in merge: a mention of a thinking tag mid-content is content', async () => {
-    const text = 'We talked about why a model would write <thinking> as plain text.';
-    const mock = scripted([{ stop: 'end_turn', text }]);
-    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
-
-    await fx.strategy.tick(ctx(fx.manager));
-
-    assert.equal(fx.strategy.summariesView().find((s) => s.level === 2)?.content, text);
-    await fx.manager.close();
+  it('opt-in merge: a recovery is logged once, with the stored summary\'s id, after the summary is stored', async () => {
+    const log = `${freshPath()}-merge-recovery.jsonl`;
+    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+    try {
+      const mock = scripted([{ stop: 'end_turn', text: '<thinking>\nA merged memory, wrapped whole.\n</thinking>' }]);
+      const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+      await fx.strategy.tick(ctx(fx.manager));
+      const parent = fx.strategy.summariesView().find((s) => s.level === 2);
+      await fx.manager.close();
+      const events = readFileSync(log, 'utf8').trim().split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((entry) => entry.event === 'compression:literal-thinking-wrapper-recovered');
+      assert.equal(events.length, 1);
+      assert.equal(events[0]!.operation, 'merge_l2');
+      assert.equal((events[0]!.metadata as Record<string, unknown>).summary_id, parent?.id);
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      rmSync(log, { force: true });
+    }
   });
 
-  it('opt-in merge: a nested wrapper leaves a dangling close tag, so the answer is rejected', async () => {
-    const mock = scripted([{ stop: 'end_turn', text: '<thinking>A <thinking>B</thinking> C</thinking>' }]);
-    const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
-
-    await fx.strategy.tick(ctx(fx.manager));
-
-    assert.equal(fx.strategy.summariesView().filter((s) => s.level === 2).length, 0);
-    assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1);
-    await fx.manager.close();
-  });
-
-  for (const [label, text, stored] of [
-    [
-      'a preamble followed by prose that mentions a close tag keeps the prose',
-      '<thinking>plan</thinking>The model printed </thinking> by mistake and we laughed.',
-      'The model printed </thinking> by mistake and we laughed.',
-    ],
-    ['a short-spelling preamble followed by prose keeps the prose', '<think>p</think>the merged body', 'the merged body'],
-    [
-      'an opening tag with attributes is left as with the option off',
-      '<thinking mode="x">memory</thinking>',
-      '<thinking mode="x">memory</thinking>',
-    ],
-    [
-      'a stray close tag at the start is left as with the option off',
-      '</thinking> the memory after a stray tag',
-      '</thinking> the memory after a stray tag',
-    ],
-    [
-      'a preamble followed by prose that ends with a close tag keeps the prose',
-      '<thinking>plan</thinking>The model printed </thinking>',
-      'The model printed </thinking>',
-    ],
-    [
-      'a preamble followed by prose and a later wrapper keeps the prose verbatim, as with the option off',
-      '<thinking>plan</thinking>The memory body.\n<thinking>afterthought</thinking>',
-      'The memory body.\n<thinking>afterthought</thinking>',
-    ],
-  ] as const) {
-    it(`opt-in merge: ${label}`, async () => {
-      const mock = scripted([{ stop: 'end_turn', text }]);
-      const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
-
-      await fx.strategy.tick(ctx(fx.manager));
-
-      assert.equal(fx.strategy.summariesView().find((s) => s.level === 2)?.content, stored);
-      await fx.manager.close();
-    });
-  }
-
-  for (const [label, text] of [
-    ['an opening tag never closed', '<thinking>unfinished memory'],
-    ['a leading wrapper followed at once by another tag', '<thinking>a</thinking> <think>b'],
-  ] as const) {
-    it(`opt-in merge: ${label} is rejected`, async () => {
-      const mock = scripted([{ stop: 'end_turn', text }]);
-      const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
-
-      await fx.strategy.tick(ctx(fx.manager));
-
-      assert.equal(fx.strategy.summariesView().filter((s) => s.level === 2).length, 0);
-      assert.equal(fx.strategy.mergeQueueView()[0]?.attempts, 1);
-      await fx.manager.close();
+  // The option only adds the whole-wrapper recovery: every other answer is
+  // read exactly as with the option off, so it can never lose or change a
+  // memory the default reading stores.
+  for (const text of [
+    '<thinking>first</thinking><thinking>second</thinking>',
+    '<thinking>A <thinking>B</thinking> C</thinking>',
+    '<thinking>The model printed </thinking> and we laughed.</thinking>',
+    '<thinking>plan</thinking>The model printed </thinking> by mistake and we laughed.',
+    '<thinking>plan</thinking>The model printed </thinking>',
+    "<thinking>plan: don't write <thinking> tags</thinking>The memory body",
+    '<thinking>plan</thinking>The memory body.\n<thinking>afterthought</thinking>',
+    '<think>p</think>the merged body',
+    '<think>memory</thinking>',
+    '<think>unclosed memory',
+    '<thinking>unfinished memory',
+    '<thinking>a</thinking> <think>b',
+    '<thinking mode="x">memory</thinking>',
+    '</thinking> the memory after a stray tag',
+    'We talked about why a model would write <thinking> as plain text.',
+  ]) {
+    it(`opt-in merge reads ${JSON.stringify(text)} as with the option off`, async () => {
+      const stored = async (options: Record<string, unknown>) => {
+        const mock = scripted([{ stop: 'end_turn', text }]);
+        const fx = await fixture(mock.membrane, options);
+        await fx.strategy.tick(ctx(fx.manager));
+        const parent = fx.strategy.summariesView().find((s) => s.level === 2);
+        const result = { content: parent?.content, carrier: parent?.responseContent, attempts: fx.strategy.mergeQueueView()[0]?.attempts };
+        await fx.manager.close();
+        return result;
+      };
+      assert.deepEqual(await stored({ recoverLiteralThinkingWrappedCompression: true }), await stored({}));
     });
   }
 

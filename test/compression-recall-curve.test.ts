@@ -523,9 +523,9 @@ describe('compression refusal recall curves', () => {
     fx.manager.close();
   });
 
-  it('opt-in at L1: a fail-closed canonical answer, then a plain-prose retry that comes back whole-wrapped, stores the retry\'s prose', async () => {
+  it('opt-in at L1: an empty canonical answer, then a plain-prose retry that comes back whole-wrapped, stores the retry\'s prose', async () => {
     const mock = flexibleMembrane([
-      { stop: 'end_turn', text: '<thinking>first</thinking><thinking>second</thinking>' },
+      { stop: 'end_turn', text: '<thinking>an unclosed preamble, no memory' },
       { stop: 'end_turn', text: '<thinking>\nThe retry\'s memory, wrapped whole.\n</thinking>' },
     ]);
     const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
@@ -538,6 +538,38 @@ describe('compression refusal recall curves', () => {
     assert.equal(produced?.content, "The retry's memory, wrapped whole.");
     assert.equal(produced?.responseContent, undefined);
     fx.manager.close();
+  });
+
+  it('opt-in at L1: a recovery is logged once, with the stored summary\'s id, and a preamble strip logs none', async () => {
+    const recovered = (log: string) => readFileSync(log, 'utf8').trim().split('\n')
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((entry) => entry.event === 'compression:literal-thinking-wrapper-recovered');
+    const previous = process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+    const logs: string[] = [];
+    try {
+      for (const [text, expected] of [
+        ['<thinking>\nA memory wrapped whole.\n</thinking>', 1],
+        ['<thinking>a preamble</thinking>the memory after it', 0],
+      ] as const) {
+        const log = `${freshPath()}-recovery.jsonl`;
+        logs.push(log);
+        process.env.CONTEXT_MANAGER_COMPRESSION_LOG = log;
+        const mock = flexibleMembrane([{ stop: 'end_turn', text }]);
+        const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+        await fx.strategy.run(fx.target, managerContext(fx.manager));
+        fx.manager.close();
+        const events = recovered(log);
+        assert.equal(events.length, expected, text);
+        if (expected) {
+          assert.equal((events[0]!.metadata as Record<string, unknown>).summary_id, fx.target.summaryId);
+          assert.equal(events[0]!.operation, 'compress_l1');
+        }
+      }
+    } finally {
+      if (previous === undefined) delete process.env.CONTEXT_MANAGER_COMPRESSION_LOG;
+      else process.env.CONTEXT_MANAGER_COMPRESSION_LOG = previous;
+      for (const log of logs) rmSync(log, { force: true });
+    }
   });
 
   it('opt-in at L1: a mention of a thinking tag mid-content is content', async () => {
