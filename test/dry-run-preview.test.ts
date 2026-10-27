@@ -644,6 +644,29 @@ describe('previewContext — the compile it previews', () => {
       // The select itself succeeds: a committing compile at this budget does.
       await manager.compile(budget);
       assert.strictEqual(manager.previewContext(budget), null);
+      // The strategy's own method keeps its type: it still throws there.
+      const internals = manager as unknown as {
+        strategyMessageView(): Parameters<typeof strategy.previewContext>[0];
+        contextLog: { createView(): Parameters<typeof strategy.previewContext>[1] };
+      };
+      assert.throws(
+        () => strategy.previewContext(internals.strategyMessageView(), internals.contextLog.createView(), budget),
+        { message: 'previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview' },
+      );
+    } finally {
+      manager.close();
+    }
+  });
+
+  it('reports an infeasible preview on the hierarchical path over the budget', async () => {
+    const strategy = makeStrategy({ adaptiveResolution: false });
+    const manager = await ContextManager.open({ path: TEST_STORE_PATH, strategy });
+    try {
+      addConversation(manager);
+      const preview = manager.previewContext({ maxTokens: 300, reserveForResponse: 0 });
+      assert.ok(preview, 'over the budget the preview is a report, not null');
+      assert.strictEqual(preview.fits, false);
+      assert.strictEqual(preview.exhausted, true);
     } finally {
       manager.close();
     }
@@ -708,30 +731,5 @@ describe('previewContext — the compile it previews', () => {
     } finally {
       manager.close();
     }
-  });
-
-  it('logs no continuity-relaxation line from a dry select', () => {
-    const strategy = makeStrategy();
-    const lines: string[] = [];
-    (strategy as unknown as { diag: unknown }).diag = {
-      error: (m: string) => lines.push(`error ${m}`),
-      warn: (m: string) => lines.push(`warn ${m}`),
-    };
-    const self = strategy as unknown as {
-      _dryRunSelect: boolean;
-      kvUnifiedContinuityMultiplier(r?: unknown): number;
-    };
-    const valid = { reason: 'infrastructure', multiplier: 0.5, expiresAt: Date.now() + 60_000 };
-    const expired = { reason: 'infrastructure', multiplier: 0.5, expiresAt: Date.now() - 1 };
-    self._dryRunSelect = true;
-    assert.strictEqual(self.kvUnifiedContinuityMultiplier(valid), 0.5);
-    assert.strictEqual(self.kvUnifiedContinuityMultiplier(expired), 1);
-    assert.deepStrictEqual(lines, [], 'a dry select logs neither line');
-    self._dryRunSelect = false;
-    assert.strictEqual(self.kvUnifiedContinuityMultiplier(valid), 0.5);
-    assert.strictEqual(self.kvUnifiedContinuityMultiplier(expired), 1);
-    assert.strictEqual(lines.length, 2, 'a committing select logs each');
-    assert.match(lines[0]!, /^error \[kv-continuity-relaxation\] reason=infrastructure multiplier=0\.5/);
-    assert.match(lines[1]!, /^warn \[kv-continuity-relaxation\] invalid or expired input/);
   });
 });

@@ -37,7 +37,7 @@ import type {
   RenderedSummaryInfo,
 } from '../types/index.js';
 import { DEFAULT_AUTOBIOGRAPHICAL_CONFIG } from '../types/index.js';
-import { getSummaryParentId } from '../types/strategy.js';
+import { getSummaryParentId, NoFoldPlanToPreviewError } from '../types/strategy.js';
 import {
   adjacentRuns, mergeGroupProblem, mergeRecordHoldsIn, mergeRunsByLevel, placeOf, queuedMergeRuns, runGroups, runsAtLevel, strandedIn,
   type LevelRuns, type PendingFill, type StoreRunsInput,
@@ -2542,16 +2542,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Non-committing "what would the context look like at these settings".
-   * Null on the hierarchical path when its select succeeds, since that path
-   * has no fold plan to preview; an over-budget select there is still
-   * reported as an infeasible preview.
+   * On the hierarchical path, which has no fold plan to preview, it throws
+   * `NoFoldPlanToPreviewError` when the select succeeds, and
+   * `ContextManager.previewContext` returns null for it; an over-budget
+   * select there is still reported as an infeasible preview.
    *
    * Runs a dry-run select at `budget`, with the select options it is given
-   * (`opts`, all but `dryRun`, which is always set), optionally with a scoped
-   * config swap for knobs that are otherwise recipe-and-restart only (tail,
-   * head window, chunk size, merge threshold, folding strategy...). Commits
-   * nothing: no resolution persistence, no compression enqueue, no
-   * transition bookkeeping.
+   * (`opts`, all but `dryRun`, which is always set, and `identity`, which
+   * nothing here reads), optionally with a scoped config swap for knobs that
+   * are otherwise recipe-and-restart only (tail, head window, chunk size,
+   * merge threshold, folding strategy...). Commits nothing: no resolution
+   * persistence, no compression enqueue, no transition bookkeeping.
    *
    * Two things this deliberately does NOT do:
    *  - It does not apply anything. Applying is `updateHotContextSettings` (for
@@ -2571,8 +2572,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     log: ContextLogView,
     budget: TokenBudget,
     overrides?: AutobiographicalOptions,
-    opts?: { render?: boolean } & Omit<SelectOptions, 'dryRun'>,
-  ): PreviewResult | null {
+    opts?: { render?: boolean } & Omit<SelectOptions, 'dryRun' | 'identity'>,
+  ): PreviewResult {
     this.requireLoadedBranch('previewContext');
     if (this._previewInFlight) {
       throw new Error('previewContext is already running; previews must not overlap');
@@ -2648,7 +2649,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // `undefined` from the reset above, but selectAdaptive fills it in.
       const preview = this._lastPreview as PreviewResult | undefined;
       // The hierarchical path has no picker, so no fold plan to preview.
-      if (!preview) return null;
+      if (!preview) throw new NoFoldPlanToPreviewError();
       // Segment breakdown for the hypothetical compile, which select() kept
       // apart from the live one. Lets a caller show the previewed
       // head/middle/tail split without re-deriving it.
