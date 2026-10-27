@@ -546,10 +546,13 @@ export interface SelectOptions {
   messageInjections?: ReadonlyArray<ContentBlock[]>;
   /** The overhead of the request the compile is for: the system prompt and
    * tool definitions it sends besides the window and its message-position
-   * injections. AutobiographicalStrategy prices it, and the message
-   * injections, for `RenderStats.request`, and selects exactly as it would
-   * without it. An overhead whose tool definitions can't be serialised as
-   * JSON is refused before anything is selected. */
+   * injections. Its system prompt is the one the request sends, with the
+   * system-position injections passed to this compile appended: the compile
+   * hands those back unchanged (`systemInjections`) and prices none of them.
+   * AutobiographicalStrategy prices it, and the message injections, for
+   * `RenderStats.request`, and selects exactly as it would without it. An
+   * overhead whose tool definitions can't be serialised as JSON is refused
+   * before anything is selected. */
   requestOverhead?: RequestOverhead;
 }
 
@@ -974,6 +977,10 @@ export interface RenderStats {
    * here rather than a price of 0. The overhead's price is the store's
    * estimate of the system prompt and of the tool definitions as JSON
    * (`JSON.stringify`), not the provider's count of what its formatter sends.
+   * System-position injections are priced only as part of that system
+   * prompt: the compile hands the ones it was passed back unchanged
+   * (`systemInjections`) for the caller to append, so the overhead's system
+   * prompt is the one sent, with them appended.
    */
   request?: { overheadTokens: number; injectedTokens: number };
 

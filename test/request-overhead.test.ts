@@ -224,7 +224,7 @@ describe('the request overhead priced by the compile (RenderStats.request)', () 
     cm.close();
     const hierarchical = await openManager('paths-hierarchical', { adaptiveResolution: false });
     const hs = (await hierarchical.cm.compile(TIGHT, INJECTIONS, { requestOverhead: OVERHEAD })).renderStats!;
-    assert.equal(hs.calibration!.multiplier, 1, 'premise: a fresh store prices at 1');
+    assert.equal(hs.calibration!.multiplier, 1, 'premise: the hierarchical path neither loads nor learns calibration, so it reports and prices at 1');
     assertPricedAt(hs, atOne, 'the hierarchical path');
     hierarchical.cm.close();
   });
