@@ -559,6 +559,35 @@ describe('Merge terminal-disposition gate', () => {
     await fx.manager.close();
   });
 
+  for (const [label, text, stored] of [
+    [
+      'a preamble followed by prose that mentions a close tag keeps the prose',
+      '<thinking>plan</thinking>The model printed </thinking> by mistake and we laughed.',
+      'The model printed </thinking> by mistake and we laughed.',
+    ],
+    ['a short-spelling preamble followed by prose keeps the prose', '<think>p</think>the merged body', 'the merged body'],
+    [
+      'an opening tag with attributes is left as with the option off',
+      '<thinking mode="x">memory</thinking>',
+      '<thinking mode="x">memory</thinking>',
+    ],
+    [
+      'a stray close tag at the start is left as with the option off',
+      '</thinking> the memory after a stray tag',
+      '</thinking> the memory after a stray tag',
+    ],
+  ] as const) {
+    it(`opt-in merge: ${label}`, async () => {
+      const mock = scripted([{ stop: 'end_turn', text }]);
+      const fx = await fixture(mock.membrane, { recoverLiteralThinkingWrappedCompression: true });
+
+      await fx.strategy.tick(ctx(fx.manager));
+
+      assert.equal(fx.strategy.summariesView().find((s) => s.level === 2)?.content, stored);
+      await fx.manager.close();
+    });
+  }
+
   it('a thinking-wrapped merge generation is rejected and the retry carries the plain-prose line', async () => {
     // Opus-3-class summarizers wrap the entire memory in a literal
     // <thinking> tag (evander 2026-08-06). The text passes the disposition

@@ -1910,37 +1910,41 @@ export function unwrapWholeLiteralThinkingWrapper(text: string): string | null {
   return body;
 }
 
-/** A think-like tag (`<thinking>`, `<think>`, either case, or a close tag) at the start of the text. */
+/** An opening `<thinking>` or `<think>` tag, either case, no attributes, at the start of the text. */
+const LEADING_THINK_OPEN = /^\s*<think(?:ing)?\s*>/i;
+/** Any think-like tag, open or close, either spelling or case, at the start of the text. */
 const LEADING_THINK_TAG = /^\s*<\/?\s*think(?:ing)?\b[^>]*>/i;
 
 /**
  * The summary text of a compression or merge answer. With
  * `recoverWholeWrapper` (the opt-in, and only for an answer of text blocks
- * alone), one closed literal wrapper around the whole answer is kept as the
- * prose inside it. An answer that opens with a think-like tag otherwise keeps
- * the public prose after one leading wrapper, as `stripThinkingPreamble` does,
- * unless what would be kept is still tag-shaped: another wrapper, or a close
- * tag that ends something the preamble opened. That residual is control-shaped,
- * so the answer counts as empty and takes the retry. An answer that doesn't
- * open with a tag is left to `stripThinkingPreamble`, which treats a mention
- * of a tag mid-content as content.
+ * alone), an answer that opens with a plain `<thinking>` or `<think>` tag is
+ * read by shape:
+ * - one closed wrapper around the whole answer, with no tag in its body: the
+ *   prose inside it is the memory;
+ * - a whole-answer wrapper whose body holds more tags (nested, or several
+ *   wrappers back to back): control-shaped, so the answer counts as empty
+ *   and takes the retry;
+ * - one leading wrapper followed by prose: the prose, verbatim, mentions of
+ *   tags in it included, unless it starts with another tag (empty);
+ * - an opening tag that is never closed: empty, as `stripThinkingPreamble`
+ *   reads an unclosed leading `<thinking>`.
+ * Every other answer goes to `stripThinkingPreamble`, as with the option off.
  */
 function extractCompressionSummaryText(
   text: string,
   recoverWholeWrapper: boolean,
 ): { text: string; recoveredWholeWrapper: boolean } {
-  if (recoverWholeWrapper && LEADING_THINK_TAG.test(text)) {
+  if (recoverWholeWrapper && LEADING_THINK_OPEN.test(text)) {
     const recovered = unwrapWholeLiteralThinkingWrapper(text);
     if (recovered !== null) return { text: recovered, recoveredWholeWrapper: true };
-
-    // One leading wrapper of either spelling, then what follows it.
+    if (/^\s*<(think(?:ing)?)\s*>[\s\S]*<\/\1\s*>\s*$/i.test(text)) {
+      return { text: '', recoveredWholeWrapper: false }; // wrapped whole, tags inside
+    }
     const suffix = text.match(/^\s*<(think(?:ing)?)\s*>[\s\S]*?<\/\1\s*>([\s\S]*)$/i);
-    if (!suffix) return { text: '', recoveredWholeWrapper: false }; // a leading tag that opens no closed wrapper
+    if (!suffix) return { text: '', recoveredWholeWrapper: false }; // never closed
     const rest = suffix[2]!.trim();
-    if (!rest) return { text: '', recoveredWholeWrapper: false };
-    const opens = rest.match(/<\s*think(?:ing)?\b[^>]*>/gi)?.length ?? 0;
-    const closes = rest.match(/<\/\s*think(?:ing)?\s*>/gi)?.length ?? 0;
-    if (LEADING_THINK_TAG.test(rest) || closes > opens) {
+    if (!rest || LEADING_THINK_TAG.test(rest)) {
       return { text: '', recoveredWholeWrapper: false };
     }
     return { text: rest, recoveredWholeWrapper: false };
