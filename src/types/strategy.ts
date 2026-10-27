@@ -1410,7 +1410,18 @@ export interface AutobiographicalConfig {
    * Unset: every target uses `identityReminder` (unchanged behavior).
    */
   witnessedIdentityReminder?: string;
-  /** Label shown before summaries in compiled context */
+  /**
+   * Label shown before summaries in compiled context. `{tools}` in it is
+   * replaced by the names of the tools called in the rounds its summary
+   * stands in for (in the combined pair of `positionedRecallPairs: false`,
+   * every summary the pair holds): each name once, in order of first call,
+   * the first five and then "and K more", or "no tools" when the sources the
+   * view holds called none. The names are read from the summary's source
+   * messages as the store's view holds them, the first time the summary is
+   * priced or rendered after the strategy loads its branch, and kept until
+   * the next load, so a source removed, or hidden by `viewFilter`, after that
+   * read drops out of them at the next load.
+   */
   summaryContextLabel?: string;
 
   /**
@@ -2070,9 +2081,11 @@ export interface AutobiographicalConfig {
    *   {level} — summary level (1, 2, or 3)
    *   {first} — first source message id
    *   {last}  — last source message id
+   *   {tools} — the tools its summary's rounds called, as `summaryContextLabel` lists them
    * Default: '[Recall {id}]'.
    *
-   * Only used when `positionedRecallPairs` is true.
+   * Only used when `positionedRecallPairs` is true and `adaptiveResolution`
+   * is off.
    */
   recallHeaderTemplate?: string;
 
