@@ -66,7 +66,7 @@ import { FoldJournal, branchRefOf, cachedStoreIdentity, existingStoreIdentity } 
 import { describeThrown, logThrown } from './describe-thrown.js';
 import {
   UNVOUCHED, bindThinking, continueRecord, isThinkingBlock, markThinkingLeftOut, messageDigest, readBindingRecord,
-  refuseUnboundBinding, refuseUnreadableIdentity, registerBindingState, thinkingAsSent, thinkingSent, withoutThinking, writeBindingRecord,
+  bindingStateId, refuseUnboundBinding, refuseUnreadableIdentity, registerBindingState, thinkingAsSent, thinkingSent, withoutThinking, writeBindingRecord,
   type BindOutcome, type BindingRecord,
 } from './thinking-binding.js';
 import { type Diagnostics, namespaceDiagnostics } from './diagnostics.js';
@@ -231,9 +231,12 @@ export interface DeriveContextOptions {
   membrane?: Membrane;
   /**
    * - `'reuse'` (default): keep the parent's rendering frontier — persisted
-   *   fold state arrives through the store, and the in-memory remainder is
-   *   handed from the parent's strategy to the child's — so the child's
-   *   first compile reproduces the parent's presentation and cache markers.
+   *   fold state arrives through the store, and, at the head, the in-memory
+   *   remainder is handed from the parent's strategy to the child's — so the
+   *   child's first compile reproduces the parent's presentation and cache
+   *   markers. Derived from an earlier point (`atSequence`), the child
+   *   keeps what was persisted by then and nothing in memory, since the
+   *   parent's in-memory frontier describes its head.
    * - `'fresh'`: discard the inherited frontier and solve from scratch, e.g.
    *   at another budget. Presentation changes; the provider cache misses.
    */
@@ -298,8 +301,9 @@ export interface ReopenDerivedOptions {
 export class ContextDerivationUnsupportedError extends Error {
   constructor() {
     super(
-      'Context derivation needs branch-bound store handles (JsStore.view), ' +
-        'which this @animalabs/chronicle build does not provide',
+      'Context derivation needs branch-bound store handles (JsStore.view) and branches forked with ' +
+        'selected states (createBranchWithStates, createBranchAtWithStates), which this ' +
+        '@animalabs/chronicle build does not provide',
     );
     this.name = 'ContextDerivationUnsupportedError';
   }
@@ -308,17 +312,17 @@ export class ContextDerivationUnsupportedError extends Error {
 /** Chronicle surface derivation depends on; absent on builds without views. */
 interface DerivableStore {
   view(branch: string): JsStore;
-  createBranchWithStates?(
+  createBranchWithStates(
     name: string,
     from: string | undefined | null,
     filter: { stateIds?: string[]; statePrefixes?: string[] },
-  ): unknown;
-  createBranchAtWithStates?(
+  ): { id: string };
+  createBranchAtWithStates(
     name: string,
     from: string,
     atSequence: number,
     filter: { stateIds?: string[]; statePrefixes?: string[] },
-  ): unknown;
+  ): { id: string };
 }
 
 /**
@@ -1259,9 +1263,12 @@ export class ContextManager {
   // Derivation: shared reads, separate writes
   // ==========================================================================
 
-  /** Whether `store` can bind handles to branches, which derivation requires. */
+  /** Whether `store` can bind handles to branches and fork a branch with selected states, which derivation requires. */
   static supportsDerivation(store: JsStore): boolean {
-    return typeof (store as unknown as Partial<DerivableStore>).view === 'function';
+    const derivable = store as unknown as Partial<DerivableStore>;
+    return typeof derivable.view === 'function'
+      && typeof derivable.createBranchWithStates === 'function'
+      && typeof derivable.createBranchAtWithStates === 'function';
   }
 
   /**
@@ -1281,7 +1288,8 @@ export class ContextManager {
    * derived manager holds a handle bound to its own branch.
    *
    * What is inherited is the set of states this manager owns: its message
-   * slot, its auxiliary slots, its context log and its strategy's states.
+   * slot, its auxiliary slots, its context log, its thinking-binding record
+   * and its strategy's states.
    * Other states in the store are not carried onto the derived branch.
    * Compression holds, and compression work in flight here, are not
    * inherited: the derived strategy re-derives its queue from what is
@@ -1305,6 +1313,7 @@ export class ContextManager {
       MessageStore.registrationFor(this.slots.messageNamespace).id,
       ...this.slots.auxiliaryNamespaces.map((ns) => MessageStore.registrationFor(ns).id),
       ContextLog.stateIdFor(this.slots.contextNamespace),
+      bindingStateId(this.strategyNamespace),
       // Authoring-request preimages are keyed by hash in one store-wide
       // tree; inherited so the child can still resolve a memory's origin.
       // Ignored by the store when the tree was never created.
@@ -1329,72 +1338,85 @@ export class ContextManager {
         ? this.strategy.exportRenderingFrontier()
         : undefined;
 
-    if (atHead) {
-      if (typeof source.createBranchWithStates === 'function') {
-        source.createBranchWithStates(options.branch, parentBranch, filter);
-      } else {
-        this.store.createBranch(options.branch, parentBranch);
+    const branch = options.branch;
+    const created = atHead
+      ? source.createBranchWithStates(branch, parentBranch, filter)
+      : source.createBranchAtWithStates(branch, parentBranch, atSequence, filter);
+    let derived: ContextManager | undefined;
+    try {
+      const view = source.view(branch);
+
+      const coldStore = (namespace: string | undefined) =>
+        new MessageStore(view, { estimator: this.slots.tokenEstimator, namespace });
+      const messageStore = atHead
+        ? this.messageStore.deriveOnto(view)
+        : coldStore(this.slots.messageNamespace);
+      const auxiliaryStores = this.auxiliaryStores.map((aux, i) =>
+        atHead ? aux.deriveOnto(view) : coldStore(this.slots.auxiliaryNamespaces[i]),
+      );
+      // ---- End of the synchronous section. ----
+
+      const contextLog = new ContextLog(view, {
+        estimator: this.slots.tokenEstimator,
+        namespace: this.slots.contextNamespace,
+      });
+      derived = new ContextManager(
+        view,
+        messageStore,
+        contextLog,
+        options.strategy,
+        false, // the app owns the store; a derived manager never closes it
+        this.strategyNamespace,
+        options.membrane ?? this.membrane,
+        options.debugLogContext ?? this.debugLogContext,
+        options.viewFilter ?? this.viewFilter,
+        auxiliaryStores,
+      );
+      derived.now = this.now;
+      derived.slots = { ...this.slots, auxiliaryNamespaces: [...this.slots.auxiliaryNamespaces] };
+      derived.toolDefinitions = this.toolDefinitions;
+      derived.systemPrompt = this.systemPrompt;
+      derived.derivation = {
+        parentBranch,
+        branch,
+        atSequence,
+        solve,
+        inherited: filter,
+        slots: {
+          messageNamespace: this.slots.messageNamespace ?? null,
+          contextNamespace: this.slots.contextNamespace ?? null,
+          auxiliaryNamespaces: this.slots.auxiliaryNamespaces.map((ns) => ns ?? null),
+        },
+      };
+
+      if (frontier !== undefined && isRenderingFrontierStrategy(derived.strategy)) {
+        derived.strategy.prepareFromRenderingFrontier?.(frontier);
       }
-    } else if (typeof source.createBranchAtWithStates === 'function') {
-      source.createBranchAtWithStates(options.branch, parentBranch, atSequence, filter);
-    } else {
-      this.store.createBranchAt(options.branch, parentBranch, atSequence);
-    }
-    const view = source.view(options.branch);
+      await derived.initializeStrategy(observeStoreBranch(view));
 
-    const coldStore = (namespace: string | undefined) =>
-      new MessageStore(view, { estimator: this.slots.tokenEstimator, namespace });
-    const messageStore = atHead
-      ? this.messageStore.deriveOnto(view)
-      : coldStore(this.slots.messageNamespace);
-    const auxiliaryStores = this.auxiliaryStores.map((aux, i) =>
-      atHead ? aux.deriveOnto(view) : coldStore(this.slots.auxiliaryNamespaces[i]),
-    );
-    // ---- End of the synchronous section. ----
-
-    const contextLog = new ContextLog(view, {
-      estimator: this.slots.tokenEstimator,
-      namespace: this.slots.contextNamespace,
-    });
-    const derived = new ContextManager(
-      view,
-      messageStore,
-      contextLog,
-      options.strategy,
-      false, // the app owns the store; a derived manager never closes it
-      this.strategyNamespace,
-      options.membrane ?? this.membrane,
-      options.debugLogContext ?? this.debugLogContext,
-      options.viewFilter ?? this.viewFilter,
-      auxiliaryStores,
-    );
-    derived.now = this.now;
-    derived.slots = { ...this.slots, auxiliaryNamespaces: [...this.slots.auxiliaryNamespaces] };
-    derived.toolDefinitions = this.toolDefinitions;
-    derived.systemPrompt = this.systemPrompt;
-    derived.derivation = {
-      parentBranch,
-      branch: options.branch,
-      atSequence,
-      solve,
-      inherited: filter,
-      slots: {
-        messageNamespace: this.slots.messageNamespace ?? null,
-        contextNamespace: this.slots.contextNamespace ?? null,
-        auxiliaryNamespaces: this.slots.auxiliaryNamespaces.map((ns) => ns ?? null),
-      },
-    };
-
-    await derived.initializeStrategy(observeStoreBranch(view));
-
-    if (isRenderingFrontierStrategy(derived.strategy)) {
-      if (solve === 'fresh') {
-        derived.strategy.discardRenderingFrontier();
-      } else if (frontier !== undefined) {
-        derived.strategy.adoptRenderingFrontier(frontier);
+      if (isRenderingFrontierStrategy(derived.strategy)) {
+        if (solve === 'fresh') {
+          derived.strategy.discardRenderingFrontier();
+        } else if (frontier !== undefined) {
+          derived.strategy.adoptRenderingFrontier(frontier);
+        }
       }
+      return derived;
+    } catch (error) {
+      try {
+        derived?.close();
+      } catch (cleanup) {
+        logThrown(`[context-manager] derive of '${branch}' failed, and closing the child failed too:`, cleanup, this.diag);
+      }
+      try {
+        if (this.store.listBranches().some((b) => b.name === branch && b.id === created.id)) {
+          this.store.deleteBranch(branch);
+        }
+      } catch (cleanup) {
+        logThrown(`[context-manager] derive of '${branch}' failed, and removing its branch failed too:`, cleanup, this.diag);
+      }
+      throw error;
     }
-    return derived;
   }
 
   /** How this manager was derived, or null if it was opened directly. */
