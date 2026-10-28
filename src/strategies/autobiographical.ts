@@ -57,7 +57,7 @@ import {
   DEFAULT_TOOL_PROSE_RESULT,
   type ToolProseHoistOptions,
 } from '../tool-prose-hoist.js';
-import { recallEnvelopeAddedText, wrapRecallAnswerContent } from '../recall-envelope.js';
+import { isRecallEnveloped, recallEnvelopeAddedText, wrapRecallAnswerContent } from '../recall-envelope.js';
 import { defaultTokenEstimator, MessageStore } from '../message-store.js';
 import { persistMintRequestPreimage } from '../mint-preimage.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
@@ -512,6 +512,8 @@ const COMPRESSION_MARKER =
   'System: You will soon form a new memory, get ready. ' +
   'The messages that follow are the slice of recent experience you are ' +
   'about to compress. After them, write the memory in your own voice.';
+
+const RECALL_TOOLS_SHOWN = 5;
 
 /**
  * The interstitial text between two summaries in the legacy combined recall
@@ -3092,6 +3094,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._adaptivePicker = null;
     this.lastFrontierTokens = undefined;
     this.transitionBlocked = undefined;
+    this._recallToolNames.clear();
     this._rs = null;
     this._lastRenderStats = null;
     this._lastSelectStats = null;
@@ -4077,10 +4080,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * after it where the agent's own turn follows (RECALL_RESUME_TEXT). Rough
    * but defensive.
    *
-   * Under `recallEnvelope: 'xml'` the answer body also carries the envelope
-   * tags, so the estimate prices that summary's ACTUAL envelope string on top
-   * — attributes included, and zero when the envelope is off. A second magic
-   * constant would drift from the tag the moment either changed.
+   * Under `recallEnvelope: 'xml'` or `'bare'` the answer body also carries
+   * the envelope tags, so the estimate prices that summary's ACTUAL envelope
+   * string on top — attributes included under `'xml'`, and zero when the
+   * envelope is off. A second magic constant would drift from the tag the
+   * moment either changed.
    */
   protected capRecallPairs(
     summariesChronological: SummaryEntry[],
@@ -6544,11 +6548,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   private _summaryIndex: { source: readonly SummaryEntry[]; length: number; byId: Map<string, SummaryEntry> } | null = null;
   private summaryById(id: string): SummaryEntry | undefined {
+    return this.summaryIndex().get(id);
+  }
+
+  /** The summaries by id, built again when the summary list changes. */
+  private summaryIndex(): ReadonlyMap<string, SummaryEntry> {
     const cached = this._summaryIndex;
     if (!cached || cached.source !== this.summaries || cached.length !== this.summaries.length) {
       this._summaryIndex = { source: this.summaries, length: this.summaries.length, byId: new Map(this.summaries.map((s) => [s.id, s] as const)) };
     }
-    return this._summaryIndex!.byId.get(id);
+    return this._summaryIndex!.byId;
   }
 
   /**
@@ -16016,7 +16025,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _answerCostCache = new Map<string, { estimate: number; cost: number }>();
 
   protected recallAnswerCost(s: SummaryEntry): { estimate: number; cost: number } {
-    const recallEnvelope = this.config.recallEnvelope === 'xml' ? 'xml' : 'none';
+    const recallEnvelope = isRecallEnveloped(this.config.recallEnvelope) ? this.config.recallEnvelope : 'none';
     const carrierPolicy = this.liveCarrierPolicy();
     const calibration = this._storeView?.getTokenCalibration?.() ?? 1;
     const key = JSON.stringify([s.id, s.tokens, recallEnvelope, carrierPolicy, calibration]);
@@ -16046,12 +16055,44 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return priced;
   }
 
-  /** The true render cost of a summary's recall pair: its label, and its
-   *  answer as recallAnswerCost prices it. */
-  protected recallPairCost(s: SummaryEntry): number {
-    const label = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
-    return this.estimateTokens([{ type: 'text', text: label }]) + this.recallAnswerCost(s).cost;
+  /** The true render cost of a summary's recall pair: the question it asks,
+   *  its label unless the site sends another, and its answer as
+   *  recallAnswerCost prices it. */
+  protected recallPairCost(s: SummaryEntry, question: string = this.recallLabel([s])): number {
+    return this.estimateTokens([{ type: 'text', text: question }]) + this.recallAnswerCost(s).cost;
   }
+
+  private recallLabel(summaries: readonly SummaryEntry[]): string {
+    const label = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
+    return label.replace(/\{tools\}/g, () => this.recallToolsText(summaries));
+  }
+
+  private recallToolsText(summaries: readonly SummaryEntry[]): string {
+    const names = new Set<string>();
+    for (const s of summaries) for (const name of this.recallToolNames(s)) names.add(name);
+    if (names.size === 0) return 'no tools';
+    const listed = [...names];
+    const shown = listed.slice(0, RECALL_TOOLS_SHOWN).join(', ');
+    return listed.length > RECALL_TOOLS_SHOWN ? `${shown} and ${listed.length - RECALL_TOOLS_SHOWN} more` : shown;
+  }
+
+  private recallToolNames(summary: SummaryEntry): readonly string[] {
+    const key = `${summary.id}\u0000${summary.created}`;
+    const known = this._recallToolNames.get(key);
+    if (known) return known;
+    const view = this._storeView;
+    const leaves = new Set<MessageId>();
+    this.expandSummaryToLeafMessageIds(summary, this.summaryIndex(), leaves);
+    const names = new Set<string>();
+    for (const id of leaves) {
+      for (const block of view?.get(id)?.content ?? []) if (block.type === 'tool_use') names.add(block.name);
+    }
+    const listed = [...names];
+    if (view) this._recallToolNames.set(key, listed);
+    return listed;
+  }
+
+  private _recallToolNames = new Map<string, readonly string[]>();
 
   /**
    * Walk the summary tree to find the L_k ancestor of a message.
@@ -16711,7 +16752,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
               sourceRelation: 'derived',
               summaries: rendered.refs,
             };
-            const pairTokens = this.recallPairCost(summary);
+            const pairTokens = this.recallPairCost(summary, headerText);
             // Never silently drop a selected representation: everything in
             // this list either covers history (summaries) or IS uncovered
             // history (pins / uncompressed / frontier raw). Emit within
@@ -16760,8 +16801,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // after it counts in its prefix.
         let pairSummaries: SummaryEntry[] = [];
         if (selectedSummaries.length > 0) {
-          const contextLabel = this.config.summaryContextLabel ?? 'What do you remember from earlier?';
-
           // Synthesised summary turns must respect maxMessageTokens. With L1+L2+L3
           // budgets defaulting to 30k each, an unconstrained concatenation can push
           // a single assistant turn past 90k tokens, eating the inference budget
@@ -16773,10 +16812,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           const combinedRender = this.renderCombinedRecallAnswer(selectedSummaries, msgCap);
           const combined = combinedRender.content;
           const combinedRefs = combinedRender.refs;
+          // The summaries the answer holds: every one the flat cap left
+          // something of, since it passes every carrier through, cut text or
+          // not (capContent), and under an envelope those its cap
+          // admitted, which ends at the first summary it cuts.
+          const admittedIds = new Set(combinedRefs.map((ref) => ref.id));
+          const admitted = selectedSummaries.filter((s) => admittedIds.has(s.id));
+          pairSummaries = admitted;
           const questionEntry: ContextEntry = {
             index: entries.length,
             participant: 'Context Manager',
-            content: [{ type: 'text', text: contextLabel }],
+            content: [{ type: 'text', text: this.recallLabel(this.sortSummariesChronologically(admitted, messages)) }],
             sourceRelation: 'derived',
             summaries: combinedRefs,
           };
@@ -16788,13 +16834,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             summaries: combinedRefs,
           };
 
-          // The summaries the answer holds: every one the flat cap left
-          // something of, since it passes every carrier through, cut text or
-          // not (capContent), and under the xml envelope those its cap
-          // admitted, which ends at the first summary it cuts.
-          const admittedIds = new Set(combinedRefs.map((ref) => ref.id));
-          const admitted = selectedSummaries.filter((s) => admittedIds.has(s.id));
-          pairSummaries = admitted;
           // The pair is priced at what goes out: the label, and the answer as
           // the cap left it, with each summary it holds floored as
           // recallAnswerCost floors a positioned pair's answer, so a carrier's
@@ -17174,15 +17213,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /**
    * Render the per-pair recall header from the configured template.
-   * Substitutions: {id} {level} {first} {last}.
+   * Substitutions: {id} {level} {first} {last} {tools}.
    */
   protected buildRecallHeader(summary: SummaryEntry): string {
     const template = this.config.recallHeaderTemplate ?? '[Recall {id}]';
-    return template
+    const header = template
       .replace(/\{id\}/g, summary.id)
       .replace(/\{level\}/g, String(summary.level))
       .replace(/\{first\}/g, summary.sourceRange.first)
       .replace(/\{last\}/g, summary.sourceRange.last);
+    return header.replace(/\{tools\}/g, () => this.recallToolsText([summary]));
   }
 
   // ============================================================================
@@ -19806,7 +19846,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       ...releaseTrailingReasoning(content),
       { type: 'text', text: COMBINED_RECALL_SEPARATOR_TEXT },
     ];
-    if (this.config.recallEnvelope !== 'xml') {
+    if (!isRecallEnveloped(this.config.recallEnvelope)) {
       let content: ContentBlock[] = [];
       // Which summary each text block of the full answer belongs to (-1 for
       // separators), so a flat truncation can be read back per summary.
@@ -19958,7 +19998,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       {
         index,
         participant: 'Context Manager',
-        content: [{ type: 'text', text: this.config.summaryContextLabel ?? 'What do you remember from earlier?' }],
+        content: [{ type: 'text', text: this.recallLabel([summary]) }],
         sourceRelation: 'derived',
         summaries: rendered.refs,
       },
@@ -19988,7 +20028,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * The envelope is therefore NOT charged against `maxMessageTokens`; a
    * capped enveloped answer runs over the cap by its own tag text, and the
-   * legacy combined answer under `recallEnvelope: 'xml'` also by the omission
+   * legacy combined answer under an envelope (`'xml'` or `'bare'`) also by the omission
    * marker it writes after its last envelope when summaries that hold anything
    * are left out, unless that answer's own cut already wrote it inside its
    * envelope. That is
