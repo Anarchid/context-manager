@@ -204,6 +204,25 @@ describe('ContextManager.derive', () => {
     managers.push(own);
     assert.ok((await texts(own)).some((t) => t.includes('SECRET ROW')), 'its own view: the child sees what the parent\'s filter hid');
     assert.ok(!(await texts(parent)).some((t) => t.includes('SECRET ROW')), 'and the parent\'s view is untouched');
+
+    const plain = (m: { metadata?: unknown }) => (m.metadata as { plain?: boolean } | undefined)?.plain === true;
+    parent.addMessage('User', [{ type: 'text', text: 'PLAIN ROW' }], { plain: true });
+    const selective = await parent.derive({ branch: 'dendrite/selective', strategy: folding(), viewFilter: (m) => !plain(m) });
+    managers.push(selective);
+    const seen = await texts(selective);
+    assert.ok(seen.some((t) => t.includes('SECRET ROW')) && !seen.some((t) => t.includes('PLAIN ROW')), 'its own view in place of the parent\'s: what it admits and what it leaves out are its own');
+    assert.ok((await texts(parent)).some((t) => t.includes('PLAIN ROW')), 'the parent still shows the row the child leaves out');
+
+    const reopened = await ContextManager.reopenDerived({
+      store: parent.getStore(),
+      derivation: selective.getDerivation()!,
+      strategy: folding(),
+      membrane: mockMembrane() as never,
+      viewFilter: (m) => !plain(m),
+    });
+    managers.push(reopened);
+    const seenAgain = await texts(reopened);
+    assert.ok(seenAgain.some((t) => t.includes('SECRET ROW')) && !seenAgain.some((t) => t.includes('PLAIN ROW')), 'reopened with the view it read through, the child sees what it saw');
   });
 
   it('shares the inherited messages in memory instead of copying them', { skip }, async () => {

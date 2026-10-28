@@ -234,9 +234,12 @@ export interface DeriveContextOptions {
    *   fold state arrives through the store, and, at the head, the in-memory
    *   remainder is handed from the parent's strategy to the child's — so the
    *   child's first compile reproduces the parent's presentation and cache
-   *   markers. Derived from an earlier point (`atSequence`), the child
-   *   keeps what was persisted by then and nothing in memory, since the
-   *   parent's in-memory frontier describes its head.
+   *   markers when it reads through the parent's view; with a view of its
+   *   own (`viewFilter`) the frontier is handed over all the same, and the
+   *   child renders what its view holds. Derived from an earlier point
+   *   (`atSequence`), the child keeps what was persisted by then and
+   *   nothing in memory, since the parent's in-memory frontier describes
+   *   its head.
    * - `'fresh'`: discard the inherited frontier and solve from scratch, e.g.
    *   at another budget. Presentation changes; the provider cache misses.
    */
@@ -250,11 +253,17 @@ export interface DeriveContextOptions {
    */
   atSequence?: number;
   /**
-   * The derived manager's view (see ContextManagerBaseConfig.viewFilter).
-   * Default: the parent's. A host whose forks see what their parent sees and
-   * their own rows besides (agent-framework's shared forks, whose stored
-   * context injections carry the fork's name) passes the composed predicate
-   * here, so the first compile already reads through it.
+   * The derived manager's view (see ContextManagerBaseConfig.viewFilter), in
+   * place of the parent's: it replaces the parent's exclusions rather than
+   * adding to them. Default: the parent's. The inherited memory was built
+   * under the parent's view, so this one keeps and leaves out what the
+   * parent's does of the history that memory covers, and may differ on rows
+   * the parent hasn't folded, such as those stored after the checkpoint. A
+   * host whose forks see what their parent sees and their own rows besides
+   * (agent-framework's shared forks, whose stored context injections carry
+   * the fork's name) passes the composed predicate here, so the first compile
+   * already reads through it. A predicate isn't part of the derivation
+   * record: reopening takes it again (ReopenDerivedOptions.viewFilter).
    */
   viewFilter?: (message: StoredMessage) => boolean;
   debugLogContext?: boolean;
@@ -272,8 +281,9 @@ export interface ContextDerivation {
   /** The states it inherited; anything else reads as empty on its branch. */
   inherited: { stateIds: string[]; statePrefixes: string[] };
   /**
-   * How the manager's slots are named — with `branch`, everything needed to
-   * reopen the derived context later (see {@link ContextManager.reopenDerived}).
+   * How the manager's slots are named — with `branch`, what the store needs
+   * to reopen the derived context later (see {@link ContextManager.reopenDerived}),
+   * which also takes the strategy and the view it read through.
    * `null` stands for "no namespace" so the record survives JSON.
    */
   slots: {
@@ -292,7 +302,10 @@ export interface ReopenDerivedOptions {
   strategy?: ContextStrategy;
   membrane?: Membrane;
   tokenEstimator?: (text: string) => number;
-  /** The same exclusion predicate the parent manager used, if it had one. */
+  /**
+   * The view the derived manager read through: the one given to `derive`,
+   * else the parent's exclusion predicate, if it had one.
+   */
   viewFilter?: (message: StoredMessage) => boolean;
   debugLogContext?: boolean;
 }
