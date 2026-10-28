@@ -2398,6 +2398,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Protected ranges (pins + documents). Loaded from chronicle in initialize. */
   protected pins: ProtectedRange[] = [];
+  private previewPins: ProtectedRange[] | null = null;
+  private get selectPins(): readonly ProtectedRange[] {
+    return this.previewPins ?? this.pins;
+  }
   /** Monotonically increasing counter for pin ids. Persisted as part of the pins snapshot. */
   protected pinIdCounter = 0;
 
@@ -2607,10 +2611,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * Runs a dry-run select at `budget`, with the select options it is given
    * (`opts`, all but `dryRun`, which is always set, and `identity`, which
-   * nothing here reads), optionally with a scoped config swap for knobs that
-   * are otherwise recipe-and-restart only (tail, head window, chunk size,
-   * merge threshold, folding strategy...). Commits nothing: no resolution
-   * persistence, no compression enqueue, no transition bookkeeping.
+   * nothing here reads), with the pins and document marks whose ids
+   * `opts.excludePins` lists read as absent (an id no pin has is ignored),
+   * optionally with a scoped config swap for knobs that are otherwise
+   * recipe-and-restart only (tail, head window, chunk size, merge
+   * threshold, folding strategy...). Commits nothing: no resolution
+   * persistence, no compression enqueue, no transition bookkeeping, and no
+   * pin is removed or written; the pins it leaves out are left out of what
+   * the select reads, not of the strategy's list.
    *
    * Two things this deliberately does NOT do:
    *  - It does not apply anything. Applying is `updateHotContextSettings` (for
@@ -2630,7 +2638,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     log: ContextLogView,
     budget: TokenBudget,
     overrides?: AutobiographicalOptions,
-    opts?: { render?: boolean } & Omit<SelectOptions, 'dryRun' | 'identity'>,
+    opts?: { render?: boolean; excludePins?: readonly string[] } & Omit<SelectOptions, 'dryRun' | 'identity'>,
   ): PreviewResult {
     this.requireLoadedBranch('previewContext');
     if (this._previewInFlight) {
@@ -2663,9 +2671,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         this._adaptivePicker = null;
         this._cachedHeadStartIndex = null;
       }
+      const { render: _render, excludePins, ...selectOptions } = opts ?? {};
+      if (excludePins?.length) {
+        const excluded = new Set(excludePins);
+        this.previewPins = this.pins.filter((pin) => !excluded.has(pin.id));
+      }
       let rendered: ContextEntry[] | undefined;
       try {
-        const { render: _render, ...selectOptions } = opts ?? {};
         const out = this.select(store, log, budget, { ...selectOptions, dryRun: true });
         // Only retained on request: these are full rendered entries and can be
         // megabytes on a large store.
@@ -2721,6 +2733,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.config = savedConfig;
       this._adaptivePicker = savedPicker;
       this._cachedHeadStartIndex = savedHeadCache;
+      this.previewPins = null;
       this._lastPreview = undefined;
       this._previewInFlight = false;
     }
@@ -3866,10 +3879,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * message exists; orphan pins (deleted messages) are silently skipped.
    */
   protected pinnedPositions(messages: StoredMessage[]): Set<number> {
-    if (this.pins.length === 0) return new Set();
+    if (this.selectPins.length === 0) return new Set();
     const positionOf = this.positionIndex(messages);
     const out = new Set<number>();
-    for (const pin of this.pins) {
+    for (const pin of this.selectPins) {
       for (const i of this.pinPositions(pin, positionOf, messages) ?? []) out.add(i);
     }
     return out;
@@ -3938,10 +3951,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    */
   protected pinLevelBounds(messages: StoredMessage[]): Map<number, { level?: number; maxLevel?: number }> {
     const out = new Map<number, { level?: number; maxLevel?: number }>();
-    if (this.pins.length === 0) return out;
+    if (this.selectPins.length === 0) return out;
     const positionOf = this.positionIndex(messages);
 
-    for (const pin of this.pins) {
+    for (const pin of this.selectPins) {
       if (pin.level === undefined && pin.maxLevel === undefined) continue;
       for (const i of this.pinPositions(pin, positionOf, messages) ?? []) {
         const prev = out.get(i) ?? {};
@@ -13076,7 +13089,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * when no pin keeps any.
    */
   private rawPinsDiagnostics(store: MessageStoreView, price: (position: number) => number): OverBudgetDiagnostics['rawPins'] {
-    if (this.pins.length === 0) return undefined;
+    if (this.selectPins.length === 0) return undefined;
     const messages = store.getAll();
     const raw = this.forceRawPinPositions(messages);
     // A message of system changes stays raw whatever the pins (resolvedPinBounds), so unpinning frees none of it.
@@ -13092,7 +13105,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const positionOf = this.positionIndex(messages);
     const readsBounds = this.readsPinBounds();
     const pins: OverBudgetRawPin[] = [];
-    for (const pin of this.pins) {
+    for (const pin of this.selectPins) {
       const bound: ResolvedPinBound = pin.level !== undefined ? { level: pin.level }
         : pin.maxLevel !== undefined ? { maxLevel: pin.maxLevel } : 'raw';
       if (readsBounds && !AutobiographicalStrategy.isRawPinBound(bound)) continue;
@@ -20192,6 +20205,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       storeOrder: this._storeOrder,
       storeOrderSource: this._storeOrderSource,
       headStartMemo: this._cachedHeadStartIndex,
+      ownedIds: this._ownedIdsCache,
     };
     return () => {
       this.chunks = saved.chunks;
@@ -20221,6 +20235,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this._storeOrder = saved.storeOrder;
       this._storeOrderSource = saved.storeOrderSource;
       this._cachedHeadStartIndex = saved.headStartMemo;
+      this._ownedIdsCache = saved.ownedIds;
     };
   }
 
