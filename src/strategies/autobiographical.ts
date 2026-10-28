@@ -19029,6 +19029,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // predecessor has tool_use, pull back by one so the pair stays together.
         if (boundary > startIdx && this.hasToolUse(messages[boundary - 1])) {
           boundary--;
+          tokens -= store.estimateTokens(messages[i]);
         }
         return this.anchorHeadToCoverage(store, messages, boundary, tokens);
       }
