@@ -246,6 +246,14 @@ export interface DeriveContextOptions {
    * live caches describe the head, not the past). Default: the current head.
    */
   atSequence?: number;
+  /**
+   * The derived manager's view (see ContextManagerBaseConfig.viewFilter).
+   * Default: the parent's. A host whose forks see what their parent sees and
+   * their own rows besides (agent-framework's shared forks, whose stored
+   * context injections carry the fork's name) passes the composed predicate
+   * here, so the first compile already reads through it.
+   */
+  viewFilter?: (message: StoredMessage) => boolean;
   debugLogContext?: boolean;
 }
 
@@ -1357,7 +1365,7 @@ export class ContextManager {
       this.strategyNamespace,
       options.membrane ?? this.membrane,
       options.debugLogContext ?? this.debugLogContext,
-      this.viewFilter,
+      options.viewFilter ?? this.viewFilter,
       auxiliaryStores,
     );
     derived.now = this.now;
