@@ -7,9 +7,10 @@
  *
  * `enforceToolPairing` is the final structural pass in selectHierarchical:
  * every tool_use must be answered by a matching tool_result in the
- * immediately-following entry, and every tool_result must answer a tool_use
- * in the immediately-preceding entry. Repair prefers preserving pairs
- * (stub tool_result) over dropping content.
+ * immediately-following entry, or after it in its own entry's content, and
+ * every tool_result must answer a tool_use in the immediately-preceding
+ * entry or before it in its own. Repair prefers preserving pairs (stub
+ * tool_result) over dropping content.
  */
 
 import { describe, it, before, after } from 'node:test';
