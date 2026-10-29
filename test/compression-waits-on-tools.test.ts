@@ -83,7 +83,7 @@ describe('compression that waits on the host\'s tool definitions', () => {
   after(cleanup);
 
   it('waits queued while no tools are declared, and once they are, compresses in order with no new message', async () => {
-    const { manager, calls, snapshot } = await open();
+    const { manager, strategy, calls, snapshot } = await open();
     addToolBearing(manager);
     await tickUntilReady(manager);
     const before = snapshot();
@@ -111,6 +111,7 @@ describe('compression that waits on the host\'s tool definitions', () => {
     const after = snapshot();
     assert.strictEqual(after.chunksCompressed, before.chunksCompressed + before.l1WaitingOnTools);
     assert.strictEqual(after.l1WaitingOnTools, 0);
+    assert.strictEqual(strategy.getCompressionDebt().pendingChunks, 0, 'no chunk was left behind');
     assert.ok(calls.slice(before.chunksCompressed).every((c) => Array.isArray(c.tools) && (c.tools as unknown[]).length === TOOLS.length));
     await manager.close();
   });
@@ -234,7 +235,7 @@ describe('compression that waits on the host\'s tool definitions', () => {
     await manager.close();
   });
 
-  async function settles(strategy: AutobiographicalStrategy, drive: () => void): Promise<number> {
+  async function settles(strategy: AutobiographicalStrategy, drive: () => void): Promise<void> {
     let ticks = 0;
     let inFlight = 0;
     const tick = strategy.tick.bind(strategy);
@@ -247,7 +248,7 @@ describe('compression that waits on the host\'s tool definitions', () => {
     const turn = () => new Promise((resolve) => setTimeout(resolve, 0));
     let seen = -1;
     let still = 0;
-    for (let i = 0; i < 20_000 && still < 20; i++) {
+    for (let i = 0; i < 5000 && still < 20; i++) {
       await turn();
       if (inFlight === 0 && ticks === seen) still++;
       else { seen = ticks; still = 0; }
@@ -255,7 +256,6 @@ describe('compression that waits on the host\'s tool definitions', () => {
     assert.strictEqual(still, 20, 'the drain settled');
     for (let i = 0; i < 50; i++) await turn();
     assert.strictEqual(ticks, seen, 'no tick after the drain settled');
-    return ticks;
   }
 
   it('an auto-tick drain stops when only waiting chunks are left', async () => {

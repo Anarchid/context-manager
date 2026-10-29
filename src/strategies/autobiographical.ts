@@ -6170,10 +6170,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * withdrawal, which say nothing about anything, it keeps its place: at the
    * head, or among the failed if it failed before (orderCompressionQueue).
    * Queued again meanwhile without a rebuild, as a plan's demand queues it
-   * at the tail, it moves from the tail to that place, once. One waiting on
-   * the host's tools goes back at the place it was taken from before the
-   * queue is ordered, so chunks deferred one after another keep their order.
-   * A rebuild
+   * at the tail, it moves from the tail to that place, once. A rebuild
    * during the call (`superseded`) re-decided the chunk's eligibility: it is
    * put back only if that rebuild queued it, and a rebuild's withdrawal of
    * it stands.
@@ -7987,13 +7984,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         }
         throw error;
       } finally {
-        if (!mergeToolsDeferred && this.isCompressionBranchCurrent(sourceBranch)) this._drainProgress++;
         // As for L1 above: a branch switch may have installed different
         // pending work, whose ownership this stale merge must not release.
         if (this.pendingCompression === merging) {
           this.pendingCompression = null;
           this.pendingCompressionWork = null;
         }
+        if (!mergeToolsDeferred && this.isCompressionBranchCurrent(sourceBranch)) this._drainProgress++;
       }
     }
   }
@@ -9593,6 +9590,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
 
+    // On Fable/Mythos-family summarizers a request without the agent's live
+    // tool definitions is refused whatever it holds: the bare
+    // marker+directive with no conversation at all is input-blocked, while
+    // the identical bytes with the live tool set declared mint cleanly (Linn,
+    // claude-fable-5-1, 2026-09-05; same on claude-fable-5). A pure-chat
+    // seed's first speculative L1 therefore fired ~300ms after boot -- before
+    // the host's first setToolDefinitions -- burned a doomed call and landed
+    // in quarantine. Opus-family summarizers mint tools-less (lena bench), so
+    // the content-independent rule is gated on the model family.
     if (this.familyWaitsForTools(ctx.tools)) {
       this.diag.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; Fable/Mythos-family summarizer refuses tools-less requests) — will retry after tools are pushed`);
       onToolsDeferred?.();
@@ -10009,19 +10015,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Without the agent's live tool definitions a summarizer request that
     // replays tool-block-bearing history is deterministically refused
     // (reasoning_extraction -- see the `tools` comment below; labclaude
-    // 2026-07-09). On Fable/Mythos-family summarizers the refusal is
-    // content-INDEPENDENT: the bare marker+directive with no conversation
-    // at all is input-blocked, while the identical bytes with the live tool
-    // set declared mint cleanly (Linn, claude-fable-5-1, 2026-09-05; same on
-    // claude-fable-5). A pure-chat seed's first speculative L1 therefore
-    // fired ~300ms after boot -- before the host's first
-    // setToolDefinitions -- burned a doomed call and landed in quarantine.
-    // Tools are pushed by the host on MCPL registration / maintenance
-    // passes and on every activation, so defer rather than burn the call.
-    // Opus-family summarizers mint tools-less (lena bench), and test
-    // harnesses never push tools, so the content-independent rule is gated
-    // on the model family.
-    // compressionWorkQueued's count applies the same test (hasToolBlocks).
+    // 2026-07-09).
     if (cleaned.some((m) => hasToolBlocks(m.content)) && !(ctx.tools && ctx.tools.length > 0)) {
       this.diag.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; history contains tool blocks) — will retry after tools are pushed`);
       onToolsDeferred?.();
@@ -13080,8 +13074,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * reaches only after that. The merge in flight stays at
    * the head until it lands, and the walk reads it there: a hold placed since
    * ends the walk at it, since tick discards what its call returns and stops
-   * at that head. A queued merge counts even when executeMerge will
-   * drop it as stale without a model call (a source not loaded, already
+   * at that head. On a Fable/Mythos model with no tools declared no merge
+   * counts, since none can be sent; otherwise a queued merge counts even
+   * when executeMerge will drop it as stale without a model call (a source not loaded, already
    * parented or held out of merges, or a group its topology check refuses,
    * which it quarantines),
    * when a source in memory covers such a message: tick drops one such entry
@@ -13269,8 +13264,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // one a hold blocks, reading the hold set the count read above; a stale
     // merge counts until tick has dropped it, if it folds something now. A
     // merge in flight is still the head: a hold placed since ends the walk
-    // there, since tick discards what its call returns and stops at it. On a
-    // Fable/Mythos model with no tools declared, no merge counts.
+    // there, since tick discards what its call returns and stops at it.
     const modelled = Boolean(this.config.compressionModel);
     let mergeCounts = false;
     if (this.config.hierarchical && modelled && !this.familyWaitsForTools(this.hostContext?.tools)) {
