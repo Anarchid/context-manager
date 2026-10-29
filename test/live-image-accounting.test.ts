@@ -863,6 +863,21 @@ describe("the adaptive strip applies the estimate's verdicts", () => {
     assert.equal(r.total + r.movedText, r.sent, `render stats ${r.total} and the repair's text ${r.movedText}, sent ${r.sent}`);
   });
 
+  it("sends no image live on another's verdict where two results for one call id share a message and the repair moves one", async () => {
+    const use = (text: string): [string, ContentBlock[]] =>
+      ['Claude', [{ type: 'text', text }, { type: 'tool_use', id: 'x', name: 'shot', input: {} }] as ContentBlock[]];
+    const result = (data: string, tokenEstimate: number, text: string) =>
+      ({ type: 'tool_result', toolUseId: 'x', content: [{ type: 'text', text }, image(data, tokenEstimate)] });
+    const r = await compileMoved(1, [
+      ['User', [{ type: 'text', text: 'start' }]],
+      use('call'), use('again'),
+      ['User', [result('SMAL', 100, 'small'), result('LARG', 5000, 'large')] as unknown as ContentBlock[]],
+      ['Claude', [{ type: 'text', text: 'done' }]],
+    ]);
+    assert.equal(r.live.length, 6, 'premise: the repair sent the two results apart, each after a call');
+    assert.ok(r.sent <= r.total, `sent ${r.sent}, past the render stats' ${r.total}`);
+  });
+
   it("counts a moved result's image once, so an older image the estimate kept stays live", async () => {
     // Result a's message sends nothing once the repair moves its result, so
     // its image goes out in result b's entry.
