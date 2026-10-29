@@ -81,12 +81,8 @@ describe('tools-less summarizer deferral', () => {
       await drain(manager);
       assert.strictEqual(calls.length, 0, 'no summarizer call may be issued before the host pushes tools');
       manager.setToolDefinitions(TOOLS);
-      // Deferred chunks are not a queued work item; they are re-examined on the
-      // next ingestion/activation (exactly what a resident's first turn does).
       await drain(manager);
-      manager.addMessage('user', [t('one more line after the host pushed tools')]);
-      await drain(manager);
-      assert.ok(calls.length > 0, 'compression resumes once tools are pushed and the next message lands');
+      assert.ok(calls.length > 0, 'compression resumes once tools are pushed, with no new message');
       assert.ok(calls.every((c) => Array.isArray(c.tools) && (c.tools as unknown[]).length === TOOLS.length), 'every summarizer request declares the live tools');
       await manager.close();
     });

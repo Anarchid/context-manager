@@ -1251,6 +1251,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
           ['fork', []],
           ['isReady', []],
           ['getPendingWork', []],
+          ['getWaitingWork', []],
           ['compile', []],
           ['acceptRound', [{ provenance: {} }]],
           ['setStrategy', [new PassthroughStrategy()]],
