@@ -12,8 +12,6 @@
  *     with the OLD cadence retunes it to the current constants via
  *     chronicle's updateStateStrategy (0.3.0+).
  *   - The retune only touches scheduling: message content is unaffected.
- *   - On chronicle builds without updateStateStrategy, open still works
- *     (feature-detected; old cadence simply remains).
  */
 
 import { describe, it } from 'node:test';

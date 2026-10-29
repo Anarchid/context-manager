@@ -196,9 +196,6 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
     const lastL1 = l1s[l1s.length - 1];
     const queueBefore = ((strategy as any).mergeQueue as Array<{ level: number; sourceIds: string[] }>).length;
 
-    // Directly invoke the handler with a synthetic produce op covering
-    // the L1 range. This is what selectAdaptive does when the picker
-    // returns produce ops; here we test it in isolation.
     (strategy as any).handleProducedOps([
       {
         kind: 'produce',
@@ -216,7 +213,6 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
       `expected handleProducedOps to enqueue an L2 merge; queue went ${queueBefore} → ${queueAfter}`
     );
 
-    // Run the merge through.
     while (!manager.isReady()) {
       await manager.tick();
     }

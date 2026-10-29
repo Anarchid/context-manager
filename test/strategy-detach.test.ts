@@ -572,13 +572,10 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       await waitFor(() => calls.length === 2);
       assert.ok(JSON.stringify(calls[1].request).includes('"thinking"'), "the second request carries the first summary's reasoning");
 
-      let ended = false;
-      await compressionLogDuring(async () => {
-        await manager.setStrategy(new PassthroughStrategy());
-        calls[1].fail(carrierRejection());
-        ended = await settlesWithin(second);
-        await settle(50);
-      });
+      await manager.setStrategy(new PassthroughStrategy());
+      calls[1].fail(carrierRejection());
+      const ended = await settlesWithin(second);
+      await settle(50);
 
       assert.strictEqual(calls.length, 2, `the replaced strategy retried the call ${calls.length - 2} time(s)`);
       assert.ok(ended, 'the tick ended');
