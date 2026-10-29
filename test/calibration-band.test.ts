@@ -357,6 +357,7 @@ describe('estimator calibration band', () => {
     await cycleReopened.cm.compile(BUDGET);
     const cal = cycleReopened.cm.getRenderStats()!.calibration!;
     assert.equal(cal.multiplier, 1, 'restarts from 1');
+    assert.equal(cal.provisional, true, 'provisional, for the first accepted sample to replace');
     assert.equal(cal.reset?.discardedMultiplier, 0.7);
     assert.equal(cal.reset?.fromEpoch, 5);
     cycleReopened.cm.close();

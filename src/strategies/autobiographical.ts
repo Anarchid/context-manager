@@ -2076,26 +2076,36 @@ function sentForm(block: ContentBlock): ContentBlock {
   return withoutRawForms(block);
 }
 
+/** A message's content in parts around each tool cycle of its own: a run
+ *  of tool_result blocks, one of which answers a tool_use earlier in the same
+ *  content, is a part, and so is what follows it. A cut never splits a run
+ *  of results or a run of other blocks, and the blocks that share a raw
+ *  replay form (raw-forms.ts) sit in one such run, so a form stays within one
+ *  part. */
+function cycleParts(content: ContentBlock[]): ContentBlock[][] {
+  const runs: ContentBlock[][] = [];
+  for (const block of content) {
+    const run = runs[runs.length - 1];
+    if (run && (run[0]!.type === 'tool_result') === (block.type === 'tool_result')) run.push(block);
+    else runs.push([block]);
+  }
+  const parts: ContentBlock[][] = [];
+  const called = new Set<string>();
+  let afterCycle = false;
+  for (const run of runs) {
+    const cycle = run.some((block) => block.type === 'tool_result' && called.has(block.toolUseId));
+    if (parts.length === 0 || cycle || afterCycle) parts.push([...run]);
+    else parts[parts.length - 1]!.push(...run);
+    afterCycle = cycle;
+    for (const block of run) if (block.type === 'tool_use') called.add(block.id);
+  }
+  return parts;
+}
+
 const TOP_LEVEL_IMAGES = Symbol('top-level images');
 /** Which of its message's image groups a block's images belong to, for the
  *  verdicts postStripEstimates keeps: a tool result's are its call's, and a
  *  message's top-level images are one group. */
-function cycleParts(content: ContentBlock[]): ContentBlock[][] {
-  const parts: ContentBlock[][] = [[]];
-  let called = false;
-  let inResults = false;
-  for (const block of content) {
-    const isResult = block.type === 'tool_result';
-    if (isResult ? called && !inResults : inResults) {
-      parts.push([]);
-      inResults = isResult;
-    }
-    parts[parts.length - 1]!.push(block);
-    if (block.type === 'tool_use') called = true;
-  }
-  return parts.filter((part) => part.length > 0);
-}
-
 function imageGroup(block: ContentBlock): unknown {
   return block.type === 'tool_result' ? block.toolUseId : TOP_LEVEL_IMAGES;
 }
@@ -14881,11 +14891,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *      band, learned nothing from it.
    *   5: generated images (`generated_image`, nested in a tool result too)
    *      priced as an image without a stamp, where they had estimated as 0
-   *   6: a tool result after a tool call in one message's content sent with
-   *      that message (enforceToolPairing), where pairing repair dropped it
-   *      after the plan and the render stats counted it, and sent a stub. A
-   *      store holding one learned a multiplier low enough to make up for
-   *      the results it priced and didn't send
+   *   6: a tool result answering a tool call before it in one message's
+   *      content sent with that message (enforceToolPairing), where pairing
+   *      repair dropped it after the plan and the render stats counted it,
+   *      and sent a stub. A store holding one learned a multiplier low
+   *      enough to make up for the results it priced and didn't send
    *
    * A record without a stamp was written by 0.13.0 or earlier: by 0.11.0 to
    * 0.13.0 under epoch 1's pricing, or by a release before 0.11.0, under
@@ -19548,12 +19558,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *     its use is adjacent; an entry left empty is replaced with a
    *     placeholder text block.
    *
-   * An entry holding a tool cycle of its own (a run of tool_result blocks
-   * after a tool_use in its content) is judged in parts: each such run of
-   * results is a part, and so is what follows it, so a result answers the
-   * calls just before it in its own message, as the compile's split
-   * (splitMixedToolMessages) and membrane's normalizer send them. The parts
-   * fold back into the one entry, with any stub placed between two of them.
+   * An entry holding a tool cycle of its own is judged in parts
+   * (cycleParts), and its parts fold back into the one entry. The look-ahead
+   * counts an entry's parts as one entry.
    *
    * Runs as a structural pass over the rendered context in BOTH render
    * paths — `selectHierarchical` (downstream of `selectL1Summaries`, so
@@ -19576,34 +19583,34 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.repairToolPairing(entries);
       return;
     }
-    this.repairToolPairing(parts);
-    const original = new Set(entries);
+    this.repairToolPairing(parts, (entry) => originOf.get(entry) ?? entry);
+    const partsOf = new Map<ContextEntry, ContextEntry[]>();
+    for (const part of parts) {
+      const origin = originOf.get(part);
+      if (!origin) continue;
+      const own = partsOf.get(origin);
+      if (own) own.push(part);
+      else partsOf.set(origin, [part]);
+    }
     const folded: ContextEntry[] = [];
-    for (let i = 0; i < parts.length;) {
-      const origin = originOf.get(parts[i]!);
+    for (const part of parts) {
+      const origin = originOf.get(part);
       if (!origin) {
-        folded.push(parts[i]!);
-        i++;
+        folded.push(part);
         continue;
       }
-      let last = i;
-      for (let k = i + 1; k < parts.length; k++) {
-        const of = originOf.get(parts[k]!);
-        if (of === origin) last = k;
-        else if (of !== undefined || original.has(parts[k]!)) break;
-      }
-      const taken = parts.slice(i, last + 1);
-      origin.content = taken.flatMap((part) => part.content);
-      const moved = taken.flatMap((part) => part.relocatedResults ?? []);
+      const own = partsOf.get(origin)!;
+      if (own[0] !== part) continue;
+      origin.content = own.flatMap((p) => p.content);
+      const moved = own.flatMap((p) => p.relocatedResults ?? []);
       if (moved.length > 0) origin.relocatedResults = [...(origin.relocatedResults ?? []), ...moved];
       folded.push(origin);
-      i = last + 1;
     }
     entries.splice(0, entries.length, ...folded);
     for (let i = 0; i < entries.length; i++) entries[i]!.index = i;
   }
 
-  private repairToolPairing(entries: ContextEntry[]): void {
+  private repairToolPairing(entries: ContextEntry[], unitOf: (entry: ContextEntry) => ContextEntry = (entry) => entry): void {
     let prevUseIds = new Set<string>();
 
     for (let i = 0; i < entries.length; i++) {
@@ -19641,7 +19648,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // Rule A when we reach it). Move the real block up into position and
           // only stub the ids for which no real result exists — so tool output
           // is preserved, not silently replaced by a placeholder.
-          const results = this.relocateOrDropMissingResults(entries, i, missing);
+          const results = this.relocateOrDropMissingResults(entries, i, missing, unitOf);
           if (answered.size > 0) {
             // This entry already carries results for the cycle — prepend the
             // relocated/stub results so all results for the preceding tool_use
@@ -19714,9 +19721,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     entries: ContextEntry[],
     afterIndex: number,
     missing: string[],
+    unitOf: (entry: ContextEntry) => ContextEntry,
   ): ContentBlock[] {
     const LOOKAHEAD = 6;
-    const end = Math.min(entries.length, afterIndex + 1 + LOOKAHEAD);
+    let end = afterIndex + 1;
+    for (let units = 0, unit = unitOf(entries[afterIndex]!); end < entries.length; end++) {
+      const next = unitOf(entries[end]!);
+      if (next === unit) continue;
+      if (++units > LOOKAHEAD) break;
+      unit = next;
+    }
     return missing.map(id => {
       for (let j = afterIndex + 1; j < end; j++) {
         const src = entries[j];
