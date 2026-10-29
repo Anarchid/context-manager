@@ -149,7 +149,11 @@ describe('AutobiographicalStrategy — non-blocking compile + uncompressed-chunk
 
     const ticking = manager.tick();
     try {
-      await Promise.race([called, ticking.then(() => { throw new Error('premise: the tick asked for no compression'); })]);
+      await Promise.race([
+        called,
+        ticking.then(() => { throw new Error('premise: the tick asked for no compression'); }),
+        within(10_000, 'the tick never reached the provider'),
+      ]);
       await Promise.race([
         manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }),
         within(10_000, 'compile() waited for the compression in flight'),
