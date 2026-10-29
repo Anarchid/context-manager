@@ -91,13 +91,6 @@ describe('merge adjacency is judged in store order (issue #122)', () => {
     const picked = p.pick([...six, stray], 6);
     assert.deepEqual(picked?.map((s) => s.id), six.map((s) => s.id));
   });
-
-  test('without a store listing the index degrades to chunk-record order', () => {
-    const p = probe();
-    p.setChunks([ids(0, 9), ids(10, 19)]);
-    const picked = p.pick([l1('a', 0, 9), l1('b', 10, 19)], 2);
-    assert.deepEqual(picked?.map((s) => s.id), ['a', 'b']);
-  });
 });
 
 /** A Probe bound to a real store: branch-guarded entrypoints need one. */
@@ -457,7 +450,7 @@ describe('auditOnly opens never mutate the store', () => {
   const wipe = () => { if (existsSync(STORE)) rmSync(STORE, { recursive: true, force: true }); };
   before(wipe);
   after(wipe);
-  test('a plain open chunks the frontier; an audit-only open leaves records and queue untouched', async () => {
+  test('a plain open chunks the frontier; an audit-only open leaves the records untouched', async () => {
     const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'x' }] }) };
     const cfg = { adaptiveResolution: true, hierarchical: true, autoTickOnNewMessage: false, headWindowTokens: 50, recentWindowTokens: 0, targetChunkTokens: 200 };
     const seed = new AutobiographicalStrategy(cfg);

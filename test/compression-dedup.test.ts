@@ -40,10 +40,15 @@ describe('Concurrent compression: stale chunk identity', () => {
     cleanup();
 
     let llmCalls = 0;
+    let entered!: () => void;
+    const called = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const answer = new Promise<void>((resolve) => { release = resolve; });
     const slowMembrane = {
       complete: async () => {
         llmCalls++;
-        await new Promise((r) => setTimeout(r, 80));
+        entered();
+        await answer;
         return { stopReason: 'end_turn', content: [{ type: 'text', text: `Summary #${llmCalls} of the chunk` }] };
       },
     };
@@ -81,6 +86,7 @@ describe('Concurrent compression: stale chunk identity', () => {
 
     // Start a slow compression of chunk 0 — do NOT await yet.
     const inflight = manager.tick();
+    await Promise.race([called, inflight.then(() => { throw new Error('premise: the tick asked for no compression'); })]);
 
     // While the LLM call is in flight: a new message arrives and a compile
     // runs → rebuildChunks resets the queue and re-queues chunk 0 (its L1
@@ -88,6 +94,7 @@ describe('Concurrent compression: stale chunk identity', () => {
     manager.addMessage('User', [{ type: 'text', text: filler(30) }]);
     await manager.compile();
 
+    release();
     await inflight;
 
     // Drain the (stale) queue: without the dedup guard, the re-queued chunk 0

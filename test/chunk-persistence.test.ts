@@ -168,31 +168,29 @@ describe('Chunk persistence: close-then-compress', () => {
     await manager.close();
   });
 
-  it('persists chunk records when chunks close', async () => {
+  it('persists chunk records when chunks close, so a reopen summarises nothing again', async () => {
     const path = freshPath();
-    const { membrane } = mockMembrane();
-    const strategy = new AutobiographicalStrategy({
+    const config = {
       compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 100,
       headWindowTokens: 0,
       recentWindowTokens: 0,
       hierarchical: true,
-      l1HoldbackChunks: 0, // this test asserts EVERY record compresses after drain
-    });
-    const manager = await ContextManager.open({ path, strategy, membrane });
-    for (let i = 0; i < 40; i++) manager.addMessage(i % 2 ? 'agent' : 'user', [t(filler(i))]);
-    await drain(manager);
-
-    const records = manager.getStore().getStateJson(CHUNKS) as any[];
-    assert.ok(Array.isArray(records) && records.length > 0, 'chunk records persisted');
-    for (const r of records) {
-      assert.ok(typeof r.id === 'string' && r.id.length > 0);
-      assert.ok(Array.isArray(r.sourceIds) && r.sourceIds.length >= 4);
-      assert.strictEqual(r.compressed, true, `record ${r.id} compressed after drain`);
-      assert.ok(typeof r.summaryId === 'string', `record ${r.id} linked to its L1`);
+      l1HoldbackChunks: 0,
+    };
+    {
+      const { membrane } = mockMembrane();
+      const manager = await ContextManager.open({ path, strategy: new AutobiographicalStrategy(config), membrane });
+      for (let i = 0; i < 40; i++) manager.addMessage(i % 2 ? 'agent' : 'user', [t(filler(i))]);
+      await drain(manager);
+      assert.ok(l1s(manager).length > 0, 'premise: the first open summarised its chunks');
+      await manager.close();
     }
-    const l1 = l1s(manager);
-    assert.strictEqual(records.length, l1.length, 'one record per L1');
+
+    const fresh = mockMembrane();
+    const manager = await ContextManager.open({ path, strategy: new AutobiographicalStrategy(config), membrane: fresh.membrane });
+    await drain(manager);
+    assert.strictEqual(fresh.calls.length, 0, `a reopen summarised again (${fresh.calls.length} calls)`);
     await manager.close();
   });
 

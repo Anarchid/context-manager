@@ -117,10 +117,12 @@ describe('AutobiographicalStrategy — non-blocking compile + uncompressed-chunk
     const called = new Promise<void>((resolve) => { entered = resolve; });
     let release!: () => void;
     const answer = new Promise<void>((resolve) => { release = resolve; });
+    let answered = false;
     const membrane = {
       complete: async () => {
         entered();
         await answer;
+        answered = true;
         return { stopReason: 'end_turn', content: [{ type: 'text', text: 'A summary.' }], usage: { inputTokens: 500, outputTokens: 100 } };
       },
     };
@@ -145,11 +147,8 @@ describe('AutobiographicalStrategy — non-blocking compile + uncompressed-chunk
     const ticking = manager.tick();
     try {
       await Promise.race([called, ticking.then(() => { throw new Error('premise: the tick asked for no compression'); })]);
-      const started = process.cpuUsage();
       await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
-      const cpu = process.cpuUsage(started);
-      const ms = (cpu.user + cpu.system) / 1000;
-      assert.ok(ms < 500, `compile() should return promptly; it used ${ms} ms of CPU`);
+      assert.equal(answered, false, 'compile() returned while the compression was still unanswered');
     } finally {
       release();
       await ticking;

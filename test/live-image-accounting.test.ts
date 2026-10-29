@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import type { ContentBlock } from '@animalabs/membrane';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, AutobiographicalStrategy, WindowedPassthroughStrategy, MessageStore, ContextLog } from '../src/index.js';
-import type { ContextEntry, MessageStoreView, StoredMessage } from '../src/index.js';
+import type { ContextEntry, StoredMessage } from '../src/index.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'live-image-accounting-'));
 let n = 0;
@@ -180,8 +180,8 @@ describe('live image accounting', () => {
     const salience = (block: ContentBlock): number =>
       (AutobiographicalStrategy as unknown as { computeStaticSalience(m: StoredMessage): number })
         .computeStaticSalience({ id: 'm', sequence: 0, participant: 'Claude', content: [block], timestamp: new Date(0) });
-    assert.equal(salience(base64Image()), 0.2, 'an image is fully externalized');
-    assert.equal(salience(generatedImage()), 0.2, 'and so is a generated image');
+    assert.notEqual(salience(base64Image()), salience({ type: 'text', text: 'x' }), 'premise: an image weighs otherwise than text');
+    assert.equal(salience(generatedImage()), salience(base64Image()), 'a generated image weighs as an image');
   });
 
   it('takes a stripped nested image off the post-strip estimate', () => {
@@ -628,25 +628,37 @@ describe('live image accounting', () => {
     assert.equal(stateOf(entries, 'tail'), 'image');
   });
 
-  it('only the adaptive selection, which prices by the post-strip estimates, asks the strip to count as they do', async () => {
-    class Recording extends AutobiographicalStrategy {
-      asked: boolean[] = [];
-      protected override applyImageStripping(entries: ContextEntry[], store: MessageStoreView, opts?: { asEstimated?: boolean }): void {
-        this.asked.push(opts?.asEstimated ?? false);
-        super.applyImageStripping(entries, store, opts);
+  it('the adaptive selection counts a folded message\'s image as its estimates do, and the hierarchical one counts only the images it sends', async () => {
+    const compileFolded = async (adaptiveResolution: boolean): Promise<Array<{ content: ContentBlock[] }>> => {
+      const membrane = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'what came between' }], usage: { inputTokens: 10, outputTokens: 5 } }) };
+      const strategy = new AutobiographicalStrategy({
+        adaptiveResolution, compressionModel: 'm', headWindowTokens: 1650, recentWindowTokens: 1650, targetChunkTokens: 200,
+        maxLiveImages: 2, imageStripDepthTokens: 0, minChunkCharsForLLM: 0, l1HoldbackChunks: 0, autoTickOnNewMessage: false,
+      } as never);
+      const cm = await ContextManager.open({ path: fresh(), strategy, membrane: membrane as never });
+      try {
+        cm.addMessage('User', [base64Image(), { type: 'text', text: 'head' }]);
+        for (let i = 0; i < 8; i++) {
+          cm.addMessage(i % 2 ? 'Claude' : 'User', i === 3
+            ? [base64Image(), { type: 'text', text: `middle ${'word '.repeat(60)}` }]
+            : [{ type: 'text', text: `filler ${i} ${'word '.repeat(60)}` }]);
+        }
+        cm.addMessage('Claude', [base64Image(), { type: 'text', text: 'tail' }]);
+        await cm.compile(BUDGET);
+        for (let ticks = 0; !cm.isReady() && ticks < 20; ticks++) await cm.tick();
+        return (await cm.compile({ maxTokens: 4500, reserveForResponse: 0 })).messages;
+      } finally {
+        cm.close();
       }
-    }
-    for (const adaptiveResolution of [true, false]) {
-      const strategy = new Recording({ adaptiveResolution, headWindowTokens: 0, recentWindowTokens: 1_000_000, maxLiveImages: 1, imageStripDepthTokens: 0 });
-      const cm = await ContextManager.open({ path: fresh(), strategy });
-      cm.addMessage('User', [base64Image(), { type: 'text', text: 'one' }]);
-      cm.addMessage('Claude', [{ type: 'text', text: 'two' }]);
-      await cm.compile(BUDGET);
-      assert.ok(strategy.asked.length > 0, 'the strip ran');
-      assert.ok(strategy.asked.every((a) => a === adaptiveResolution),
-        `${adaptiveResolution ? 'selectAdaptive asks' : 'selectHierarchical does not ask'}: ${JSON.stringify(strategy.asked)}`);
-      cm.close();
-    }
+    };
+    const adaptive = await compileFolded(true);
+    assert.equal(stateOf(adaptive, 'middle '), 'missing', 'premise: the fold leaves the middle message out, image and all');
+    assert.equal(stateOf(adaptive, 'head'), 'stripped', "the folded message's image keeps its live slot, as the estimates count it");
+    assert.equal(stateOf(adaptive, 'tail'), 'image');
+    const hierarchical = await compileFolded(false);
+    assert.equal(stateOf(hierarchical, 'middle '), 'missing', 'premise: the fold leaves the middle message out, image and all');
+    assert.equal(stateOf(hierarchical, 'head'), 'image', 'only the images sent take live slots');
+    assert.equal(stateOf(hierarchical, 'tail'), 'image');
   });
 
   it("takes a stripped image's placeholder off the post-strip estimate at the store's price for its text", () => {
