@@ -5,14 +5,18 @@
  * fallback emitting a raw tool_result whose tool_use chunk already
  * compressed) sailed through to the wire layer.
  *
- * `enforceToolPairing` is the final structural pass in selectHierarchical:
- * every tool_use must be answered by a matching tool_result in the run of
- * results right after its run of calls, or, where its run ends its entry, in
- * the immediately-following entry; every tool_result must answer a tool_use
- * in the run just before its own, or, where its run starts its entry, in the
- * immediately-preceding entry. That is what the compile's split
- * (splitMixedToolMessages) sends as adjacent messages. Repair prefers
- * preserving pairs (stub tool_result) over dropping content.
+ * `enforceToolPairing` is the final structural pass in selectHierarchical.
+ * It pairs by entry: a tool_use is answered later in its own entry or in the
+ * immediately-following one, and a tool_result answers a tool_use earlier in
+ * its own entry or in the immediately-preceding one; a result that stands
+ * after other blocks of its entry is left for membrane's normalizer to place.
+ * Repair prefers preserving pairs (stub tool_result) over dropping content.
+ * assertPaired holds these cases' repaired entries to the stricter rule the
+ * compile's split (splitMixedToolMessages) sends as adjacent messages: a call
+ * is answered in the run of results right after its run of calls, or, where
+ * its run ends its entry, in the next entry; a result answers a call in the
+ * run just before its own, or, where its run starts its entry, in the
+ * previous entry.
  */
 
 import { describe, it, before, after } from 'node:test';
