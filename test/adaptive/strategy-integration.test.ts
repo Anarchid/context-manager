@@ -98,15 +98,15 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
     // Compile with a very tight budget — picker should fold middle to fit.
     const tight = await manager.compile({ maxTokens: 2000, reserveForResponse: 0 });
     assert.ok(tight.messages.length > 0, 'tight budget should still produce output');
-    // The tight compile should have ≤ entries than generous (or equal if generous already used summaries).
-    // What matters more: total tokens of tight output should be bounded.
-    const tightTokens = tight.messages.reduce((acc, m) => {
+    const tokens = (compiled: typeof tight) => compiled.messages.reduce((acc, m) => {
       const text = m.content
         .filter((b: any) => b.type === 'text')
         .map((b: any) => b.text)
         .join('');
       return acc + Math.ceil(text.length / 4);
     }, 0);
+    const tightTokens = tokens(tight);
+    assert.ok(tightTokens < tokens(generous), `the tight compile folds: ${tightTokens} tokens against ${tokens(generous)}`);
     assert.ok(tightTokens <= 2000, `tight compile tokens ${tightTokens} should fit budget 2000`);
     manager.close();
   });
