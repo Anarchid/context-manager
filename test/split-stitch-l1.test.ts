@@ -603,6 +603,7 @@ describe('split-stitch L1 fallback', () => {
     await all.strategy.run(all.target, managerContext(all.manager));
     assert.equal(all.strategy.details()!.model.actual, 'leaf-model', 'all leaves agree → recorded');
     assert.notEqual(some.strategy.details()!.model.actual, 'leaf-model-1', 'one leaf reported, others did not → not that leaf\'s model');
+    assert.notEqual(some.strategy.details()!.model.actual, 'same-model', 'nor the requested model');
     const none = await build(cumulativeMembrane({ refuseAt: 2 }).membrane, { split: true });
     await none.strategy.run(none.target, managerContext(none.manager));
     assert.notEqual(none.strategy.details()!.model.actual, 'same-model', 'no leaf reported → the requested model isn\'t claimed as the one that answered');

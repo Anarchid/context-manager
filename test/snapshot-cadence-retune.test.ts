@@ -9,7 +9,7 @@
  *
  * Contract pinned here:
  *   - ContextManager.open on a store whose messages state was registered
- *     with the OLD cadence retunes it to the current constants via
+ *     with the OLD cadence retunes it to the current delta cadence via
  *     chronicle's updateStateStrategy (0.3.0+).
  *   - The retune only touches scheduling: message content is unaffected.
  */
@@ -33,21 +33,24 @@ function tmpStore(): { dir: string; store: JsStore } {
 }
 
 describe('snapshot cadence retune', () => {
-  it('an open retunes a message slot registered under another cadence to the current one', async () => {
+  it('an open retunes a message slot registered under another cadence to the current delta cadence', async () => {
     const { store } = tmpStore();
     const current = MessageStore.registrationFor();
+    const delta = current.deltaSnapshotEvery;
     store.registerState({ id: current.id, strategy: 'append_log', deltaSnapshotEvery: 10, fullSnapshotEvery: 10 });
     assert.strictEqual(typeof (store as unknown as { updateStateStrategy?: unknown }).updateStateStrategy, 'function', 'premise: this chronicle can retune a registration');
+    const opsSinceSnapshot = () => store.listStates().find((state) => state.id === current.id)?.opsSinceSnapshot;
     const manager = await ContextManager.open({ store });
-    for (let i = 0; i < 15; i++) manager.addMessage('test', [{ type: 'text', text: `m${i}` }]);
+    for (let i = 0; i < delta - 1; i++) manager.addMessage('test', [{ type: 'text', text: `m${i}` }]);
+    assert.strictEqual(opsSinceSnapshot(), delta - 1, `no snapshot before ${delta} appends`);
+    manager.addMessage('test', [{ type: 'text', text: `m${delta - 1}` }]);
+    assert.strictEqual(opsSinceSnapshot(), 0, `a snapshot at ${delta} appends`);
     manager.close();
-    const slot = store.listStates().find((state) => state.id === current.id);
-    assert.ok((slot?.opsSinceSnapshot ?? 0) >= 10, `no snapshot at 10 appends, as the registered cadence would take: ${JSON.stringify(slot)}`);
-    assert.strictEqual((store.getStateJson(current.id) as unknown as unknown[]).length, 15, 'every message is kept');
+    assert.strictEqual((store.getStateJson(current.id) as unknown as unknown[]).length, delta, 'every message is kept');
     store.close();
   });
 
-  it('register refuses a second registration of the message state rather than replacing it', () => {
+  it('register refuses a second registration of the message state', () => {
     const { store } = tmpStore();
     MessageStore.register(store);
     assert.throws(() => MessageStore.register(store));

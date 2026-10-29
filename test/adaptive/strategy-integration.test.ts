@@ -12,6 +12,11 @@ import { rmSync, existsSync } from 'node:fs';
 
 import { ContextManager, AutobiographicalStrategy } from '../../src/index.js';
 
+async function drain(manager: ContextManager): Promise<void> {
+  for (let ticks = 0; ticks < 200 && !manager.isReady(); ticks++) await manager.tick();
+  assert.ok(manager.isReady(), 'premise: compression settled within 200 ticks');
+}
+
 const TEST_STORE_PATH = './test-adaptive-strategy-store';
 
 function cleanup() {
@@ -107,6 +112,7 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
     }, 0);
     const tightTokens = tokens(tight);
     assert.ok(tightTokens < tokens(generous), `the tight compile folds: ${tightTokens} tokens against ${tokens(generous)}`);
+    assert.ok(tight.messages.some((m) => m.content.some((b: any) => b.type === 'text' && b.text.includes('[mock summary #'))), 'and sends a summary in place of what it folded');
     assert.ok(tightTokens <= 2000, `tight compile tokens ${tightTokens} should fit budget 2000`);
     manager.close();
   });
@@ -129,7 +135,7 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
       const id = manager.addMessage('User', [{ type: 'text', text: `Turn ${i}: SECRET-${i.toString().padStart(2, '0')} ` + 'word '.repeat(40) }]);
       messageIds.push(id);
     }
-    while (!manager.isReady()) await manager.tick();
+    await drain(manager);
 
     // Lock an early message that would otherwise be folded.
     const lockedId = messageIds[3];
@@ -171,9 +177,7 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
     for (let i = 0; i < 12; i++) {
       manager.addMessage('User', [{ type: 'text', text: `T${i}. ` + 'word '.repeat(40) }]);
     }
-    while (!manager.isReady()) {
-      await manager.tick();
-    }
+    await drain(manager);
 
     const summariesByLevel = (): Record<number, number> => {
       const out: Record<number, number> = {};
@@ -213,9 +217,7 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
       `expected handleProducedOps to enqueue an L2 merge; queue went ${queueBefore} → ${queueAfter}`
     );
 
-    while (!manager.isReady()) {
-      await manager.tick();
-    }
+    await drain(manager);
 
     const counts = summariesByLevel();
     assert.ok(counts[2] >= 1, `expected at least one L2 to exist after draining; got ${JSON.stringify(counts)}`);
@@ -239,7 +241,7 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
     for (let i = 0; i < 24; i++) {
       manager.addMessage('User', [{ type: 'text', text: `Turn ${i}. ` + 'word '.repeat(40) }]);
     }
-    while (!manager.isReady()) await manager.tick();
+    await drain(manager);
 
     // First compile under tight budget — picker folds.
     await manager.compile({ maxTokens: 1200, reserveForResponse: 200 });

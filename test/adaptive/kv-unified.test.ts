@@ -516,11 +516,12 @@ test('kv-unified decision DAG is linear and preserves chronological expand edges
 
   assert.equal(dag.nodeCount, 7, '4 leaves + 2 L1s + 1 L2');
   assert.equal(dag.expandEdgeCount, 6, 'one expand edge per ownership-tree edge');
-  const id = (key: string) => key.slice(key.indexOf(':') + 1);
-  assert.deepEqual(dag.roots.map(id), ['L2-0']);
-  const root = dag.nodes.get(dag.roots[0]!)!;
-  assert.deepEqual(root.expandKeys.map(id), ['L1-0', 'L1-1']);
-  assert.deepEqual(dag.nodes.get(root.expandKeys[0]!)?.expandKeys.map(id), ['c-0000', 'c-0001']);
+  const node = (key: string) => dag.nodes.get(key)!;
+  const kindAndId = (key: string) => [node(key).kind, node(key).id];
+  assert.deepEqual(dag.roots.map(kindAndId), [['summary', 'L2-0']]);
+  const root = node(dag.roots[0]!);
+  assert.deepEqual(root.expandKeys.map(kindAndId), [['summary', 'L1-0'], ['summary', 'L1-1']]);
+  assert.deepEqual(node(root.expandKeys[0]!).expandKeys.map(kindAndId), [['leaf', 'c-0000'], ['leaf', 'c-0001']]);
   assert.deepEqual(root.select?.participantLeafIds, [
     'c-0000',
     'c-0001',

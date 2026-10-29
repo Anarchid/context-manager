@@ -642,16 +642,7 @@ test('phase C: a declined group isn\'t tried again when an accept moves a leaf i
   for (const r of runs) assert.ok(r.visits <= 3 * chunks.length, `phase C took ${r.visits} visits over ${r.passes} passes, past ${3 * chunks.length}`);
 });
 
-/**
- * R6-1's other half: where relist puts a chunk back. Its predecessor query,
- * `listedCounts(n).olderThan(i)`, must give the largest listed position below
- * i, or -1 when there's none, as the scan back did. Which
- * group the walk tries first decides which group takes the headroom, so a
- * wrong answer could change a plan, though no sweep we ran found one that
- * does; this test checks the query against the scan over random lists and
- * unlists.
- */
-test('phase C: the walk list\'s predecessor query gives the next older listed position, as scanning back would (R6-1)', () => {
+test('phase C: the walk list\'s predecessor query gives the next older listed position, as scanning back would', () => {
   let seed = 156;
   const random = (m: number): number => { seed = (Math.imul(seed, 1103515245) + 12345) >>> 0; return (seed >>> 8) % m; };
   let checked = 0, none = 0;
