@@ -13,11 +13,12 @@ const words = (n: number) => 'substantive words about real happenings '.repeat(n
 const TOOLS = [{ name: 'fetch', description: 'fetch a thing', inputSchema: { type: 'object' as const } }];
 const FABLE = 'claude-fable-5-1';
 
-function mockMembrane() {
+function mockMembrane(refuse = false) {
   const calls: Array<{ tools: unknown }> = [];
   const membrane = {
     complete: async (request: { tools?: unknown }) => {
       calls.push({ tools: request.tools });
+      if (refuse) return { stopReason: 'refusal', content: [t('I can\'t help with that.')], usage: { input_tokens: 100, output_tokens: 10 } };
       return { stopReason: 'end_turn', content: [t(`[summary ${calls.length}] what happened, briefly`)], usage: { input_tokens: 100, output_tokens: 10 } };
     },
   };
@@ -37,9 +38,9 @@ interface Opened {
   snapshot: () => AutobiographicalProgressSnapshot;
 }
 
-async function open(opts: { model?: string; autoTick?: boolean; keep?: boolean; config?: AutobiographicalOptions; strategy?: (config: AutobiographicalOptions) => AutobiographicalStrategy } = {}): Promise<Opened> {
+async function open(opts: { model?: string; autoTick?: boolean; keep?: boolean; refuse?: boolean; config?: AutobiographicalOptions; strategy?: (config: AutobiographicalOptions) => AutobiographicalStrategy } = {}): Promise<Opened> {
   if (!opts.keep) cleanup();
-  const { membrane, calls } = mockMembrane();
+  const { membrane, calls } = mockMembrane(opts.refuse);
   const config: AutobiographicalOptions = {
     compressionModel: opts.model ?? 'test-compression-model', targetChunkTokens: 80, headWindowTokens: 0, recentWindowTokens: 0,
     hierarchical: true, mergeThreshold: 100, autoTickOnNewMessage: opts.autoTick ?? false, ...opts.config,
@@ -96,9 +97,17 @@ describe('compression that waits on the host\'s tool definitions', () => {
     manager.setToolDefinitions(TOOLS);
     assert.strictEqual(manager.isReady(), false);
     assert.strictEqual(manager.getWaitingWork(), null);
-    await manager.tick();
-    assert.ok(coveredByL1(manager).has(call), 'the earliest waiting chunk, the call\'s, compresses first');
-    await tickUntilReady(manager);
+    const position = new Map(manager.getAllMessages().map((m, i) => [m.id, i]));
+    const firstOfEach: number[] = [];
+    for (let i = 0; i < 200 && !manager.isReady(); i++) {
+      const covered = coveredByL1(manager);
+      await manager.tick();
+      const fresh = [...coveredByL1(manager)].filter((id) => !covered.has(id)).map((id) => position.get(id)!);
+      if (fresh.length > 0) firstOfEach.push(Math.min(...fresh));
+    }
+    assert.strictEqual(firstOfEach[0], position.get(call), 'the earliest waiting chunk, the call\'s, compresses first');
+    assert.strictEqual(firstOfEach.length, before.l1WaitingOnTools);
+    assert.deepStrictEqual(firstOfEach, [...firstOfEach].sort((a, b) => a - b), 'the waiting chunks compress in their order');
     const after = snapshot();
     assert.strictEqual(after.chunksCompressed, before.chunksCompressed + before.l1WaitingOnTools);
     assert.strictEqual(after.l1WaitingOnTools, 0);
@@ -158,8 +167,8 @@ describe('compression that waits on the host\'s tool definitions', () => {
 
     const second = await open({ model: FABLE, config: { mergeThreshold: 2 }, keep: true });
     second.manager.addMessage('user', [t(`one more ${words(8)}`)]);
+    assert.strictEqual(second.manager.isReady(), false, 'a merge no tick has asked about reads as pending');
     await tickUntilReady(second.manager);
-    for (let i = 0; i < 5; i++) await second.manager.tick();
     const waiting = second.snapshot();
     assert.ok(waiting.mergesWaitingOnTools > 0, 'premise: the merge survived the reopen');
     assert.strictEqual(waiting.mergeQueueLength, 0);
@@ -179,9 +188,11 @@ describe('compression that waits on the host\'s tool definitions', () => {
   it('on a Fable-family summarizer with no tools declared, a merge that makes no call is still dropped', async () => {
     const { manager, strategy, calls, snapshot } = await open({ model: FABLE, strategy: (config) => new QueueingStrategy(config) });
     (strategy as QueueingStrategy).queueMergeOf(['L1-gone-a', 'L1-gone-b']);
-    assert.strictEqual(snapshot().mergesWaitingOnTools + snapshot().mergeQueueLength, 1, 'premise: the merge is queued');
-    for (let i = 0; i < 5; i++) await manager.tick();
+    assert.strictEqual(snapshot().mergeQueueLength, 1, 'a merge no tick has asked about counts as queued');
+    assert.strictEqual(manager.isReady(), false);
+    await tickUntilReady(manager);
     assert.strictEqual(snapshot().mergesWaitingOnTools + snapshot().mergeQueueLength, 0, 'the merge with missing sources was dropped');
+    assert.strictEqual(manager.getWaitingWork(), null);
     assert.strictEqual(calls.length, 0);
     await manager.close();
   });
@@ -197,8 +208,7 @@ describe('compression that waits on the host\'s tool definitions', () => {
     await first.manager.close();
 
     const second = await open({ model: FABLE, config, keep: true });
-    await tickUntilReady(second.manager);
-    for (let i = 0; i < 5; i++) await second.manager.tick();
+    assert.strictEqual(await tickUntilReady(second.manager), 1, 'one tick, which the cap leaves to the merge');
     const s = second.snapshot();
     assert.ok(s.mergesWaitingOnTools > 0, 'premise: the merge waits');
     assert.ok(s.l1WaitingOnTools > 0, 'the chunks the cap holds wait behind it');
@@ -224,22 +234,28 @@ describe('compression that waits on the host\'s tool definitions', () => {
     await manager.close();
   });
 
-  async function settles(strategy: AutobiographicalStrategy, drive: () => void): Promise<void> {
+  async function settles(strategy: AutobiographicalStrategy, drive: () => void): Promise<number> {
     let ticks = 0;
+    let inFlight = 0;
     const tick = strategy.tick.bind(strategy);
-    strategy.tick = (ctx) => { ticks++; return tick(ctx); };
+    strategy.tick = (ctx) => {
+      ticks++;
+      inFlight++;
+      return tick(ctx).finally(() => { inFlight--; });
+    };
     drive();
     const turn = () => new Promise((resolve) => setTimeout(resolve, 0));
     let seen = -1;
     let still = 0;
-    for (let i = 0; i < 5000 && still < 20; i++) {
+    for (let i = 0; i < 20_000 && still < 20; i++) {
       await turn();
-      if (ticks === seen) still++;
+      if (inFlight === 0 && ticks === seen) still++;
       else { seen = ticks; still = 0; }
     }
     assert.strictEqual(still, 20, 'the drain settled');
     for (let i = 0; i < 50; i++) await turn();
     assert.strictEqual(ticks, seen, 'no tick after the drain settled');
+    return ticks;
   }
 
   it('an auto-tick drain stops when only waiting chunks are left', async () => {
@@ -264,6 +280,25 @@ describe('compression that waits on the host\'s tool definitions', () => {
     try {
       await settles(second.strategy, () => second.manager.addMessage('user', [t(`one more ${words(8)}`)]));
       assert.ok(second.snapshot().mergesWaitingOnTools > 0, 'premise: the merge waits');
+    } finally {
+      await second.manager.close();
+    }
+  });
+
+  it('an auto-tick drain goes on past a refused merge, retrying it until its attempts run out', async () => {
+    const first = await open({ config: { mergeThreshold: 2 } });
+    first.manager.setToolDefinitions(TOOLS);
+    addPlain(first.manager);
+    for (let i = 0; i < 200 && first.snapshot().l1QueueLength > 0; i++) await first.manager.tick();
+    assert.ok(first.snapshot().mergeQueueLength > 0, 'premise: a merge is queued');
+    await first.manager.close();
+
+    const second = await open({ config: { mergeThreshold: 2, mergeAttemptLimit: 3 }, autoTick: true, keep: true, refuse: true });
+    try {
+      second.manager.setToolDefinitions(TOOLS);
+      await settles(second.strategy, () => second.manager.addMessage('user', [t('ok')]));
+      assert.ok(second.strategy.getMergeQuarantineStatus().count >= 1, 'in one drain, a refused merge was asked again until its attempts ran out');
+      assert.ok(second.calls.length >= 3);
     } finally {
       await second.manager.close();
     }
