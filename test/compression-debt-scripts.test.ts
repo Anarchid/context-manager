@@ -212,6 +212,18 @@ describe('the scripts on a store whose compression quarantine ledger can\'t be r
     assert.match(r.stderr, /not drained \(tick-error\): run the drain again with the same flags, leaving out --clear-merge-quarantine, which goes on from the store as it stands\n/);
   });
 
+  it('the drain stops once only work waiting on the resident\'s tools is left, and says so', async () => {
+    const waiting = join(dir, 'waiting');
+    await storeWithPendingChunks(waiting);
+    const args = [...drainArgs(waiting).filter((a) => !a.startsWith('--max-steps') && !a.startsWith('--model')), '--model=claude-fable-5-1', '--max-steps=200'];
+    const r = run(DRAIN, args);
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    const finish = events(r.stdout).at(-1)!;
+    assert.deepEqual([finish.event, finish.completed, finish.stopped, finish.tickError], ['finish', false, 'waiting-on-tools', undefined], r.stdout);
+    assert.ok(Number(finish.waitingOnTools) > 0, 'premise: chunks wait on the tools');
+    assert.match(r.stderr, /not drained \(waiting-on-tools\): \d+ chunks and merges wait on the resident's tool definitions; run the drain again with --tools-log=<a log of its requests>\n/);
+  });
+
   it('the drain stops before any tick and fails', async () => {
     await storeWithPendingChunks(pending);
     const r = run(DRAIN, drainArgs(pending), UNREADABLE_LEDGER);

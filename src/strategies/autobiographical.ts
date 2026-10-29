@@ -1734,10 +1734,16 @@ export interface AutobiographicalProgressSnapshot {
   totalChunks: number;
   /** Chunks that already have an L1 summary. */
   chunksCompressed: number;
-  /** Chunks queued for L1 compression. */
+  /** Chunks queued for L1 compression, less those waiting on the host's tool definitions. */
   l1QueueLength: number;
-  /** Pending L1→L2 and L2→L3 merges. */
+  /** Queued chunks that wait on the host's tool definitions: a tick takes
+   *  them once it declares them. */
+  l1WaitingOnTools: number;
+  /** Pending L1→L2 and L2→L3 merges, less those waiting on the host's tool definitions. */
   mergeQueueLength: number;
+  /** Pending merges that wait on the host's tool definitions, as
+   *  `l1WaitingOnTools`. */
+  mergesWaitingOnTools: number;
   /** Stored summary counts per level (1 = raw L1, 2 = L1→L2 merge, 3 = L2→L3 merge). */
   summaryCounts: { l1: number; l2: number; l3: number };
   /** True if a compression or merge LLM call is currently in flight. */
@@ -2434,6 +2440,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private mergeFailureRuns = new Map<string, CompressionFailureStreak>();
   /** A chunk whose split-stitch rung waits for its call window, until when (see CompressionSplitWindowWait). */
   private compressionNotBefore = new Map<string, number>();
+  private toolsDeferredChunks = new Set<string>();
+  private toolsDeferredMerge: string | undefined;
 
   /** Branch-scoped projection of the append-only quarantine event ledger. */
   private compressionRefusalQuarantine = new Map<string, ActiveCompressionQuarantine>();
@@ -6192,16 +6200,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * put back only if that rebuild queued it, and a rebuild's withdrawal of
    * it stands.
    */
-  private requeuePendingChunk(key: string, place: 'head' | 'back', superseded: boolean): void {
+  private requeuePendingChunk(key: string, place: 'head' | 'back' | number, superseded: boolean): void {
     if (place === 'back') this.compressionFailureOrder.set(key, ++this.compressionFailureSequence);
     const index = this.chunks.findIndex((chunk) => !chunk.compressed && this.chunkKey(chunk) === key);
     if (index >= 0 && !superseded) {
       const queued = this.compressionQueue.indexOf(index);
-      if (place === 'head') {
+      if (place === 'back') {
+        if (queued === -1) this.compressionQueue.push(index);
+      } else {
         if (queued !== -1) this.compressionQueue.splice(queued, 1);
-        this.compressionQueue.unshift(index);
-      } else if (queued === -1) {
-        this.compressionQueue.push(index);
+        const at = place === 'head' ? 0 : Math.min(place, this.compressionQueue.length);
+        this.compressionQueue.splice(at, 0, index);
       }
     }
     this.orderCompressionQueue();
@@ -7346,25 +7355,60 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     });
   }
 
+  private familyWaitsForTools(tools: readonly unknown[] | undefined): boolean {
+    return !(tools !== undefined && tools.length > 0) && isToolsLessRefusingSummarizer(this.config.compressionModel ?? '');
+  }
+
+  private waitingOnTools(): { chunks: number; merges: number } {
+    const tools = this.hostContext?.tools;
+    if (tools !== undefined && tools.length > 0) return { chunks: 0, merges: 0 };
+    let chunks = 0;
+    for (const index of this.compressionQueue) {
+      const chunk = this.chunks[index];
+      if (chunk !== undefined && !chunk.compressed && this.toolsDeferredChunks.has(this.chunkKey(chunk))) chunks++;
+    }
+    const head = this.mergeQueue[0];
+    const mergesWait = this.config.hierarchical === true && head !== undefined
+      && this.toolsDeferredMerge === mergeFailureKey(head) && this.familyWaitsForTools(tools);
+    if (mergesWait && this.speculativeCapHolds()) {
+      chunks = 0;
+      for (const index of this.compressionQueue) {
+        const chunk = this.chunks[index];
+        if (chunk !== undefined && !chunk.compressed) chunks++;
+      }
+    }
+    return { chunks, merges: mergesWait ? this.mergeQueue.length : 0 };
+  }
+
   checkReadiness(): ReadinessState {
     this.requireLoadedBranch('checkReadiness');
+    const waiting = this.waitingOnTools();
+    const waitingParts: string[] = [];
+    if (waiting.chunks > 0) waitingParts.push(`${waiting.chunks} chunks`);
+    if (waiting.merges > 0) waitingParts.push(`${waiting.merges} merges`);
+    const waitingText = waitingParts.length > 0
+      ? `${waitingParts.join(' + ')} wait on the host's tool definitions`
+      : undefined;
     if (this.pendingCompression) {
       return {
         ready: false,
         pendingWork: this.pendingCompression,
         description: `Compressing chunk ${this.compressionQueue[0] ?? '?'}`,
+        ...(waitingText !== undefined ? { waitingOn: 'tools' as const, waitingDescription: waitingText } : {}),
       };
     }
 
     const needsCompression = this.chunks.some(
       (c) => !c.compressed && this.isChunkOldEnough(c)
     );
-    const needsMerge = this.config.hierarchical && this.mergeQueue.length > 0;
+    const runnableChunks = this.compressionQueue.length - waiting.chunks;
+    const runnableMerges = this.mergeQueue.length - waiting.merges;
+    const needsMerge = this.config.hierarchical && runnableMerges > 0;
 
-    if ((needsCompression && this.compressionQueue.length > 0) || needsMerge) {
+    if ((needsCompression && runnableChunks > 0) || needsMerge) {
       const parts: string[] = [];
-      if (this.compressionQueue.length > 0) parts.push(`${this.compressionQueue.length} chunks`);
-      if (needsMerge) parts.push(`${this.mergeQueue.length} merges`);
+      if (runnableChunks > 0) parts.push(`${runnableChunks} chunks`);
+      if (needsMerge) parts.push(`${runnableMerges} merges`);
       // The pause binds the membrane instance and model of the call that
       // failed. Readiness has no context to name the membrane, so a pause
       // bound to another instance shows until the next tick drops it; one
@@ -7384,9 +7428,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return {
         ready: false,
         description: `${parts.join(' + ')} pending${paused}`,
+        ...(waitingText !== undefined ? { waitingOn: 'tools' as const, waitingDescription: waitingText } : {}),
       };
     }
 
+    if (waitingText !== undefined) return { ready: true, waitingOn: 'tools', waitingDescription: waitingText };
     return { ready: true };
   }
 
@@ -7595,8 +7641,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       candidates.add(this.chunkKey(chunk));
       return true;
     });
+    if ((ctx.tools?.length ?? 0) > 0) {
+      this.toolsDeferredChunks.clear();
+      this.toolsDeferredMerge = undefined;
+    }
     for (const key of candidates) {
       if (this.speculativeCapHolds()) break;
+      if (this.toolsDeferredChunks.has(key)) continue;
       // Resolve against the current queue: a rebuild may renumber chunks or
       // withdraw one (e.g. holdback). Never resurrect withdrawn work or use a
       // stale chunk object. Newly queued source identities wait for next tick.
@@ -7629,6 +7680,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       let quarantineSkipped = false;
       let requestStopped = false;
       let joinedWorkDiscarded = false;
+      let toolsDeferred = false;
       const work: { chunk: Chunk; skipped?: true } = { chunk };
       this.pendingCompressionWork = work;
       const compression = this.compressChunkHierarchical(chunk, ctx, () => {
@@ -7640,6 +7692,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         requestStopped = true;
       }, () => {
         joinedWorkDiscarded = true;
+      }, () => {
+        toolsDeferred = true;
       }).then(async () => {
         // Quarantine checks build compression contexts too. As in the
         // speculative drain, a macrotask hop keeps those builds from starving
@@ -7761,6 +7815,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // ladder, where a rung's answer, fresh or reused, ends its run.
         if (chunk.compressed || requestStopped) this.endChunkFailureRuns(key);
         this.compressionFailureOrder.delete(key);
+        if (toolsDeferred) {
+          const superseded = this.compressionQueueGeneration !== queueGeneration;
+          if (!superseded) this.toolsDeferredChunks.add(key);
+          this.requeuePendingChunk(key, queueIndex, superseded);
+        }
         this.checkMergeThreshold();
       }
       // Attempts, including fresh refusals, still consume the tick. Existing
@@ -7788,8 +7847,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // merges reaching it: the merge prompt replays raw sources. No progress
       // is recorded, so the drain stops; release resumes it.
       if (this.mergeBlockedByHold(merge.sourceIds, ctx.messageStore)) return;
-      this._drainProgress++; // executing a merge is real work, even if a
-      // follow-on merge gets enqueued and the queue length nets out unchanged
       // Whether the merge wrote its parent (see executeMerge): a skipped
       // entry wrote nothing.
       let merged = false;
@@ -7798,7 +7855,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const mergeModel = this.config.compressionModel;
       const mergeMembrane = ctx.membrane;
       this.pendingCompressionWork = { sourceIds: [...merge.sourceIds] };
-      const merging = this.executeMerge(merge.level, merge.sourceIds, ctx).then((wrote) => {
+      let mergeToolsDeferred = false;
+      const merging = this.executeMerge(merge.level, merge.sourceIds, ctx, () => {
+        mergeToolsDeferred = true;
+      }).then((wrote) => {
         merged = wrote;
       });
       this.pendingCompression = merging;
@@ -7809,6 +7869,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // A merge written before the branch switched still landed on its
           // route: the domain's count is the route's.
           if (merged) noteDomainLanding(mergeMembrane, mergeModel);
+          return;
+        }
+        if (mergeToolsDeferred) {
+          if (this.mergeQueue[0] === merge) this.toolsDeferredMerge = mergeFailureKey(merge);
           return;
         }
         // Success, or a skipped entry: drop from head and persist the
@@ -7951,6 +8015,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           this.pendingCompression = null;
           this.pendingCompressionWork = null;
         }
+        if (!mergeToolsDeferred && this.isCompressionBranchCurrent(sourceBranch)) this._drainProgress++;
       }
     }
   }
@@ -7996,11 +8061,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       else if (s.level === 2) l2++;
       else if (s.level === 3) l3++;
     }
+    const waiting = this.waitingOnTools();
     return {
       totalChunks: this.chunks.length,
       chunksCompressed,
-      l1QueueLength: this.compressionQueue.length,
-      mergeQueueLength: this.mergeQueue.length,
+      l1QueueLength: this.compressionQueue.length - waiting.chunks,
+      l1WaitingOnTools: waiting.chunks,
+      mergeQueueLength: this.mergeQueue.length - waiting.merges,
+      mergesWaitingOnTools: waiting.merges,
       summaryCounts: { l1, l2, l3 },
       pending: this.pendingCompression !== null,
     };
@@ -9397,6 +9465,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // doesn't pass it on leaves the chunk to the next rebuild, as a return
     // that made no call does.
     onJoinedWorkDiscarded?: () => void,
+    // The chunk's request needs the host's tool definitions, which it hasn't
+    // declared: no call was made.
+    onToolsDeferred?: () => void,
   ): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('compressChunkHierarchical');
     phaseChannel.report('compress-chunk'); // liveness-watchdog phase
@@ -9541,6 +9612,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // holds the branch now.
       if (!this.isCompressionBranchCurrent(sourceBranch)) return;
       this.checkMergeThreshold();
+      return;
+    }
+
+    // On Fable/Mythos-family summarizers a request without the agent's live
+    // tool definitions is refused whatever it holds: the bare
+    // marker+directive with no conversation at all is input-blocked, while
+    // the identical bytes with the live tool set declared mint cleanly (Linn,
+    // claude-fable-5-1, 2026-09-05; same on claude-fable-5). A pure-chat
+    // seed's first speculative L1 therefore fired ~300ms after boot -- before
+    // the host's first setToolDefinitions -- burned a doomed call and landed
+    // in quarantine. Opus-family summarizers mint tools-less (lena bench), so
+    // the content-independent rule is gated on the model family.
+    if (this.familyWaitsForTools(ctx.tools)) {
+      this.diag.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; Fable/Mythos-family summarizer refuses tools-less requests) — will retry after tools are pushed`);
+      onToolsDeferred?.();
       return;
     }
 
@@ -9954,23 +10040,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // Without the agent's live tool definitions a summarizer request that
     // replays tool-block-bearing history is deterministically refused
     // (reasoning_extraction -- see the `tools` comment below; labclaude
-    // 2026-07-09). On Fable/Mythos-family summarizers the refusal is
-    // content-INDEPENDENT: the bare marker+directive with no conversation
-    // at all is input-blocked, while the identical bytes with the live tool
-    // set declared mint cleanly (Linn, claude-fable-5-1, 2026-09-05; same on
-    // claude-fable-5). A pure-chat seed's first speculative L1 therefore
-    // fired ~300ms after boot -- before the host's first
-    // setToolDefinitions -- burned a doomed call and landed in quarantine.
-    // Tools are pushed by the host on MCPL registration / maintenance
-    // passes and on every activation, so defer rather than burn the call.
-    // Opus-family summarizers mint tools-less (lena bench), and test
-    // harnesses never push tools, so the content-independent rule is gated
-    // on the model family.
-    // compressionWorkQueued's count applies the same test (hasToolBlocks).
-    const chunkHasToolBlocks = cleaned.some((m) => hasToolBlocks(m.content));
-    const toolsLessRefusingFamily = isToolsLessRefusingSummarizer(this.config.compressionModel ?? "");
-    if ((chunkHasToolBlocks || toolsLessRefusingFamily) && !(ctx.tools && ctx.tools.length > 0)) {
-      this.diag.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; ${chunkHasToolBlocks ? 'history contains tool blocks' : 'Fable/Mythos-family summarizer refuses tools-less requests'}) — will retry after tools are pushed`);
+    // 2026-07-09).
+    // Change compressionWorkQueued's count (requestCarriesToolBlocks) with this check.
+    if (cleaned.some((m) => hasToolBlocks(m.content)) && !(ctx.tools && ctx.tools.length > 0)) {
+      this.diag.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; history contains tool blocks) — will retry after tools are pushed`);
+      onToolsDeferred?.();
       return;
     }
 
@@ -10045,9 +10119,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // (labclaude incident, 2026-07-09; 268 refusals). Declaring the same
       // tools the live instance runs with is also strictly MORE faithful to
       // the original context, so it is the KV-honest choice, not a
-      // workaround. Undefined before the first activation of a session --
-      // acceptable: those chunks stay raw and are retried after the agent's
-      // first turn (see the defer guard in compressChunkHierarchical).
+      // workaround.
       tools: ctx.tools,
     };
 
@@ -12146,7 +12218,10 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   protected async executeMerge(
     targetLevel: SummaryLevel,
     sourceIds: string[],
-    ctx: StrategyContext
+    ctx: StrategyContext,
+    // The merge's request needs the host's tool definitions, which it hasn't
+    // declared: no call was made.
+    onToolsDeferred?: () => void,
   ): Promise<boolean> {
     const sourceBranch = this.requireLoadedBranch('executeMerge');
     if (!ctx.membrane) {
@@ -12210,6 +12285,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     const topology = this.mergeTopologyProblem(targetLevel, sources, position);
     if (topology) {
       this.refuseCrossedMerge(targetLevel, sourceIds, topology);
+      return false;
+    }
+
+    if (this.familyWaitsForTools(ctx.tools)) {
+      this.diag.warn(`[autobiographical] deferring L${targetLevel} merge: host has not provided tool definitions yet (ctx.tools empty; Fable/Mythos-family summarizer refuses tools-less requests) — will retry after tools are pushed`);
+      onToolsDeferred?.();
       return false;
     }
 
@@ -12680,9 +12761,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // (labclaude incident, 2026-07-09; 268 refusals). Declaring the same
       // tools the live instance runs with is also strictly MORE faithful to
       // the original context, so it is the KV-honest choice, not a
-      // workaround. Undefined before the first activation of a session --
-      // acceptable: those chunks stay raw and are retried after the agent's
-      // first turn (see the defer guard in compressChunkHierarchical).
+      // workaround.
       tools: ctx.tools,
     };
 
@@ -13021,8 +13100,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * reaches only after that. The merge in flight stays at
    * the head until it lands, and the walk reads it there: a hold placed since
    * ends the walk at it, since tick discards what its call returns and stops
-   * at that head. A queued merge counts even when executeMerge will
-   * drop it as stale without a model call (a source not loaded, already
+   * at that head. On a Fable/Mythos model with no tools declared no merge
+   * counts, since none can be sent; otherwise a queued merge counts even
+   * when executeMerge will drop it as stale without a model call (a source not loaded, already
    * parented or held out of merges, or a group its topology check refuses,
    * which it quarantines),
    * when a source in memory covers such a message: tick drops one such entry
@@ -13213,7 +13293,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // there, since tick discards what its call returns and stops at it.
     const modelled = Boolean(this.config.compressionModel);
     let mergeCounts = false;
-    if (this.config.hierarchical && modelled) {
+    if (this.config.hierarchical && modelled && !this.familyWaitsForTools(this.hostContext?.tools)) {
       for (const merge of this.mergeQueue) {
         if (this.mergeBlockedByHold(merge.sourceIds, store, held)) break;
         if (mergeFolds(merge.sourceIds)) {
@@ -17735,6 +17815,15 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     return out;
   }
 
+  /** Empty the chunk list and its queue for a rebuild: an attempt in flight finds its queue superseded. */
+  protected resetChunks(): void {
+    this.chunks = [];
+    this.compressionQueue = [];
+    this.compressionQueueGeneration++;
+    this.toolsDeferredChunks.clear();
+    this.toolsDeferredMerge = undefined;
+  }
+
   /**
    * Rebuild the chunk list: persisted records own the past; the running-sum
    * chunker only extends at the frontier, and a chunk is only ever created
@@ -17744,9 +17833,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * prefix-generation families found fleet-wide in the 2026-07 audit).
    */
   protected rebuildChunks(store: MessageStoreView): void {
-    this.chunks = [];
-    this.compressionQueue = [];
-    this.compressionQueueGeneration++;
+    this.resetChunks();
 
     // ---- 1. Materialize persisted records (they OWN their messages). ----
     const listing = store.getAll();
@@ -20570,6 +20657,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // they were.
       compressionFailureOrder: new Map(this.compressionFailureOrder),
       compressionNotBefore: new Map(this.compressionNotBefore),
+      toolsDeferredChunks: new Set(this.toolsDeferredChunks),
+      toolsDeferredMerge: this.toolsDeferredMerge,
       mergeFailureOrder: new Map(this.mergeFailureOrder),
       compressionFailureRuns: new Map(this.compressionFailureRuns),
       mergeFailureRuns: new Map(this.mergeFailureRuns),
@@ -20600,6 +20689,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       this.compressionQueueGeneration = saved.compressionQueueGeneration;
       this.compressionFailureOrder = saved.compressionFailureOrder;
       this.compressionNotBefore = saved.compressionNotBefore;
+      this.toolsDeferredChunks = saved.toolsDeferredChunks;
+      this.toolsDeferredMerge = saved.toolsDeferredMerge;
       this.mergeFailureOrder = saved.mergeFailureOrder;
       this.compressionFailureRuns = saved.compressionFailureRuns;
       this.mergeFailureRuns = saved.mergeFailureRuns;
