@@ -2187,8 +2187,9 @@ export interface AutobiographicalConfig {
    * renders raw: a result is replaced once the conversation holds N newer
    * answered calls of its tool, folded ones included, so folding never
    * brings a replaced result back. A result answers the earliest call with
-   * its id, in an earlier message, that no result has answered yet; a
-   * further result for an answered call goes with that call. Calls are
+   * its id before it, in its own message or an earlier one, that no result
+   * has answered yet; a further result for an answered call goes with that
+   * call. Calls are
    * ordered by the message that made them, and calls made in one message by
    * where their results are stored, as the render sends them unless pairing
    * repair moves some. A result is replaced before `maxMessageTokens` cuts its

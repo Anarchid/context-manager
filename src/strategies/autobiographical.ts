@@ -683,10 +683,11 @@ type AnsweredCall = { message: number; place: number; results: Array<{ message: 
 
 /**
  * Each tool's answered calls, as toolPruning counts them. A result answers
- * the earliest call with its id, in an earlier message, that no result has
- * answered yet; a result with no such call goes with the call its id last
- * answered, as a further result; a result with neither answers none. Epoch
- * 4's predicate reads the same calls, so it sees what the count sees.
+ * the earliest call with its id before it, in its own message or an earlier
+ * one, that no result has answered yet; a result with no such call goes with
+ * the call its id last answered, as a further result; a result with neither
+ * answers none. Epoch 4's predicate reads the same calls, so it sees what the
+ * count sees.
  */
 function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, AnsweredCall[]> {
   type Waiting = { toolName: string; call: AnsweredCall };
@@ -698,13 +699,12 @@ function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, Answ
   let place = 0;
   for (let at = 0; at < messages.length; at++) {
     const m = messages[at]!;
-    // A message's calls wait from the next message on: pairing repair
-    // drops a result in its call's own message.
-    const opened: Array<[string, Waiting]> = [];
     for (let i = 0; i < m.content.length; i++, place++) {
       const block = m.content[i]!;
       if (block.type === 'tool_use') {
-        opened.push([block.id, { toolName: block.name, call: { message: at, place: -1, results: [] } }]);
+        let queue = waiting.get(block.id);
+        if (!queue) waiting.set(block.id, (queue = []));
+        queue.push({ toolName: block.name, call: { message: at, place: -1, results: [] } });
       } else if (block.type === 'tool_result') {
         const first = waiting.get(block.toolUseId)?.shift();
         let call: AnsweredCall | undefined;
@@ -720,11 +720,6 @@ function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, Answ
         }
         call?.results.push({ message: m.id, index: i });
       }
-    }
-    for (const [id, entry] of opened) {
-      let queue = waiting.get(id);
-      if (!queue) waiting.set(id, (queue = []));
-      queue.push(entry);
     }
   }
   return byTool;
@@ -2085,6 +2080,22 @@ const TOP_LEVEL_IMAGES = Symbol('top-level images');
 /** Which of its message's image groups a block's images belong to, for the
  *  verdicts postStripEstimates keeps: a tool result's are its call's, and a
  *  message's top-level images are one group. */
+function cycleParts(content: ContentBlock[]): ContentBlock[][] {
+  const parts: ContentBlock[][] = [[]];
+  let called = false;
+  let inResults = false;
+  for (const block of content) {
+    const isResult = block.type === 'tool_result';
+    if (isResult ? called && !inResults : inResults) {
+      parts.push([]);
+      inResults = isResult;
+    }
+    parts[parts.length - 1]!.push(block);
+    if (block.type === 'tool_use') called = true;
+  }
+  return parts.filter((part) => part.length > 0);
+}
+
 function imageGroup(block: ContentBlock): unknown {
   return block.type === 'tool_result' ? block.toolUseId : TOP_LEVEL_IMAGES;
 }
@@ -14870,6 +14881,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *      band, learned nothing from it.
    *   5: generated images (`generated_image`, nested in a tool result too)
    *      priced as an image without a stamp, where they had estimated as 0
+   *   6: a tool result after a tool call in one message's content sent with
+   *      that message (enforceToolPairing), where pairing repair dropped it
+   *      after the plan and the render stats counted it, and sent a stub. A
+   *      store holding one learned a multiplier low enough to make up for
+   *      the results it priced and didn't send
    *
    * A record without a stamp was written by 0.13.0 or earlier: by 0.11.0 to
    * 0.13.0 under epoch 1's pricing, or by a release before 0.11.0, under
@@ -14901,7 +14917,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (reportRealInputTokens); rolling forward again treats that as an older
    * record.
    */
-  static readonly CALIBRATION_PRICING_EPOCH = 5;
+  static readonly CALIBRATION_PRICING_EPOCH = 6;
 
   /**
    * For each pricing epoch, the content it repriced: a predicate over the
@@ -14992,6 +15008,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       for (const image of imagesIn(m.content)) if (image.type === 'generated_image') return true;
       return false;
     }),
+    6: (messages) => messages.some((m) => cycleParts(m.content).length > 1),
   };
 
   /** Whether any epoch in (fromEpoch, CALIBRATION_PRICING_EPOCH] repriced content in this store. */
@@ -19531,6 +19548,13 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *     its use is adjacent; an entry left empty is replaced with a
    *     placeholder text block.
    *
+   * An entry holding a tool cycle of its own (a run of tool_result blocks
+   * after a tool_use in its content) is judged in parts: each such run of
+   * results is a part, and so is what follows it, so a result answers the
+   * calls just before it in its own message, as the compile's split
+   * (splitMixedToolMessages) and membrane's normalizer send them. The parts
+   * fold back into the one entry, with any stub placed between two of them.
+   *
    * Runs as a structural pass over the rendered context in BOTH render
    * paths — `selectHierarchical` (downstream of `selectL1Summaries`, so
    * subclass overrides like KnowledgeStrategy are covered) and
@@ -19538,6 +19562,48 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * already-valid output.
    */
   protected enforceToolPairing(entries: ContextEntry[]): void {
+    const originOf = new Map<ContextEntry, ContextEntry>();
+    const parts = entries.flatMap((entry) => {
+      const cut = cycleParts(entry.content);
+      if (cut.length < 2) return [entry];
+      return cut.map((content) => {
+        const part: ContextEntry = { ...entry, content, relocatedResults: undefined };
+        originOf.set(part, entry);
+        return part;
+      });
+    });
+    if (originOf.size === 0) {
+      this.repairToolPairing(entries);
+      return;
+    }
+    this.repairToolPairing(parts);
+    const original = new Set(entries);
+    const folded: ContextEntry[] = [];
+    for (let i = 0; i < parts.length;) {
+      const origin = originOf.get(parts[i]!);
+      if (!origin) {
+        folded.push(parts[i]!);
+        i++;
+        continue;
+      }
+      let last = i;
+      for (let k = i + 1; k < parts.length; k++) {
+        const of = originOf.get(parts[k]!);
+        if (of === origin) last = k;
+        else if (of !== undefined || original.has(parts[k]!)) break;
+      }
+      const taken = parts.slice(i, last + 1);
+      origin.content = taken.flatMap((part) => part.content);
+      const moved = taken.flatMap((part) => part.relocatedResults ?? []);
+      if (moved.length > 0) origin.relocatedResults = [...(origin.relocatedResults ?? []), ...moved];
+      folded.push(origin);
+      i = last + 1;
+    }
+    entries.splice(0, entries.length, ...folded);
+    for (let i = 0; i < entries.length; i++) entries[i]!.index = i;
+  }
+
+  private repairToolPairing(entries: ContextEntry[]): void {
     let prevUseIds = new Set<string>();
 
     for (let i = 0; i < entries.length; i++) {
@@ -19687,14 +19753,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  - `replaced`: each `tool_result` that `toolResultMaxLastN` replaces, by
    *    its message's id and its place in that message's content, with the
    *    marker its content becomes. The count is of calls. A result answers
-   *    the earliest call with its id, in an earlier message, that no result
-   *    has answered yet, the order pairing repair's look-ahead pairs them in
+   *    the earliest call with its id before it, in its own message or an
+   *    earlier one, that no result has answered yet, the order pairing
+   *    repair's look-ahead pairs them in
    *    where it reaches: a result beyond its reach still answers its call and
    *    keeps the slot, as a folded one does. A result with no such call goes
    *    with the call its id last answered, as a further result, and takes no
-   *    slot. A result with neither, before any call with its id or beside
-   *    only its own message's call, answers none and is left as it is:
-   *    pairing repair drops it. Each
+   *    slot. A result with neither, before any call with its id, answers
+   *    none and is left as it is: pairing repair drops it. Each
    *    tool's answered calls are ordered by their call's message, and calls
    *    made in one message by where the results that answer them are
    *    stored, the order the render sends a batch the repair leaves alone.
