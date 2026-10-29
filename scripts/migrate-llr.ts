@@ -260,6 +260,8 @@ async function main() {
   }
   const compressDuration = Date.now() - startCompress;
   console.log(`Compression complete in ${compressDuration}ms after ${tickCount} ticks.`);
+  const waiting = manager.getWaitingWork();
+  if (waiting) console.log(`Still waiting: ${waiting.description}.`);
   console.log(`LLM calls: ${(membrane as any).callCount ?? 0}`);
 
   const stats = strategy.getStats();

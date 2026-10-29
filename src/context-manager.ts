@@ -1507,9 +1507,9 @@ export class ContextManager {
   // ==========================================================================
 
   /**
-   * Whether the strategy has no background work a tick can advance now (its
-   * `checkReadiness()`). Work waiting on the host, such as for its tool
-   * definitions, doesn't count: getWaitingWork() names it. compile() doesn't
+   * Whether the strategy has no background work pending (its
+   * `checkReadiness()`), other than work that waits on the host, such as for
+   * its tool definitions, which getWaitingWork() names. compile() doesn't
    * wait for that work: it compiles from what's there.
    */
   isReady(): boolean {

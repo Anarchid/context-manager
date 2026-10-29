@@ -1739,12 +1739,12 @@ export interface AutobiographicalProgressSnapshot {
   totalChunks: number;
   /** Chunks that already have an L1 summary. */
   chunksCompressed: number;
-  /** Chunks queued for L1 compression that a tick can take now. */
+  /** Chunks queued for L1 compression, less those waiting on the host's tool definitions. */
   l1QueueLength: number;
-  /** Chunks queued for L1 compression that wait on the host's tool
-   *  definitions: a tick takes them once it declares them. */
+  /** Queued chunks that wait on the host's tool definitions: a tick takes
+   *  them once it declares them. */
   l1WaitingOnTools: number;
-  /** Pending L1→L2 and L2→L3 merges that a tick can take now. */
+  /** Pending L1→L2 and L2→L3 merges, less those waiting on the host's tool definitions. */
   mergeQueueLength: number;
   /** Pending merges that wait on the host's tool definitions, as
    *  `l1WaitingOnTools`. */
@@ -2415,8 +2415,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private mergeFailureRuns = new Map<string, CompressionFailureStreak>();
   /** A chunk whose split-stitch rung waits for its call window, until when (see CompressionSplitWindowWait). */
   private compressionNotBefore = new Map<string, number>();
-  private toolsDeferredChunks = new Set<string>();
-  private toolsDeferredMerges = new Set<string>();
+  protected toolsDeferredChunks = new Set<string>();
 
   /** Branch-scoped projection of the append-only quarantine event ledger. */
   private compressionRefusalQuarantine = new Map<string, ActiveCompressionQuarantine>();
@@ -7341,9 +7340,14 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       const chunk = this.chunks[index];
       if (chunk !== undefined && !chunk.compressed && this.toolsDeferredChunks.has(this.chunkKey(chunk))) chunks++;
     }
-    const head = this.mergeQueue[0];
-    const mergesWait = this.config.hierarchical === true && head !== undefined
-      && this.toolsDeferredMerges.has(mergeFailureKey(head)) && this.familyWaitsForTools(tools);
+    const mergesWait = this.config.hierarchical === true && this.mergeQueue.length > 0 && this.familyWaitsForTools(tools);
+    if (mergesWait && this.speculativeCapHolds()) {
+      chunks = 0;
+      for (const index of this.compressionQueue) {
+        const chunk = this.chunks[index];
+        if (chunk !== undefined && !chunk.compressed) chunks++;
+      }
+    }
     return { chunks, merges: mergesWait ? this.mergeQueue.length : 0 };
   }
 
@@ -7608,10 +7612,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       candidates.add(this.chunkKey(chunk));
       return true;
     });
-    if ((ctx.tools?.length ?? 0) > 0) {
-      this.toolsDeferredChunks.clear();
-      this.toolsDeferredMerges.clear();
-    }
+    if ((ctx.tools?.length ?? 0) > 0) this.toolsDeferredChunks.clear();
     for (const key of candidates) {
       if (this.speculativeCapHolds()) break;
       if (this.toolsDeferredChunks.has(key)) continue;
@@ -7786,7 +7787,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       }
       if (toolsDeferred && this.compressionQueueGeneration === queueGeneration) {
         this.toolsDeferredChunks.add(key);
-        this.requeuePendingChunk(key, 'head', false);
+        if (!this.compressionQueue.includes(chunkIndex)) this.compressionQueue.splice(Math.min(queueIndex, this.compressionQueue.length), 0, chunkIndex);
       }
       // Attempts, including fresh refusals, still consume the tick. Existing
       // overrides that omit the optional notification keep that behavior.
@@ -7813,13 +7814,6 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // merges reaching it: the merge prompt replays raw sources. No progress
       // is recorded, so the drain stops; release resumes it.
       if (this.mergeBlockedByHold(merge.sourceIds, ctx.messageStore)) return;
-      const mergeKey = mergeFailureKey(merge);
-      if (this.toolsDeferredMerges.has(mergeKey)) {
-        if (this.familyWaitsForTools(ctx.tools)) return;
-        this.toolsDeferredMerges.delete(mergeKey);
-      }
-      this._drainProgress++; // executing a merge is real work, even if a
-      // follow-on merge gets enqueued and the queue length nets out unchanged
       // Whether the merge wrote its parent (see executeMerge): a skipped
       // entry wrote nothing.
       let merged = false;
@@ -7838,16 +7832,17 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
       try {
         await merging;
+        // Executing a merge is real work, even if a follow-on merge gets
+        // enqueued and the queue length nets out unchanged; a merge that waits
+        // on the host's tools did none, so the drain stops there.
+        if (!mergeToolsDeferred) this._drainProgress++;
         if (!this.isCompressionBranchCurrent(sourceBranch)) {
           // A merge written before the branch switched still landed on its
           // route: the domain's count is the route's.
           if (merged) noteDomainLanding(mergeMembrane, mergeModel);
           return;
         }
-        if (mergeToolsDeferred) {
-          if (this.mergeQueue[0] === merge) this.toolsDeferredMerges.add(mergeKey);
-          return;
-        }
+        if (mergeToolsDeferred) return;
         // Success, or a skipped entry: drop from head and persist the
         // shorter queue, if the head is still our merge. executeMerge drops
         // the head itself when it refuses a crossed merge or skips an entry
@@ -9438,8 +9433,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // that made no call does.
     onJoinedWorkDiscarded?: () => void,
     // The chunk's request needs the host's tool definitions, which it hasn't
-    // declared: no call was made. tick keeps the chunk queued, waiting on the
-    // tools, until the host declares them or a rebuild judges it again.
+    // declared: no call was made.
     onToolsDeferred?: () => void,
   ): Promise<void> {
     const sourceBranch = this.requireLoadedBranch('compressChunkHierarchical');
@@ -10015,9 +10009,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // passes and on every activation, so defer rather than burn the call.
     // Opus-family summarizers mint tools-less (lena bench), and test
     // harnesses never push tools, so the content-independent rule is gated
-    // on the model family, and applied before the request is built
-    // (familyWaitsForTools, above).
-    // compressionWorkQueued's count applies the same test (hasToolBlocks).
+    // on the model family, and applied before the request is built.
+    // compressionWorkQueued's count applies the same tests.
     if (cleaned.some((m) => hasToolBlocks(m.content)) && !(ctx.tools && ctx.tools.length > 0)) {
       this.diag.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; history contains tool blocks) — will retry after tools are pushed`);
       onToolsDeferred?.();
@@ -10096,8 +10089,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // tools the live instance runs with is also strictly MORE faithful to
       // the original context, so it is the KV-honest choice, not a
       // workaround. Undefined until the host first declares them --
-      // acceptable: work whose request needs them waits, queued, until it
-      // does (the defer guard in compressChunkHierarchical, familyWaitsForTools).
+      // acceptable: a request that needs them waits until it does (the defer
+      // guard above).
       tools: ctx.tools,
     };
 
@@ -12198,8 +12191,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     sourceIds: string[],
     ctx: StrategyContext,
     // The merge's request needs the host's tool definitions, which it hasn't
-    // declared: no call was made, and the merge stays at the head of the
-    // queue, waiting on the tools, until the host declares them.
+    // declared: no call was made.
     onToolsDeferred?: () => void,
   ): Promise<boolean> {
     const sourceBranch = this.requireLoadedBranch('executeMerge');
@@ -12740,9 +12732,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // (labclaude incident, 2026-07-09; 268 refusals). Declaring the same
       // tools the live instance runs with is also strictly MORE faithful to
       // the original context, so it is the KV-honest choice, not a
-      // workaround. Undefined until the host first declares them --
-      // acceptable: work whose request needs them waits, queued, until it
-      // does (the defer guard in compressChunkHierarchical, familyWaitsForTools).
+      // workaround. Undefined until the host first declares them: a merge on
+      // a Fable/Mythos-family summarizer waits for them, and any other goes
+      // without them.
       tools: ctx.tools,
     };
 
@@ -13270,10 +13262,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // one a hold blocks, reading the hold set the count read above; a stale
     // merge counts until tick has dropped it, if it folds something now. A
     // merge in flight is still the head: a hold placed since ends the walk
-    // there, since tick discards what its call returns and stops at it.
+    // there, since tick discards what its call returns and stops at it. On a
+    // Fable/Mythos model with no tools declared no merge counts, since tick
+    // leaves every one waiting on the host's tools (familyWaitsForTools).
     const modelled = Boolean(this.config.compressionModel);
     let mergeCounts = false;
-    if (this.config.hierarchical && modelled) {
+    if (this.config.hierarchical && modelled && !this.familyWaitsForTools(this.hostContext?.tools)) {
       for (const merge of this.mergeQueue) {
         if (this.mergeBlockedByHold(merge.sourceIds, store, held)) break;
         if (mergeFolds(merge.sourceIds)) {

@@ -101,6 +101,7 @@ export class KnowledgeStrategy extends AutobiographicalStrategy {
 
     this.chunks = [];
     this.compressionQueue = [];
+    this.toolsDeferredChunks.clear();
 
     let currentChunk: StoredMessage[] = [];
     let currentTokens = 0;

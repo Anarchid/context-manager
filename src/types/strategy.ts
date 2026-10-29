@@ -138,10 +138,10 @@ export interface StrategyContext {
  * Result of readiness check.
  */
 export interface ReadinessState {
-  /** Whether the strategy has no background work a tick can advance now.
-   *  Work that waits on something only the host can give, such as its tool
-   *  definitions, doesn't count: `waitingOn` names it. compile() doesn't
-   *  wait for either: it compiles from what's there. */
+  /** Whether the strategy has no background work pending, other than work
+   *  that waits on something only the host can give, such as its tool
+   *  definitions: `waitingOn` names that. compile() doesn't wait for either:
+   *  it compiles from what's there. */
   ready: boolean;
   /** Promise that resolves when ready (if not ready) */
   pendingWork?: Promise<void>;
@@ -269,9 +269,8 @@ export interface ContextStrategy {
   onCompressionHoldsReleased?(ctx: StrategyContext): void;
 
   /**
-   * Whether the strategy has background work a tick can advance now, with
-   * its info if so, and what waits on the host. compile() doesn't wait for
-   * it.
+   * Whether the strategy has background work pending, with its info if so,
+   * and what waits on the host. compile() doesn't wait for it.
    */
   checkReadiness(): ReadinessState;
 
