@@ -10016,6 +10016,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // replays tool-block-bearing history is deterministically refused
     // (reasoning_extraction -- see the `tools` comment below; labclaude
     // 2026-07-09).
+    // Change compressionWorkQueued's count (requestCarriesToolBlocks) with this check.
     if (cleaned.some((m) => hasToolBlocks(m.content)) && !(ctx.tools && ctx.tools.length > 0)) {
       this.diag.warn(`[autobiographical] deferring chunk compression: host has not provided tool definitions yet (ctx.tools empty; history contains tool blocks) — will retry after tools are pushed`);
       onToolsDeferred?.();
