@@ -683,10 +683,11 @@ type AnsweredCall = { message: number; place: number; results: Array<{ message: 
 
 /**
  * Each tool's answered calls, as toolPruning counts them. A result answers
- * the earliest call with its id, in an earlier message, that no result has
- * answered yet; a result with no such call goes with the call its id last
- * answered, as a further result; a result with neither answers none. Epoch
- * 4's predicate reads the same calls, so it sees what the count sees.
+ * the earliest call with its id before it, in its own message or an earlier
+ * one, that no result has answered yet; a result with no such call goes with
+ * the call its id last answered, as a further result; a result with neither
+ * answers none. Epoch 4's predicate reads the same calls, so it sees what the
+ * count sees.
  */
 function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, AnsweredCall[]> {
   type Waiting = { toolName: string; call: AnsweredCall };
@@ -698,13 +699,12 @@ function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, Answ
   let place = 0;
   for (let at = 0; at < messages.length; at++) {
     const m = messages[at]!;
-    // A message's calls wait from the next message on: pairing repair
-    // drops a result in its call's own message.
-    const opened: Array<[string, Waiting]> = [];
     for (let i = 0; i < m.content.length; i++, place++) {
       const block = m.content[i]!;
       if (block.type === 'tool_use') {
-        opened.push([block.id, { toolName: block.name, call: { message: at, place: -1, results: [] } }]);
+        let queue = waiting.get(block.id);
+        if (!queue) waiting.set(block.id, (queue = []));
+        queue.push({ toolName: block.name, call: { message: at, place: -1, results: [] } });
       } else if (block.type === 'tool_result') {
         const first = waiting.get(block.toolUseId)?.shift();
         let call: AnsweredCall | undefined;
@@ -720,11 +720,6 @@ function answeredToolCalls(messages: readonly StoredMessage[]): Map<string, Answ
         }
         call?.results.push({ message: m.id, index: i });
       }
-    }
-    for (const [id, entry] of opened) {
-      let queue = waiting.get(id);
-      if (!queue) waiting.set(id, (queue = []));
-      queue.push(entry);
     }
   }
   return byTool;
@@ -2079,6 +2074,36 @@ function sentForm(block: ContentBlock): ContentBlock {
     return { type: block.type, rawItem: item } as unknown as ContentBlock;
   }
   return withoutRawForms(block);
+}
+
+/** A message's content in parts around each tool cycle of its own: a run
+ *  of tool_result blocks, one of which answers a tool_use earlier in the same
+ *  content that no result there has answered yet, is a part, and so is what
+ *  follows it. A cut never splits a run
+ *  of results or a run of other blocks, and the blocks that share a raw
+ *  replay form (raw-forms.ts) sit in one such run, so a form stays within one
+ *  part. */
+function cycleParts(content: ContentBlock[]): ContentBlock[][] {
+  const runs: ContentBlock[][] = [];
+  for (const block of content) {
+    const run = runs[runs.length - 1];
+    if (run && (run[0]!.type === 'tool_result') === (block.type === 'tool_result')) run.push(block);
+    else runs.push([block]);
+  }
+  const parts: ContentBlock[][] = [];
+  const waiting = new Set<string>();
+  let afterCycle = false;
+  for (const run of runs) {
+    const cycle = run.some((block) => block.type === 'tool_result' && waiting.has(block.toolUseId));
+    if (parts.length === 0 || cycle || afterCycle) parts.push([...run]);
+    else parts[parts.length - 1]!.push(...run);
+    afterCycle = cycle;
+    for (const block of run) {
+      if (block.type === 'tool_use') waiting.add(block.id);
+      else if (block.type === 'tool_result') waiting.delete(block.toolUseId);
+    }
+  }
+  return parts;
 }
 
 const TOP_LEVEL_IMAGES = Symbol('top-level images');
@@ -14870,6 +14895,11 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *      band, learned nothing from it.
    *   5: generated images (`generated_image`, nested in a tool result too)
    *      priced as an image without a stamp, where they had estimated as 0
+   *   6: a tool result answering a tool call before it in one message's
+   *      content sent with that message (enforceToolPairing), where pairing
+   *      repair dropped it after the plan and the render stats counted it,
+   *      and sent a stub. A store holding one learned a multiplier low
+   *      enough to make up for the results it priced and didn't send
    *
    * A record without a stamp was written by 0.13.0 or earlier: by 0.11.0 to
    * 0.13.0 under epoch 1's pricing, or by a release before 0.11.0, under
@@ -14901,7 +14931,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * (reportRealInputTokens); rolling forward again treats that as an older
    * record.
    */
-  static readonly CALIBRATION_PRICING_EPOCH = 5;
+  static readonly CALIBRATION_PRICING_EPOCH = 6;
 
   /**
    * For each pricing epoch, the content it repriced: a predicate over the
@@ -14992,6 +15022,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       for (const image of imagesIn(m.content)) if (image.type === 'generated_image') return true;
       return false;
     }),
+    6: (messages) => messages.some((m) => cycleParts(m.content).length > 1),
   };
 
   /** Whether any epoch in (fromEpoch, CALIBRATION_PRICING_EPOCH] repriced content in this store. */
@@ -19531,6 +19562,12 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *     its use is adjacent; an entry left empty is replaced with a
    *     placeholder text block.
    *
+   * An entry holding a tool cycle of its own is judged in parts
+   * (cycleParts), and its parts fold back into the one entry, with any entry
+   * the repair placed between two of them in its place; a part the repair
+   * empties adds nothing, where an entry it empties gets the placeholder. The
+   * look-ahead counts an entry's parts as one entry.
+   *
    * Runs as a structural pass over the rendered context in BOTH render
    * paths — `selectHierarchical` (downstream of `selectL1Summaries`, so
    * subclass overrides like KnowledgeStrategy are covered) and
@@ -19538,6 +19575,47 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * already-valid output.
    */
   protected enforceToolPairing(entries: ContextEntry[]): void {
+    const originOf = new Map<ContextEntry, ContextEntry>();
+    const parts = entries.flatMap((entry) => {
+      const cut = cycleParts(entry.content);
+      if (cut.length < 2) return [entry];
+      return cut.map((content) => {
+        const part: ContextEntry = { ...entry, content, relocatedResults: undefined };
+        originOf.set(part, entry);
+        return part;
+      });
+    });
+    if (originOf.size === 0) {
+      this.repairToolPairing(entries);
+      return;
+    }
+    this.repairToolPairing(parts, (entry) => originOf.get(entry) ?? entry);
+    const lastPart = new Map<ContextEntry, number>();
+    parts.forEach((part, i) => {
+      const origin = originOf.get(part);
+      if (origin) lastPart.set(origin, i);
+    });
+    const folded: ContextEntry[] = [];
+    let open: { origin: ContextEntry; last: number } | undefined;
+    parts.forEach((part, i) => {
+      const origin = originOf.get(part);
+      if (origin && origin !== open?.origin) {
+        open = { origin, last: lastPart.get(origin)! };
+        origin.content = [];
+        folded.push(origin);
+      }
+      if (!open || i > open.last) {
+        folded.push(part);
+        return;
+      }
+      open.origin.content.push(...part.content);
+      if (part.relocatedResults?.length) open.origin.relocatedResults = [...(open.origin.relocatedResults ?? []), ...part.relocatedResults];
+    });
+    entries.splice(0, entries.length, ...folded);
+    for (let i = 0; i < entries.length; i++) entries[i]!.index = i;
+  }
+
+  private repairToolPairing(entries: ContextEntry[], unitOf: (entry: ContextEntry) => ContextEntry = (entry) => entry): void {
     let prevUseIds = new Set<string>();
 
     for (let i = 0; i < entries.length; i++) {
@@ -19556,7 +19634,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (filtered.length !== entry.content.length) {
           entry.content = filtered.length > 0
             ? releaseEditedRawForms(entry.content, filtered)
-            : [{ type: 'text', text: '[tool call omitted]' }];
+            : unitOf(entry) !== entry ? [] : [{ type: 'text', text: '[tool call omitted]' }];
         }
       }
 
@@ -19575,7 +19653,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
           // Rule A when we reach it). Move the real block up into position and
           // only stub the ids for which no real result exists — so tool output
           // is preserved, not silently replaced by a placeholder.
-          const results = this.relocateOrDropMissingResults(entries, i, missing);
+          const results = this.relocateOrDropMissingResults(entries, i, missing, unitOf);
           if (answered.size > 0) {
             // This entry already carries results for the cycle — prepend the
             // relocated/stub results so all results for the preceding tool_use
@@ -19634,8 +19712,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    *   - if the genuine result exists within a short look-ahead window after
    *     `afterIndex`, MOVE it up into position (removing it from its source
-   *     entry — replacing a now-empty entry with a placeholder) so the real
-   *     tool output survives the repair;
+   *     entry — replacing a now-empty entry with a placeholder, and leaving a
+   *     now-empty part of a cut message empty) so the real tool output
+   *     survives the repair;
    *   - otherwise emit a stub.
    *
    * tool_use ids are unique, so the single result carrying a given id is
@@ -19648,9 +19727,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     entries: ContextEntry[],
     afterIndex: number,
     missing: string[],
+    unitOf: (entry: ContextEntry) => ContextEntry,
   ): ContentBlock[] {
     const LOOKAHEAD = 6;
-    const end = Math.min(entries.length, afterIndex + 1 + LOOKAHEAD);
+    let end = afterIndex + 1;
+    for (let units = 0, unit = unitOf(entries[afterIndex]!); end < entries.length; end++) {
+      const next = unitOf(entries[end]!);
+      if (next === unit) continue;
+      if (++units > LOOKAHEAD) break;
+      unit = next;
+    }
     return missing.map(id => {
       for (let j = afterIndex + 1; j < end; j++) {
         const src = entries[j];
@@ -19666,7 +19752,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // they're apart; each gives it up (see raw-forms.ts).
         src.content = rest.length > 0
           ? releaseEditedRawForms(source, rest)
-          : [{ type: 'text', text: '[tool result moved during context repair]' }];
+          : unitOf(src) !== src ? [] : [{ type: 'text', text: '[tool result moved during context repair]' }];
         // The result still reaches the request, next to its tool_use:
         // provenance credits the source body with it there.
         (src.relocatedResults ??= []).push(id);
@@ -19687,24 +19773,23 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *  - `replaced`: each `tool_result` that `toolResultMaxLastN` replaces, by
    *    its message's id and its place in that message's content, with the
    *    marker its content becomes. The count is of calls. A result answers
-   *    the earliest call with its id, in an earlier message, that no result
-   *    has answered yet, the order pairing repair's look-ahead pairs them in
-   *    where it reaches: a result beyond its reach still answers its call and
-   *    keeps the slot, as a folded one does. A result with no such call goes
-   *    with the call its id last answered, as a further result, and takes no
-   *    slot. A result with neither, before any call with its id or beside
-   *    only its own message's call, answers none and is left as it is:
-   *    pairing repair drops it. Each
-   *    tool's answered calls are ordered by their call's message, and calls
-   *    made in one message by where the results that answer them are
-   *    stored, the order the render sends a batch the repair leaves alone.
-   *    All but the last N have every result replaced, whether they render
-   *    raw, folded or not at all: no selection brings a replaced result
-   *    back. Where the repair moves a batch's results (part of a batch
-   *    whose results are split across messages, or all of one when a recall
-   *    pair or pin comes between the calls and their results), it sends the
-   *    moved results first, in call order, so the render's order can differ,
-   *    while still sending at most N whole.
+   *    the earliest call with its id before it, in its own message or an
+   *    earlier one, that no result has answered yet, the order pairing
+   *    repair's look-ahead pairs them in where it reaches: a result beyond
+   *    its reach still answers its call and keeps the slot, as a folded one
+   *    does. A result with no such call goes with the call its id last
+   *    answered, as a further result, and takes no slot. A result with
+   *    neither, before any call with its id, answers none and is left as it
+   *    is: pairing repair drops it. Each tool's answered calls are ordered by
+   *    their call's message, and calls made in one message by where the
+   *    results that answer them are stored, the order the render sends a
+   *    batch the repair leaves alone. All but the last N have every result
+   *    replaced, whether they render raw, folded or not at all: no selection
+   *    brings a replaced result back. Where the repair moves a batch's
+   *    results (part of a batch whose results are split across messages, or
+   *    all of one when a recall pair or pin comes between the calls and their
+   *    results), it sends the moved results first, in call order, so the
+   *    render's order can differ, while still sending at most N whole.
    *  - `inputCap`: `toolUseInputMaxTokens`. A `tool_use` input over it is
    *    truncated by its own size alone (see prunedForSend).
    * Memoized per listing and per the two settings, a map of limits by its
