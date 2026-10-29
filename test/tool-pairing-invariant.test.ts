@@ -27,28 +27,28 @@ import type { MessageStoreView } from '../src/types/index.js';
 
 function assertPaired(entries: ContextEntry[]): void {
   for (let i = 0; i < entries.length; i++) {
-    for (const block of entries[i].content) {
+    entries[i].content.forEach((block, k) => {
       if (block.type === 'tool_use') {
         const id = (block as { id: string }).id;
-        const next = entries[i + 1];
+        const answers = [...entries[i].content.slice(k + 1), ...(entries[i + 1]?.content ?? [])];
         assert.ok(
-          next?.content.some(
+          answers.some(
             (b) => b.type === 'tool_result' && (b as { toolUseId: string }).toolUseId === id,
           ),
-          `entries[${i}]: tool_use ${id} not answered in entries[${i + 1}]`,
+          `entries[${i}]: tool_use ${id} not answered later in entries[${i}] or in entries[${i + 1}]`,
         );
       }
       if (block.type === 'tool_result') {
         const tid = (block as { toolUseId: string }).toolUseId;
-        const prev = entries[i - 1];
+        const calls = [...(entries[i - 1]?.content ?? []), ...entries[i].content.slice(0, k)];
         assert.ok(
-          prev?.content.some(
+          calls.some(
             (b) => b.type === 'tool_use' && (b as { id: string }).id === tid,
           ),
-          `entries[${i}]: tool_result ${tid} has no tool_use in entries[${i - 1}]`,
+          `entries[${i}]: tool_result ${tid} has no tool_use in entries[${i - 1}] or earlier in entries[${i}]`,
         );
       }
-    }
+    });
   }
 }
 

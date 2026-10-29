@@ -163,22 +163,28 @@ for (const select of Object.keys(selects) as Array<keyof typeof selects>) {
         ['User', [result('look-2')]],
         ['Claude', [text('Both say hello.')]],
       ]);
-      assert.ok(compiled.messages.some((m) => m.participant === 'User' && m.content.length === 1 && m.content[0]!.type === 'tool_result' && m.content[0]!.toolUseId === 'look-2'), JSON.stringify(compiled.messages));
+      const answer = compiled.messages.find((m) => m.participant === 'User' && m.content.some((b) => b.type === 'tool_result' && b.toolUseId === 'look-2'));
+      assert.deepEqual(answer?.content, [result('look-2')], JSON.stringify(compiled.messages));
       const { sent, repairs } = sentByMembrane(compiled);
       assert.ok(!sent.includes('[tool result moved during context repair]') && !sent.includes('[tool call omitted]'), sent);
       assert.deepEqual(repairs, []);
     });
 
     it('a further result for a call its message already answered leaves no placeholder in the message', async () => {
-      const { compiled } = await compileOf(select, [
-        ['User', [text('Please look at the file.')]],
-        ['Claude', [text('Let me look.'), call('look-1'), result('look-1'), text('It says hello.'), result('look-1')]],
-        ['User', [text('Thanks.')]],
-      ]);
-      const { sent, repairs } = sentByMembrane(compiled);
-      assert.ok(sent.includes(said('look-1')), sent);
-      assert.ok(!sent.includes('[tool call omitted]'), sent);
-      assert.deepEqual(repairs, []);
+      for (const content of [
+        [text('Let me look.'), call('look-1'), result('look-1'), text('It says hello.'), result('look-1')],
+        [text('Let me look.'), call('look-1'), call('look-2'), result('look-1'), text('Again.'), result('look-2'), result('look-2')],
+      ]) {
+        const { compiled } = await compileOf(select, [
+          ['User', [text('Please look at the files.')]],
+          ['Claude', content],
+          ['User', [text('Thanks.')]],
+        ]);
+        const { sent, repairs } = sentByMembrane(compiled);
+        for (const id of content.flatMap((b) => (b.type === 'tool_use' ? [b.id] : []))) assert.ok(sent.includes(said(id)), sent);
+        assert.ok(!sent.includes('[tool call omitted]') && !sent.includes('[tool result moved during context repair]'), sent);
+        assert.deepEqual(repairs, []);
+      }
     });
 
     it("under toolResultMaxLastN: 0, a message's own result is replaced with the tool's marker", async () => {

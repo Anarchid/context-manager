@@ -18,9 +18,9 @@
   reported it incomplete, missing `content`.
 - `toolResultMaxLastN` counts such a result as answering its call: a result
   answers the earliest call with its id before it, in its own message or an
-  earlier one. It answered none before, so it was never replaced, and in a
-  store holding one, an older result of the same tool that was sent whole can
-  now get its marker.
+  earlier one, that no result has answered yet. It answered none before, so it
+  was never replaced, and in a store holding one, an older result of the same
+  tool that was sent whole can now get its marker.
 - The calibration's pricing epoch is 6, after the generated images' 5. The
   plan and the render stats priced such a message with its results while the
   request carried stubs, so a store holding one learned a multiplier low

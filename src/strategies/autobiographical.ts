@@ -19712,8 +19712,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    *   - if the genuine result exists within a short look-ahead window after
    *     `afterIndex`, MOVE it up into position (removing it from its source
-   *     entry — replacing a now-empty entry with a placeholder) so the real
-   *     tool output survives the repair;
+   *     entry — replacing a now-empty entry with a placeholder, and leaving a
+   *     now-empty part of a cut message empty) so the real tool output
+   *     survives the repair;
    *   - otherwise emit a stub.
    *
    * tool_use ids are unique, so the single result carrying a given id is
@@ -19774,22 +19775,21 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *    marker its content becomes. The count is of calls. A result answers
    *    the earliest call with its id before it, in its own message or an
    *    earlier one, that no result has answered yet, the order pairing
-   *    repair's look-ahead pairs them in
-   *    where it reaches: a result beyond its reach still answers its call and
-   *    keeps the slot, as a folded one does. A result with no such call goes
-   *    with the call its id last answered, as a further result, and takes no
-   *    slot. A result with neither, before any call with its id, answers
-   *    none and is left as it is: pairing repair drops it. Each
-   *    tool's answered calls are ordered by their call's message, and calls
-   *    made in one message by where the results that answer them are
-   *    stored, the order the render sends a batch the repair leaves alone.
-   *    All but the last N have every result replaced, whether they render
-   *    raw, folded or not at all: no selection brings a replaced result
-   *    back. Where the repair moves a batch's results (part of a batch
-   *    whose results are split across messages, or all of one when a recall
-   *    pair or pin comes between the calls and their results), it sends the
-   *    moved results first, in call order, so the render's order can differ,
-   *    while still sending at most N whole.
+   *    repair's look-ahead pairs them in where it reaches: a result beyond
+   *    its reach still answers its call and keeps the slot, as a folded one
+   *    does. A result with no such call goes with the call its id last
+   *    answered, as a further result, and takes no slot. A result with
+   *    neither, before any call with its id, answers none and is left as it
+   *    is: pairing repair drops it. Each tool's answered calls are ordered by
+   *    their call's message, and calls made in one message by where the
+   *    results that answer them are stored, the order the render sends a
+   *    batch the repair leaves alone. All but the last N have every result
+   *    replaced, whether they render raw, folded or not at all: no selection
+   *    brings a replaced result back. Where the repair moves a batch's
+   *    results (part of a batch whose results are split across messages, or
+   *    all of one when a recall pair or pin comes between the calls and their
+   *    results), it sends the moved results first, in call order, so the
+   *    render's order can differ, while still sending at most N whole.
    *  - `inputCap`: `toolUseInputMaxTokens`. A `tool_use` input over it is
    *    truncated by its own size alone (see prunedForSend).
    * Memoized per listing and per the two settings, a map of limits by its
