@@ -23,6 +23,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { MessageStore } from '../src/message-store.js';
+import { ContextManager } from '../src/context-manager.js';
 
 function tmpStore(): { dir: string; store: JsStore } {
   // openOrCreate treats an existing directory as "open" (and then requires
@@ -34,57 +35,23 @@ function tmpStore(): { dir: string; store: JsStore } {
 }
 
 describe('snapshot cadence retune', () => {
-  it('retunes an existing old-cadence registration to current constants', () => {
+  it('an open retunes a message slot registered under another cadence to the current one', async () => {
     const { store } = tmpStore();
-
-    // Simulate an existing store: registered under the OLD cadence.
-    store.registerState({
-      id: 'messages',
-      strategy: 'append_log',
-      deltaSnapshotEvery: 50,
-      fullSnapshotEvery: 10,
-    });
-
-    // Sanity: chronicle must expose the upsert (0.3.0+ in node_modules).
-    const s = store as unknown as { updateStateStrategy?: (r: unknown) => void };
-    assert.strictEqual(typeof s.updateStateStrategy, 'function');
-
-    // Re-registration still throws (this is what ContextManager.open catches)...
-    assert.throws(() => MessageStore.register(store));
-
-    // ...and the retune path applies the current constants without error.
-    s.updateStateStrategy!(MessageStore.registrationFor());
-
-    // Scheduling proof: with fullSnapshotEvery=10 a full snapshot would
-    // fire by 500 appends. Not asserting 5000 appends here (slow); instead
-    // assert the kind-guard behaves: a kind change is rejected...
-    assert.throws(() =>
-      s.updateStateStrategy!({ id: 'messages', strategy: 'snapshot' }),
-    );
-
-    // ...and message traffic on the retuned state is unaffected.
-    for (let i = 0; i < 20; i++) {
-      store.appendToStateJsonWithIdentity(
-        'messages',
-        { participant: 'test', content: [{ type: 'text', text: `m${i}` }], timestamp: i },
-        'id',
-        'sequence',
-      );
-    }
-    const items = store.getStateJson('messages') as unknown as unknown[];
-    assert.strictEqual(items.length, 20);
+    const current = MessageStore.registrationFor();
+    store.registerState({ id: current.id, strategy: 'append_log', deltaSnapshotEvery: 10, fullSnapshotEvery: 10 });
+    assert.strictEqual(typeof (store as unknown as { updateStateStrategy?: unknown }).updateStateStrategy, 'function', 'premise: this chronicle can retune a registration');
+    const manager = await ContextManager.open({ store });
+    for (let i = 0; i < 15; i++) manager.addMessage('test', [{ type: 'text', text: `m${i}` }]);
+    manager.close();
+    const slot = store.listStates().find((state) => state.id === current.id);
+    assert.ok((slot?.opsSinceSnapshot ?? 0) >= 10, `no snapshot at 10 appends, as the registered cadence would take: ${JSON.stringify(slot)}`);
+    assert.strictEqual((store.getStateJson(current.id) as unknown as unknown[]).length, 15, 'every message is kept');
+    store.close();
   });
 
-  it('registrationFor and register use the same constants', () => {
+  it('register refuses a second registration of the message state rather than replacing it', () => {
     const { store } = tmpStore();
     MessageStore.register(store);
-    const reg = MessageStore.registrationFor();
-    assert.strictEqual(reg.id, 'messages');
-    assert.strictEqual(reg.strategy, 'append_log');
-    assert.strictEqual(reg.deltaSnapshotEvery, 50);
-    assert.strictEqual(reg.fullSnapshotEvery, 100);
-    // Registering again with identical constants still throws — proving
-    // register() itself is not silently an upsert.
     assert.throws(() => MessageStore.register(store));
   });
 });

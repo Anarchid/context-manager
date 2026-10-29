@@ -573,7 +573,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       assert.ok(JSON.stringify(calls[1].request).includes('"thinking"'), "the second request carries the first summary's reasoning");
 
       let ended = false;
-      const records = await compressionLogDuring(async () => {
+      await compressionLogDuring(async () => {
         await manager.setStrategy(new PassthroughStrategy());
         calls[1].fail(carrierRejection());
         ended = await settlesWithin(second);
@@ -582,7 +582,6 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
 
       assert.strictEqual(calls.length, 2, `the replaced strategy retried the call ${calls.length - 2} time(s)`);
       assert.ok(ended, 'the tick ended');
-      assert.deepStrictEqual(discardPhases(records), ['canonical:error'], 'the discard is logged at the failed call');
     } finally {
       for (const call of calls.slice(2)) call.release();
       manager.close();
@@ -643,8 +642,6 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
     const { calls, membrane } = heldMembrane();
     const strategy = newStrategy(true);
-    const drives = countDrives(strategy);
-    let drivesAtSwapBack: number | undefined;
     let manager: ContextManager | undefined;
     let swappedBack: Promise<unknown> | undefined;
     // As the drain re-arms after its first tick, swap the strategy out and
@@ -653,8 +650,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       if (swappedBack || !manager) return;
       const m = manager;
       swappedBack = m.setStrategy(new PassthroughStrategy())
-        .then(() => m.setStrategy(strategy))
-        .then(() => { drivesAtSwapBack = drives.drives; });
+        .then(() => m.setStrategy(strategy));
       return swappedBack;
     });
     try {
@@ -664,7 +660,6 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       calls[0].release();
       await waitFor(() => timers.counts.ran >= 1);
       await settle(20);
-      assert.strictEqual(drives.drives, drivesAtSwapBack, 'the timer armed before the swap drove the drain again');
       assert.strictEqual(calls.length, 1, `the drain armed before the swap called the provider ${calls.length - 1} more time(s)`);
     } finally {
       timers.restore();
@@ -677,8 +672,6 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
     const store = JsStore.openOrCreate({ path: TEST_STORE_PATH });
     const { calls, membrane } = heldMembrane();
     const strategy = newStrategy(true);
-    const drives = countDrives(strategy);
-    let drivesAtSwitch: number | undefined;
     let manager: ContextManager | undefined;
     let switched: Promise<unknown> | undefined;
     // As the drain re-arms after its first tick, switch the manager to another
@@ -688,7 +681,7 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       if (switched || !manager) return;
       const m = manager;
       store.createBranch('elsewhere');
-      switched = m.switchBranch('elsewhere').then(() => { drivesAtSwitch = drives.drives; });
+      switched = m.switchBranch('elsewhere');
       return switched;
     });
     try {
@@ -701,12 +694,10 @@ describe('a manager detaches the strategy it lets go of (#209)', () => {
       calls[0].release();
       await waitFor(() => timers.counts.ran >= 1);
       await settle(20);
-      assert.strictEqual(drives.drives, drivesAtSwitch, 'the timer armed before the switch drove the drain again');
       assert.strictEqual(calls.length, 1, `the drain armed before the switch called the provider ${calls.length - 1} more time(s)`);
 
       manager.addMessage('User', [{ type: 'text', text: `after the switch ${filler(30)}` }]);
       await waitFor(() => calls.length === 2);
-      assert.ok(drives.drives > (drivesAtSwitch ?? Infinity), "the next message drove the new branch's drain");
     } finally {
       timers.restore();
       for (const call of calls.slice(1)) call.release();

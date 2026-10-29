@@ -48,28 +48,6 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
   after(() => cleanup());
   beforeEach(() => cleanup());
 
-  it('flag off: existing hierarchical behavior preserved', async () => {
-    const mock = makeMockMembrane();
-    const strategy = new AutobiographicalStrategy({
-      compressionModel: 'mock',
-      targetChunkTokens: 100,
-      recentWindowTokens: 200,
-      adaptiveResolution: false, // explicit
-    });
-    const manager = await ContextManager.open({
-      path: TEST_STORE_PATH,
-      strategy,
-      membrane: mock as any,
-    });
-    for (let i = 0; i < 8; i++) {
-      manager.addMessage('User', [{ type: 'text', text: `Message ${i} ` + 'x'.repeat(80) }]);
-    }
-    await manager.tick();
-    const compiled = await manager.compile();
-    assert.ok(compiled.messages.length > 0);
-    manager.close();
-  });
-
   it('flag on: compile produces output and runs picker', async () => {
     const mock = makeMockMembrane();
     const strategy = new AutobiographicalStrategy({
@@ -151,72 +129,22 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
       const id = manager.addMessage('User', [{ type: 'text', text: `Turn ${i}: SECRET-${i.toString().padStart(2, '0')} ` + 'word '.repeat(40) }]);
       messageIds.push(id);
     }
-    await manager.tick();
+    while (!manager.isReady()) await manager.tick();
 
     // Lock an early message that would otherwise be folded.
     const lockedId = messageIds[3];
     strategy.lockChunk(lockedId);
 
     // Compile with tight budget to force picker to fold.
-    const tight = await manager.compile({ maxTokens: 3000, reserveForResponse: 200 });
+    const tight = await manager.compile({ maxTokens: 1200, reserveForResponse: 200 });
 
-    // Look for the secret token from the locked message — it should be in
-    // the output verbatim (as raw content) because the lock prevented folding.
-    const lockedSecret = `SECRET-03`;
     const tightText = tight.messages
       .flatMap((m) => m.content)
       .filter((b: any) => b.type === 'text')
       .map((b: any) => b.text)
       .join('\n');
-    // Either: the locked message survived raw, OR it was never folded because
-    // budget didn't require it. Verify locked-id appears among entries.
-    const sourceIds = tight.messages.map((m: any) => m.sourceMessageId).filter(Boolean);
-    if (!sourceIds.includes(lockedId)) {
-      // The locked message wasn't in head/tail and was folded despite lock?
-      // That's a bug — unless the locked message was folded as part of a
-      // group fold (locked chunks in the *picker* are skipped, but the
-      // surrounding group's recall pair could still render).
-      // For this test, we'll relax: just verify the secret is somewhere.
-      assert.ok(
-        tightText.includes(lockedSecret),
-        `locked message's secret should be in output; got message IDs: ${sourceIds.join(', ')}`
-      );
-    } else {
-      // Found the locked message id in the output — that's the success case.
-      assert.ok(true);
-    }
-    manager.close();
-  });
-
-  it('flag on: speculative pre-producer creates upper-level summaries', async () => {
-    const mock = makeMockMembrane();
-    const strategy = new AutobiographicalStrategy({
-      compressionModel: 'mock',
-      targetChunkTokens: 50, // small chunks so we get many L1s
-      recentWindowTokens: 50,
-      adaptiveResolution: true,
-      mergeThreshold: 3, // small threshold so L2s form quickly
-    });
-    const manager = await ContextManager.open({
-      path: TEST_STORE_PATH,
-      strategy,
-      membrane: mock as any,
-    });
-
-    // Many short turns
-    for (let i = 0; i < 15; i++) {
-      manager.addMessage('User', [{ type: 'text', text: `T${i}` }]);
-    }
-    // Drive compression to completion
-    while (!manager.isReady()) {
-      await manager.tick();
-    }
-
-    const stats = strategy.getStats();
-    // Should have produced L1s; the existing checkMergeThreshold would have
-    // enqueued L2 production as well. The exact number depends on chunk
-    // boundaries.
-    assert.ok(stats.l1 >= 0, `expected L1 production`);
+    assert.ok(!tightText.includes('SECRET-04 '), 'premise: the budget folds the unlocked message beside it');
+    assert.ok(tightText.includes(`Turn 3: SECRET-03 ${'word '.repeat(40)}`), 'the locked message is sent verbatim');
     manager.close();
   });
 
@@ -240,12 +168,8 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
       membrane: mock as any,
     });
 
-    // Drive enough turns to build several L1s (threshold=3 keeps the
-    // legacy non-speculative checkMergeThreshold honest: L1→L2 fires when
-    // 3 unmerged L1s exist; we want more than that so the picker can ask
-    // for an L_n the legacy path hasn't enqueued).
     for (let i = 0; i < 12; i++) {
-      manager.addMessage('User', [{ type: 'text', text: `T${i}. ` + 'word '.repeat(20) }]);
+      manager.addMessage('User', [{ type: 'text', text: `T${i}. ` + 'word '.repeat(40) }]);
     }
     while (!manager.isReady()) {
       await manager.tick();
@@ -266,39 +190,39 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
       sourceRange: { first: string; last: string };
     }>).filter((s) => s.level === 1);
 
-    if (l1s.length >= 2) {
-      const firstL1 = l1s[0];
-      const lastL1 = l1s[l1s.length - 1];
-      const queueBefore = ((strategy as any).mergeQueue as Array<{ level: number; sourceIds: string[] }>).length;
+    assert.ok(l1s.length >= 2, `premise: the turns made two or more L1s (${l1s.length})`);
+    assert.ok(l1s.length < 3, `premise: fewer L1s than the merge threshold, so the merge check queued no L2 over them (${l1s.length})`);
+    const firstL1 = l1s[0];
+    const lastL1 = l1s[l1s.length - 1];
+    const queueBefore = ((strategy as any).mergeQueue as Array<{ level: number; sourceIds: string[] }>).length;
 
-      // Directly invoke the handler with a synthetic produce op covering
-      // the L1 range. This is what selectAdaptive does when the picker
-      // returns produce ops; here we test it in isolation.
-      (strategy as any).handleProducedOps([
-        {
-          kind: 'produce',
-          level: 2,
-          range: {
-            firstChunkId: firstL1.sourceRange.first,
-            lastChunkId: lastL1.sourceRange.last,
-          },
+    // Directly invoke the handler with a synthetic produce op covering
+    // the L1 range. This is what selectAdaptive does when the picker
+    // returns produce ops; here we test it in isolation.
+    (strategy as any).handleProducedOps([
+      {
+        kind: 'produce',
+        level: 2,
+        range: {
+          firstChunkId: firstL1.sourceRange.first,
+          lastChunkId: lastL1.sourceRange.last,
         },
-      ]);
+      },
+    ]);
 
-      const queueAfter = ((strategy as any).mergeQueue as Array<{ level: number; sourceIds: string[] }>).length;
-      assert.ok(
-        queueAfter > queueBefore,
-        `expected handleProducedOps to enqueue an L2 merge; queue went ${queueBefore} → ${queueAfter}`
-      );
+    const queueAfter = ((strategy as any).mergeQueue as Array<{ level: number; sourceIds: string[] }>).length;
+    assert.ok(
+      queueAfter > queueBefore,
+      `expected handleProducedOps to enqueue an L2 merge; queue went ${queueBefore} → ${queueAfter}`
+    );
 
-      // Run the merge through.
-      while (!manager.isReady()) {
-        await manager.tick();
-      }
-
-      const counts = summariesByLevel();
-      assert.ok(counts[2] >= 1, `expected at least one L2 to exist after draining; got ${JSON.stringify(counts)}`);
+    // Run the merge through.
+    while (!manager.isReady()) {
+      await manager.tick();
     }
+
+    const counts = summariesByLevel();
+    assert.ok(counts[2] >= 1, `expected at least one L2 to exist after draining; got ${JSON.stringify(counts)}`);
 
     manager.close();
   });
@@ -319,15 +243,16 @@ describe('AutobiographicalStrategy — adaptiveResolution', () => {
     for (let i = 0; i < 24; i++) {
       manager.addMessage('User', [{ type: 'text', text: `Turn ${i}. ` + 'word '.repeat(40) }]);
     }
-    await manager.tick();
+    while (!manager.isReady()) await manager.tick();
 
     // First compile under tight budget — picker folds.
-    await manager.compile({ maxTokens: 3000, reserveForResponse: 200 });
+    await manager.compile({ maxTokens: 1200, reserveForResponse: 200 });
     // Snapshot resolutions
     const snap1 = new Map((strategy as any).resolutions);
+    assert.ok(snap1.size > 0, 'premise: the first compile set resolutions to compare');
 
     // Second compile under same budget — should not lower anything.
-    await manager.compile({ maxTokens: 3000, reserveForResponse: 200 });
+    await manager.compile({ maxTokens: 1200, reserveForResponse: 200 });
     const snap2 = new Map((strategy as any).resolutions);
 
     // Monotonicity: every message's resolution in snap2 >= snap1.
