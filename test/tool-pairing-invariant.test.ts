@@ -6,11 +6,13 @@
  * compressed) sailed through to the wire layer.
  *
  * `enforceToolPairing` is the final structural pass in selectHierarchical:
- * every tool_use must be answered by a matching tool_result in the
- * immediately-following entry, or after it in its own entry's content, and
- * every tool_result must answer a tool_use in the immediately-preceding
- * entry or before it in its own. Repair prefers preserving pairs (stub
- * tool_result) over dropping content.
+ * every tool_use must be answered by a matching tool_result in the run of
+ * results right after its run of calls, or, where its run ends its entry, in
+ * the immediately-following entry; every tool_result must answer a tool_use
+ * in the run just before its own, or, where its run starts its entry, in the
+ * immediately-preceding entry. That is what the compile's split
+ * (splitMixedToolMessages) sends as adjacent messages. Repair prefers
+ * preserving pairs (stub tool_result) over dropping content.
  */
 
 import { describe, it, before, after } from 'node:test';
@@ -26,27 +28,35 @@ import type { MessageStoreView } from '../src/types/index.js';
 // ---------------------------------------------------------------------------
 
 function assertPaired(entries: ContextEntry[]): void {
+  const runsOf = (content: ContentBlock[]): ContentBlock[][] => {
+    const runs: ContentBlock[][] = [];
+    for (const block of content) {
+      const run = runs[runs.length - 1];
+      if (run && (run[0]!.type === 'tool_result') === (block.type === 'tool_result')) run.push(block);
+      else runs.push([block]);
+    }
+    return runs;
+  };
   for (let i = 0; i < entries.length; i++) {
-    entries[i].content.forEach((block, k) => {
-      if (block.type === 'tool_use') {
-        const id = (block as { id: string }).id;
-        const answers = [...entries[i].content.slice(k + 1), ...(entries[i + 1]?.content ?? [])];
-        assert.ok(
-          answers.some(
-            (b) => b.type === 'tool_result' && (b as { toolUseId: string }).toolUseId === id,
-          ),
-          `entries[${i}]: tool_use ${id} not answered later in entries[${i}] or in entries[${i + 1}]`,
-        );
-      }
-      if (block.type === 'tool_result') {
-        const tid = (block as { toolUseId: string }).toolUseId;
-        const calls = [...(entries[i - 1]?.content ?? []), ...entries[i].content.slice(0, k)];
-        assert.ok(
-          calls.some(
-            (b) => b.type === 'tool_use' && (b as { id: string }).id === tid,
-          ),
-          `entries[${i}]: tool_result ${tid} has no tool_use in entries[${i - 1}] or earlier in entries[${i}]`,
-        );
+    const runs = runsOf(entries[i].content);
+    runs.forEach((run, r) => {
+      for (const block of run) {
+        if (block.type === 'tool_use') {
+          const id = (block as { id: string }).id;
+          const answers = r + 1 < runs.length ? runs[r + 1]! : (entries[i + 1]?.content ?? []);
+          assert.ok(
+            answers.some((b) => b.type === 'tool_result' && (b as { toolUseId: string }).toolUseId === id),
+            `entries[${i}]: tool_use ${id} not answered in the results right after its run`,
+          );
+        }
+        if (block.type === 'tool_result') {
+          const tid = (block as { toolUseId: string }).toolUseId;
+          const calls = r > 0 ? runs[r - 1]! : (entries[i - 1]?.content ?? []);
+          assert.ok(
+            calls.some((b) => b.type === 'tool_use' && (b as { id: string }).id === tid),
+            `entries[${i}]: tool_result ${tid} answers no tool_use in the run just before its own`,
+          );
+        }
       }
     });
   }
