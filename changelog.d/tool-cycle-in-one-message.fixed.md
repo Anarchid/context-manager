@@ -4,17 +4,18 @@
   (`enforceToolPairing`) judged each message whole, so it dropped such a
   result as answering no call before it and sent a stub for the call: a
   message the compile's split (`splitMixedToolMessages`, which `compile()`
-  runs for sessions imported in that shape) or membrane's normalizer would
-  have sent with its results lost them in every compile. The repair now judges
-  such a message in parts, each run of results that answers a call earlier in
-  its own content as one part and what follows it as another, and folds the
-  parts back into the one message, so a result answers its call in its own
-  message; a call its own results don't answer is still answered by a stub
-  beside them. This holds for a user message of that shape too, which
-  membrane's normalizer re-roles. A compile holding no such message is
-  repaired exactly as before. Compile provenance now reports such a message
-  carried whole (`complete: true`) where nothing else alters it; it reported
-  it incomplete, missing `content`.
+  runs on every message) or membrane's normalizer would have sent with its
+  results lost them in every compile. The repair now judges such a message in
+  parts, each run of results that answers a call earlier in its own content,
+  one no result there has answered yet, as one part and what follows it as
+  another, and folds the parts back into the one message, so a result answers
+  its call in its own message; a call its own results don't answer is answered
+  as pairing repair answers any call: by its result moved up where the
+  look-ahead finds one, else by a stub. This holds for a user message of that
+  shape too, which membrane's normalizer re-roles. A compile holding no such
+  message is repaired exactly as before. Compile provenance now reports such a
+  message carried whole (`complete: true`) where nothing else alters it; it
+  reported it incomplete, missing `content`.
 - `toolResultMaxLastN` counts such a result as answering its call: a result
   answers the earliest call with its id before it, in its own message or an
   earlier one. It answered none before, so it was never replaced, and in a

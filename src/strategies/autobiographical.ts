@@ -2078,7 +2078,8 @@ function sentForm(block: ContentBlock): ContentBlock {
 
 /** A message's content in parts around each tool cycle of its own: a run
  *  of tool_result blocks, one of which answers a tool_use earlier in the same
- *  content, is a part, and so is what follows it. A cut never splits a run
+ *  content that no result there has answered yet, is a part, and so is what
+ *  follows it. A cut never splits a run
  *  of results or a run of other blocks, and the blocks that share a raw
  *  replay form (raw-forms.ts) sit in one such run, so a form stays within one
  *  part. */
@@ -2090,14 +2091,17 @@ function cycleParts(content: ContentBlock[]): ContentBlock[][] {
     else runs.push([block]);
   }
   const parts: ContentBlock[][] = [];
-  const called = new Set<string>();
+  const waiting = new Set<string>();
   let afterCycle = false;
   for (const run of runs) {
-    const cycle = run.some((block) => block.type === 'tool_result' && called.has(block.toolUseId));
+    const cycle = run.some((block) => block.type === 'tool_result' && waiting.has(block.toolUseId));
     if (parts.length === 0 || cycle || afterCycle) parts.push([...run]);
     else parts[parts.length - 1]!.push(...run);
     afterCycle = cycle;
-    for (const block of run) if (block.type === 'tool_use') called.add(block.id);
+    for (const block of run) {
+      if (block.type === 'tool_use') waiting.add(block.id);
+      else if (block.type === 'tool_result') waiting.delete(block.toolUseId);
+    }
   }
   return parts;
 }
@@ -19560,8 +19564,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *
    * An entry holding a tool cycle of its own is judged in parts
    * (cycleParts), and its parts fold back into the one entry, with any entry
-   * the repair placed between two of them in its place. The look-ahead counts
-   * an entry's parts as one entry.
+   * the repair placed between two of them in its place; a part the repair
+   * empties adds nothing, where an entry it empties gets the placeholder. The
+   * look-ahead counts an entry's parts as one entry.
    *
    * Runs as a structural pass over the rendered context in BOTH render
    * paths — `selectHierarchical` (downstream of `selectL1Summaries`, so
@@ -19629,7 +19634,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         if (filtered.length !== entry.content.length) {
           entry.content = filtered.length > 0
             ? releaseEditedRawForms(entry.content, filtered)
-            : [{ type: 'text', text: '[tool call omitted]' }];
+            : unitOf(entry) !== entry ? [] : [{ type: 'text', text: '[tool call omitted]' }];
         }
       }
 
@@ -19746,7 +19751,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         // they're apart; each gives it up (see raw-forms.ts).
         src.content = rest.length > 0
           ? releaseEditedRawForms(source, rest)
-          : [{ type: 'text', text: '[tool result moved during context repair]' }];
+          : unitOf(src) !== src ? [] : [{ type: 'text', text: '[tool result moved during context repair]' }];
         // The result still reaches the request, next to its tool_use:
         // provenance credits the source body with it there.
         (src.relocatedResults ??= []).push(id);

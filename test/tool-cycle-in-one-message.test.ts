@@ -151,8 +151,34 @@ for (const select of Object.keys(selects) as Array<keyof typeof selects>) {
         const { sent, repairs } = sentByMembrane(compiled);
         for (const id of content.flatMap((b) => (b.type === 'tool_use' ? [b.id] : []))) assert.ok(sent.includes(said(id)), sent);
         assert.ok(!sent.includes(STUB), sent);
+        assert.ok(!sent.includes('[tool result moved during context repair]'), sent);
         assert.deepEqual(repairs, []);
       }
+    });
+
+    it("a further result doesn't take the next message's own answer to a call of its message", async () => {
+      const { compiled } = await compileOf(select, [
+        ['User', [text('Please look at both files.')]],
+        ['Claude', [call('look-1'), result('look-1'), call('look-2'), text('One says hello.'), result('look-1')]],
+        ['User', [result('look-2')]],
+        ['Claude', [text('Both say hello.')]],
+      ]);
+      assert.ok(compiled.messages.some((m) => m.participant === 'User' && m.content.length === 1 && m.content[0]!.type === 'tool_result' && m.content[0]!.toolUseId === 'look-2'), JSON.stringify(compiled.messages));
+      const { sent, repairs } = sentByMembrane(compiled);
+      assert.ok(!sent.includes('[tool result moved during context repair]') && !sent.includes('[tool call omitted]'), sent);
+      assert.deepEqual(repairs, []);
+    });
+
+    it('a further result for a call its message already answered leaves no placeholder in the message', async () => {
+      const { compiled } = await compileOf(select, [
+        ['User', [text('Please look at the file.')]],
+        ['Claude', [text('Let me look.'), call('look-1'), result('look-1'), text('It says hello.'), result('look-1')]],
+        ['User', [text('Thanks.')]],
+      ]);
+      const { sent, repairs } = sentByMembrane(compiled);
+      assert.ok(sent.includes(said('look-1')), sent);
+      assert.ok(!sent.includes('[tool call omitted]'), sent);
+      assert.deepEqual(repairs, []);
     });
 
     it("under toolResultMaxLastN: 0, a message's own result is replaced with the tool's marker", async () => {
