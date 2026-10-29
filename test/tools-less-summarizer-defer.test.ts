@@ -95,7 +95,8 @@ describe('tools-less summarizer deferral', () => {
   it('non-Fable summarizer + pure-chat chunks: still mints tools-less (baseline behaviour preserved)', async () => {
     const { manager, calls } = await openChatty('test-compression-model');
     await drain(manager);
-    assert.ok(calls.length > 0, 'tools-less compression proceeds on non-Fable summarizers');
+    assert.ok(calls.length > 0, 'compression proceeds on non-Fable summarizers');
+    assert.ok(calls.every((call) => !Array.isArray(call.tools) || call.tools.length === 0), `and its requests carry no tools: ${JSON.stringify(calls.map((call) => call.tools))}`);
     await manager.close();
   });
 });
