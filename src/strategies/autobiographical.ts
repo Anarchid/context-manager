@@ -4367,17 +4367,25 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /**
    * Resolve IDs through loadPersistedState's canonical projection, never an
    * arbitrary historical duplicate. Each projected authored node must still
-   * have a byte-identical authored copy in Chronicle; mergedInto is excluded
-   * because it is mutable graph state, not authored node identity.
+   * have an authored copy in Chronicle that sameAuthoredSummary finds the
+   * same: its id, level, source level, content, source range and source ids.
+   * mergedInto isn't compared, because it is mutable graph state, not
+   * authored node identity.
    */
   private persistedCanonicalSummariesById(): Map<string, SummaryEntry> {
     const stored = this.store?.getStateJson(this.summariesStateId);
     if (!Array.isArray(stored)) return new Map();
-    const historical = stored as SummaryEntry[];
+    const copiesById = new Map<string, SummaryEntry[]>();
+    for (const alternate of stored as Array<SummaryEntry | null>) {
+      if (!alternate || typeof alternate.id !== 'string') continue;
+      const copies = copiesById.get(alternate.id);
+      if (copies) copies.push(alternate);
+      else copiesById.set(alternate.id, [alternate]);
+    }
     const canonical = new Map<string, SummaryEntry>();
     for (const summary of this.summaries) {
       if (!summary || typeof summary.id !== 'string') continue;
-      if (historical.some((alternate) => alternate && this.sameAuthoredSummary(summary, alternate))) {
+      if (copiesById.get(summary.id)?.some((alternate) => this.sameAuthoredSummary(summary, alternate))) {
         canonical.set(summary.id, summary);
       }
     }
