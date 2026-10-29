@@ -5,8 +5,8 @@
 // jobs act on: the release publishes only if it is 0.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -51,6 +51,32 @@ const READS_STDIN = [
 /** Not a test file: run, as JavaScript or as stripped TypeScript, it would
  *  end the run red. */
 const NOT_A_TEST = "process.exit(3);";
+/** Says it has started, then passes only once `other` has started too, and
+ *  fails after 10 s if it never does: run one after another, the first of a
+ *  pair fails. */
+const waitsFor = (own: string, other: string): string => [
+  "import { existsSync, writeFileSync } from 'node:fs';",
+  `writeFileSync(${JSON.stringify(`${own}.started`)}, '');`,
+  `console.log(${JSON.stringify(`${own} has started`)});`,
+  "const until = Date.now() + 10_000;",
+  `while (!existsSync(${JSON.stringify(`${other}.started`)})) {`,
+  `  if (Date.now() > until) { console.log(${JSON.stringify(`${other} never ran beside ${own}`)}); process.exit(1); }`,
+  "  await new Promise((resolve) => setTimeout(resolve, 20));",
+  "}",
+  `console.log(${JSON.stringify(`${own} saw ${other} running`)});`,
+].join("\n");
+/** Writes a line, then passes only once that line is in the script's own
+ *  output, and fails after 10 s if it never is: a script that held a running
+ *  file's output until the file ended would fail it. */
+const SEES_ITS_LINE_PRINTED = [
+  "import { readFileSync } from 'node:fs';",
+  "console.log('written while running');",
+  "const until = Date.now() + 10_000;",
+  "while (!readFileSync('script-stdout.txt', 'utf8').includes('\\nwritten while running\\n')) {",
+  "  if (Date.now() > until) { console.log('not printed while running'); process.exit(1); }",
+  "  await new Promise((resolve) => setTimeout(resolve, 20));",
+  "}",
+].join("\n");
 
 interface Run {
   status: number | null;
@@ -69,9 +95,14 @@ interface Run {
  * an empty dist/test when `files` is empty, and none when it is undefined.
  * Each `*.test.js` fixture first prints `ran <path>`, synchronously, so the
  * one that kills itself has said so before it dies. If NODE_TEST_CONTEXT
- * reaches a fixture, it prints `context <value>` too.
+ * reaches a fixture, it prints `context <value>` too. The script's stdout
+ * goes to `script-stdout.txt` in that directory, where a fixture can read it
+ * while the script runs.
  */
-function runScript(files: Record<string, string> | undefined): Run {
+function runScript(
+  files: Record<string, string> | undefined,
+  options: { jobs?: string } = {},
+): Run {
   const dir = mkdtempSync(join(tmpdir(), "test-each-file-"));
   try {
     writeFileSync(join(dir, "package.json"), '{ "type": "module" }\n');
@@ -95,22 +126,33 @@ function runScript(files: Record<string, string> | undefined): Run {
         writeFileSync(join(dir, path), `${marker}${text}\n`);
       }
     }
-    const result = spawnSync("bash", [SCRIPT], {
-      cwd: dir,
-      env: {
-        ...process.env,
-        // The fixtures run on the node this test runs on.
-        PATH: [dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter),
-        // node --test gives its children this, and the script must clear it:
-        // set here, every run with fixtures checks that.
-        NODE_TEST_CONTEXT: "child-v8",
-      },
-      encoding: "utf8",
-      // If bash itself hangs, its case fails here rather than at the job's
-      // limit. A fixture can't hang: each ends on its own.
-      timeout: 120_000,
-    });
-    const stdout = result.stdout ?? "";
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    delete env.TEST_EACH_FILE_JOBS;
+    if (options.jobs !== undefined) env.TEST_EACH_FILE_JOBS = options.jobs;
+    const stdoutPath = join(dir, "script-stdout.txt");
+    const stdoutFd = openSync(stdoutPath, "w");
+    let result: SpawnSyncReturns<string>;
+    try {
+      result = spawnSync("bash", [SCRIPT], {
+        cwd: dir,
+        env: {
+          ...env,
+          // The fixtures run on the node this test runs on.
+          PATH: [dirname(process.execPath), process.env.PATH].filter(Boolean).join(delimiter),
+          // node --test gives its children this, and the script must clear it:
+          // set here, every run with fixtures checks that.
+          NODE_TEST_CONTEXT: "child-v8",
+        },
+        encoding: "utf8",
+        stdio: ["pipe", stdoutFd, "pipe"],
+        // If bash itself hangs, its case fails here rather than at the job's
+        // limit. A fixture can't hang: each ends on its own.
+        timeout: 120_000,
+      });
+    } finally {
+      closeSync(stdoutFd);
+    }
+    const stdout = readFileSync(stdoutPath, "utf8");
     const lines = stdout.split("\n");
     return {
       status: result.status,
@@ -213,6 +255,34 @@ test("a path with a space runs as it is, and a file that reads stdin leaves the 
     "dist/test/c-passes.test.js",
   ]);
   assert.match(run.stdout, /read 0 bytes of stdin/, run.log);
+});
+
+test("files run at once, and each one's output is printed whole under its path, in path order", notOnWindows, () => {
+  const run = runScript({
+    "dist/test/a-waits-for-b.test.js": waitsFor("a", "b"),
+    "dist/test/b-waits-for-a.test.js": waitsFor("b", "a"),
+  }, { jobs: "2" });
+  assert.equal(run.status, 0, run.log);
+  assertRanPlain(run, ["dist/test/a-waits-for-b.test.js", "dist/test/b-waits-for-a.test.js"]);
+  const [, a, b] = run.stdout.split(/^== .*$/m);
+  assert.deepEqual(a!.match(/^[ab] .*$/gm), ["a has started", "a saw b running"], run.log);
+  assert.deepEqual(b!.match(/^[ab] .*$/gm), ["b has started", "b saw a running"], run.log);
+});
+
+test("TEST_EACH_FILE_JOBS that isn't a whole number above 0 ends the run red before any file runs", notOnWindows, () => {
+  for (const jobs of ["0", "07", "-1", "two", "1.5"]) {
+    const run = runScript({ "dist/test/a-passes.test.js": PASSES }, { jobs });
+    assert.equal(run.status, 1, run.log);
+    assert.deepEqual(run.started, [], run.log);
+    assert.deepEqual(run.errors, [`::error::TEST_EACH_FILE_JOBS must be a whole number above 0, not '${jobs}'`], run.log);
+  }
+});
+
+test("the earliest file still running prints its output as it comes, so one that never ends shows what it has written", notOnWindows, () => {
+  const run = runScript({ "dist/test/a-sees-its-line-printed.test.js": SEES_ITS_LINE_PRINTED });
+  assert.equal(run.status, 0, run.log);
+  assertRanPlain(run, ["dist/test/a-sees-its-line-printed.test.js"]);
+  assert.deepEqual(run.errors, [], run.log);
 });
 
 test("an empty dist/test ends the run red", notOnWindows, () => {
