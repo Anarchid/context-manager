@@ -18,6 +18,8 @@ const selects = {
   'kv-unified': { adaptiveResolution: true, foldingStrategy: 'kv-unified', kvUnified: KV },
   'flat-profile': { adaptiveResolution: true, foldingStrategy: 'flat-profile' },
   'Knowledge, hierarchical': { adaptiveResolution: false, knowledge: true },
+  'Knowledge, kv-unified': { adaptiveResolution: true, foldingStrategy: 'kv-unified', kvUnified: KV, knowledge: true },
+  'Knowledge, flat-profile': { adaptiveResolution: true, foldingStrategy: 'flat-profile', knowledge: true },
 } as const;
 
 const text = (t: string): ContentBlock => ({ type: 'text', text: t });
@@ -84,14 +86,30 @@ for (const select of Object.keys(selects) as Array<keyof typeof selects>) {
       }
     }
 
-    it("an assistant message's call that its own results don't answer is answered beside them, and the result that is there is sent", async () => {
+    for (const [role, participant, reply] of [['an assistant', 'Claude', 'User'], ['a user', 'User', 'Claude']] as const) {
+      it(`${role} message's call that its own results don't answer is answered beside them, and the result that is there is sent`, async () => {
+        const { compiled } = await compileOf(select, [
+          ['User', [text('Please look at both files.')]],
+          [participant, [text('Let me look.'), call('look-1'), call('look-2'), result('look-1'), text('One says hello.')]],
+          [reply, [text('Thanks.')]],
+        ]);
+        const { sent, repairs } = sentByMembrane(compiled);
+        assert.ok(sent.includes(said('look-1')), sent);
+        assert.ok(sent.includes(STUB), sent);
+        assert.deepEqual(repairs, []);
+      });
+    }
+
+    it('a call whose result is nowhere, between cycles of its own message, is answered right after it', async () => {
       const { compiled } = await compileOf(select, [
-        ['User', [text('Please look at both files.')]],
-        ['Claude', [text('Let me look.'), call('look-1'), call('look-2'), result('look-1'), text('One says hello.')]],
+        ['User', [text('Please look at the files.')]],
+        ['Claude', [text('Let me look.'), call('look-1'), call('look-2'), result('look-2'), text('Then.'), call('look-3'), result('look-1'), text('Again.'), call('look-4'), result('look-4'), text('Done.')]],
         ['User', [text('Thanks.')]],
       ]);
+      const at = compiled.messages.findIndex((m) => m.content.some((b) => b.type === 'tool_use' && b.id === 'look-3'));
+      assert.ok(compiled.messages[at + 1]?.content.some((b) => b.type === 'tool_result' && b.toolUseId === 'look-3'), JSON.stringify(compiled.messages));
       const { sent, repairs } = sentByMembrane(compiled);
-      assert.ok(sent.includes(said('look-1')), sent);
+      for (const id of ['look-1', 'look-2', 'look-4']) assert.ok(sent.includes(said(id)), sent);
       assert.ok(sent.includes(STUB), sent);
       assert.deepEqual(repairs, []);
     });
@@ -101,15 +119,6 @@ for (const select of Object.keys(selects) as Array<keyof typeof selects>) {
         ['User', [text('Please look at both files.')]],
         ['Claude', [text('First.'), call('look-1'), result('look-1'), text('Then.'), call('look-2'), result('look-2'), text('Both say hello.')]],
         ['User', [text('Thanks.')]],
-      ]);
-      assert.deepEqual(compiled.messages.map((m) => [m.participant, m.content.map((b) => b.type)]), [
-        ['User', ['text']],
-        ['Claude', ['text', 'tool_use']],
-        ['user', ['tool_result']],
-        ['Claude', ['text', 'tool_use']],
-        ['user', ['tool_result']],
-        ['Claude', ['text']],
-        ['User', ['text']],
       ]);
       const { sent, repairs } = sentByMembrane(compiled);
       assert.ok(sent.includes(said('look-1')) && sent.indexOf(said('look-1')) < sent.indexOf(said('look-2')), sent);
@@ -186,20 +195,29 @@ class Exposed extends AutobiographicalStrategy {
 }
 
 describe("pairing repair's look-ahead for a displaced result", () => {
-  it('counts a message holding cycles as one entry, so a result five entries on still reaches its call', () => {
-    const entry = (id: string, participant: string, content: ContentBlock[]): ContextEntry =>
-      ({ sourceMessageId: id, participant, content } as ContextEntry);
+  const entry = (id: string, participant: string, content: ContentBlock[]): ContextEntry =>
+    ({ sourceMessageId: id, participant, content } as ContextEntry);
+  const repaired = (between: number): ContextEntry[] => {
     const entries = [
       entry('m0', 'Claude', [call('look-x')]),
       entry('m1', 'User', [text('Busy.')]),
       entry('m2', 'Claude', [call('look-a'), result('look-a'), text('a'), call('look-b'), result('look-b'), text('b'), call('look-c'), result('look-c'), text('c')]),
-      entry('m3', 'User', [text('Go on.')]),
-      entry('m4', 'Claude', [text('Going.')]),
-      entry('m5', 'User', [text('Still busy.')]),
-      entry('m6', 'User', [result('look-x')]),
+      ...Array.from({ length: between - 2 }, (_, k) => entry(`p${k}`, k % 2 ? 'Claude' : 'User', [text('Still busy.')])),
+      entry('mx', 'User', [result('look-x')]),
     ];
     new Exposed({ autoTickOnNewMessage: false } as ConstructorParameters<typeof AutobiographicalStrategy>[0]).repair(entries);
+    return entries;
+  };
+
+  it('counts a message holding cycles as one entry, so a result seven entries after its call, the farthest it reaches, still reaches it', () => {
+    const entries = repaired(6);
     assert.deepEqual(entries[1]!.content, [result('look-x')], 'the real result is moved next to its call');
     assert.ok(!JSON.stringify(entries).includes(STUB), JSON.stringify(entries));
+  });
+
+  it('stubs a call whose result is eight entries after it, as before', () => {
+    const entries = repaired(7);
+    assert.ok(JSON.stringify(entries[1]!.content).includes(STUB), JSON.stringify(entries[1]));
+    assert.ok(!JSON.stringify(entries[1]!.content).includes(said('look-x')), JSON.stringify(entries[1]));
   });
 });

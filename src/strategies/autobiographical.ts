@@ -19559,8 +19559,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    *     placeholder text block.
    *
    * An entry holding a tool cycle of its own is judged in parts
-   * (cycleParts), and its parts fold back into the one entry. The look-ahead
-   * counts an entry's parts as one entry.
+   * (cycleParts), and its parts fold back into the one entry, with any entry
+   * the repair placed between two of them in its place. The look-ahead counts
+   * an entry's parts as one entry.
    *
    * Runs as a structural pass over the rendered context in BOTH render
    * paths — `selectHierarchical` (downstream of `selectL1Summaries`, so
@@ -19584,28 +19585,27 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       return;
     }
     this.repairToolPairing(parts, (entry) => originOf.get(entry) ?? entry);
-    const partsOf = new Map<ContextEntry, ContextEntry[]>();
-    for (const part of parts) {
+    const lastPart = new Map<ContextEntry, number>();
+    parts.forEach((part, i) => {
       const origin = originOf.get(part);
-      if (!origin) continue;
-      const own = partsOf.get(origin);
-      if (own) own.push(part);
-      else partsOf.set(origin, [part]);
-    }
+      if (origin) lastPart.set(origin, i);
+    });
     const folded: ContextEntry[] = [];
-    for (const part of parts) {
+    let open: { origin: ContextEntry; last: number } | undefined;
+    parts.forEach((part, i) => {
       const origin = originOf.get(part);
-      if (!origin) {
-        folded.push(part);
-        continue;
+      if (origin && origin !== open?.origin) {
+        open = { origin, last: lastPart.get(origin)! };
+        origin.content = [];
+        folded.push(origin);
       }
-      const own = partsOf.get(origin)!;
-      if (own[0] !== part) continue;
-      origin.content = own.flatMap((p) => p.content);
-      const moved = own.flatMap((p) => p.relocatedResults ?? []);
-      if (moved.length > 0) origin.relocatedResults = [...(origin.relocatedResults ?? []), ...moved];
-      folded.push(origin);
-    }
+      if (!open || i > open.last) {
+        folded.push(part);
+        return;
+      }
+      open.origin.content.push(...part.content);
+      if (part.relocatedResults?.length) open.origin.relocatedResults = [...(open.origin.relocatedResults ?? []), ...part.relocatedResults];
+    });
     entries.splice(0, entries.length, ...folded);
     for (let i = 0; i < entries.length; i++) entries[i]!.index = i;
   }
