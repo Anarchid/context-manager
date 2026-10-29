@@ -233,6 +233,8 @@ describe('Head Window Reset', () => {
 
       // Reset to mid message, then remove it
       strategy.resetHeadWindow(midId);
+      const reset = await manager.compile();
+      assert.deepStrictEqual(reset.messages[0]?.content, textBlock('Second'), 'premise: the reset moved the head');
       manager.removeMessage(midId);
 
       const { messages } = await manager.compile();
@@ -257,11 +259,12 @@ describe('Head Window Reset', () => {
 
       // Add regular messages
       manager.addMessage('user', textBlock('Hello'));
-      manager.addMessage('assistant', textBlock('[Topic Transition] fake'));
 
       // Add real transition
       const realTransitionId = manager.addMessage('Context Manager',
         textBlock('[Topic Transition]\n\nReal transition.'));
+
+      manager.addMessage('assistant', textBlock('[Topic Transition] fake'));
 
       // Add another regular message
       manager.addMessage('user', textBlock('After transition'));

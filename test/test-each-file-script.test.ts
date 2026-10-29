@@ -7,7 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { availableParallelism, tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -51,12 +51,9 @@ const READS_STDIN = [
 /** Not a test file: run, as JavaScript or as stripped TypeScript, it would
  *  end the run red. */
 const NOT_A_TEST = "process.exit(3);";
-/** Says it has started, then passes only once `other` has started too, and
- *  fails after 10 s if it never does: run one after another, the first of a
- *  pair fails. */
-const waitsFor = (own: string, other: string): string => [
-  "import { existsSync, writeFileSync } from 'node:fs';",
-  `writeFileSync(${JSON.stringify(`${own}.started`)}, '');`,
+const waitsFor = (own: string, other: string, outlives = false): string => [
+  "import { existsSync, readFileSync, writeFileSync } from 'node:fs';",
+  `writeFileSync(${JSON.stringify(`${own}.started`)}, String(process.pid));`,
   `console.log(${JSON.stringify(`${own} has started`)});`,
   "const until = Date.now() + 10_000;",
   `while (!existsSync(${JSON.stringify(`${other}.started`)})) {`,
@@ -64,10 +61,21 @@ const waitsFor = (own: string, other: string): string => [
   "  await new Promise((resolve) => setTimeout(resolve, 20));",
   "}",
   `console.log(${JSON.stringify(`${own} saw ${other} running`)});`,
+  ...(outlives ? [
+    `const pid = Number(readFileSync(${JSON.stringify(`${other}.started`)}, 'utf8'));`,
+    "const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };",
+    "while (alive()) {",
+    `  if (Date.now() > until) { console.log(${JSON.stringify(`${other} never ended`)}); process.exit(1); }`,
+    "  await new Promise((resolve) => setTimeout(resolve, 20));",
+    "}",
+    "const watch = Date.now() + 1_000;",
+    "while (Date.now() < watch) {",
+    `  if (readFileSync('script-stdout.txt', 'utf8').includes(${JSON.stringify(`\n${other} has started\n`)})) { console.log(${JSON.stringify(`${other} was printed before ${own} ended`)}); break; }`,
+    "  await new Promise((resolve) => setTimeout(resolve, 20));",
+    "}",
+    `console.log(${JSON.stringify(`${own} outlived ${other}`)});`,
+  ] : []),
 ].join("\n");
-/** Writes a line, then passes only once that line is in the script's own
- *  output, and fails after 10 s if it never is: a script that held a running
- *  file's output until the file ended would fail it. */
 const SEES_ITS_LINE_PRINTED = [
   "import { readFileSync } from 'node:fs';",
   "console.log('written while running');",
@@ -95,9 +103,7 @@ interface Run {
  * an empty dist/test when `files` is empty, and none when it is undefined.
  * Each `*.test.js` fixture first prints `ran <path>`, synchronously, so the
  * one that kills itself has said so before it dies. If NODE_TEST_CONTEXT
- * reaches a fixture, it prints `context <value>` too. The script's stdout
- * goes to `script-stdout.txt` in that directory, where a fixture can read it
- * while the script runs.
+ * reaches a fixture, it prints `context <value>` too.
  */
 function runScript(
   files: Record<string, string> | undefined,
@@ -257,28 +263,36 @@ test("a path with a space runs as it is, and a file that reads stdin leaves the 
   assert.match(run.stdout, /read 0 bytes of stdin/, run.log);
 });
 
-test("files run at once, and each one's output is printed whole under its path, in path order", notOnWindows, () => {
+test("files run at once, and each one's output is printed whole under its path, in path order, whichever ends first", notOnWindows, () => {
   const run = runScript({
-    "dist/test/a-waits-for-b.test.js": waitsFor("a", "b"),
+    "dist/test/a-outlives-b.test.js": waitsFor("a", "b", true),
     "dist/test/b-waits-for-a.test.js": waitsFor("b", "a"),
   }, { jobs: "2" });
   assert.equal(run.status, 0, run.log);
-  assertRanPlain(run, ["dist/test/a-waits-for-b.test.js", "dist/test/b-waits-for-a.test.js"]);
+  assertRanPlain(run, ["dist/test/a-outlives-b.test.js", "dist/test/b-waits-for-a.test.js"]);
   const [, a, b] = run.stdout.split(/^== .*$/m);
-  assert.deepEqual(a!.match(/^[ab] .*$/gm), ["a has started", "a saw b running"], run.log);
+  assert.deepEqual(a!.match(/^[ab] .*$/gm), ["a has started", "a saw b running", "a outlived b"], run.log);
   assert.deepEqual(b!.match(/^[ab] .*$/gm), ["b has started", "b saw a running"], run.log);
 });
 
-test("TEST_EACH_FILE_JOBS that isn't a whole number above 0 ends the run red before any file runs", notOnWindows, () => {
+test("an empty or unset TEST_EACH_FILE_JOBS runs as many files at once as node's os.availableParallelism() gives", notOnWindows, () => {
+  for (const jobs of [undefined, ""]) {
+    const run = runScript({ "dist/test/a-passes.test.js": PASSES }, { jobs });
+    assert.equal(run.status, 0, run.log);
+    assert.equal(run.stdout.split("\n")[0], `Running 1 test files, ${availableParallelism()} at a time`, run.log);
+  }
+});
+
+test("a TEST_EACH_FILE_JOBS that isn't a whole number above 0, with no leading zero, ends the run red before any file runs", notOnWindows, () => {
   for (const jobs of ["0", "07", "-1", "two", "1.5"]) {
     const run = runScript({ "dist/test/a-passes.test.js": PASSES }, { jobs });
     assert.equal(run.status, 1, run.log);
     assert.deepEqual(run.started, [], run.log);
-    assert.deepEqual(run.errors, [`::error::TEST_EACH_FILE_JOBS must be a whole number above 0, not '${jobs}'`], run.log);
+    assert.deepEqual(run.errors, [`::error::TEST_EACH_FILE_JOBS must be a whole number above 0, with no leading zero, not '${jobs}'`], run.log);
   }
 });
 
-test("the earliest file still running prints its output as it comes, so one that never ends shows what it has written", notOnWindows, () => {
+test("the earliest file still running prints its output before it ends", notOnWindows, () => {
   const run = runScript({ "dist/test/a-sees-its-line-printed.test.js": SEES_ITS_LINE_PRINTED });
   assert.equal(run.status, 0, run.log);
   assertRanPlain(run, ["dist/test/a-sees-its-line-printed.test.js"]);

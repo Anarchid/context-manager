@@ -177,7 +177,6 @@ describe('Chunk persistence: close-then-compress', () => {
       hierarchical: true,
       l1HoldbackChunks: 0,
     };
-    /** The numbers of the messages each compression request holds, request by request. */
     const held = (calls: Array<{ messages: ApiMessage[] }>) => calls.map((c) =>
       (c.messages.flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '').join(' ').match(/message \d+/g) ?? []).join(','));
     const reopenedAt = async (targetChunkTokens: number) => {

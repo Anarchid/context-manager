@@ -594,9 +594,11 @@ describe('KnowledgeStrategy', () => {
 
       await manager.compile();
       const phases = getStrategyState(strategy).chunks.map(c => c.phaseType);
-      assert.ok(phases.includes('research'), `no research chunk: ${phases.join(', ')}`);
-      assert.ok(phases.includes('subagent'), `no subagent chunk: ${phases.join(', ')}`);
-      assert.ok(phases.includes('lesson'), `no lesson chunk: ${phases.join(', ')}`);
+      assert.deepStrictEqual(
+        phases.filter((p) => p === 'research' || p === 'subagent' || p === 'lesson').filter((p, i, run) => i === 0 || run[i - 1] !== p),
+        ['research', 'subagent', 'lesson'],
+        `each call's phase, in the order of the calls: ${phases.join(', ')}`,
+      );
       manager.close();
     });
 

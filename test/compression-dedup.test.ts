@@ -23,6 +23,9 @@ import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { SummaryEntry } from '../src/types/index.js';
 
+const within = (ms: number, why: string): Promise<never> =>
+  new Promise((_, reject) => { setTimeout(() => reject(new Error(why)), ms).unref(); });
+
 const TEST_STORE_PATH = './test-compression-dedup';
 const TEST_COMPRESSION_MODEL = 'test-compression-model';
 
@@ -86,15 +89,21 @@ describe('Concurrent compression: stale chunk identity', () => {
 
     // Start a slow compression of chunk 0 — do NOT await yet.
     const inflight = manager.tick();
-    await Promise.race([called, inflight.then(() => { throw new Error('premise: the tick asked for no compression'); })]);
+    try {
+      await Promise.race([
+        called,
+        inflight.then(() => { throw new Error('premise: the tick asked for no compression'); }),
+        within(10_000, 'the tick never reached the provider'),
+      ]);
 
-    // While the LLM call is in flight: a new message arrives and a compile
-    // runs → rebuildChunks resets the queue and re-queues chunk 0 (its L1
-    // doesn't exist yet, so the rebuilt chunk object is uncompressed).
-    manager.addMessage('User', [{ type: 'text', text: filler(30) }]);
-    await manager.compile();
-
-    release();
+      // While the LLM call is in flight: a new message arrives and a compile
+      // runs → rebuildChunks resets the queue and re-queues chunk 0 (its L1
+      // doesn't exist yet, so the rebuilt chunk object is uncompressed).
+      manager.addMessage('User', [{ type: 'text', text: filler(30) }]);
+      await Promise.race([manager.compile(), within(10_000, 'compile() waited for the held compression')]);
+    } finally {
+      release();
+    }
     await inflight;
 
     // Drain the (stale) queue: without the dedup guard, the re-queued chunk 0

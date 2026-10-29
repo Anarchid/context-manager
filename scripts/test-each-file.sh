@@ -1,22 +1,14 @@
 #!/usr/bin/env bash
 # Runs every compiled test file, dist/test/**/*.test.js, in a node process of
-# its own, as many at once as the machine has CPUs; run it after npm run build,
-# from the repository's root, as CI and the release workflow do. That is what
-# node --test runs in each child, but here nothing between the file and the
-# log reads its output. CI's build-and-test job and the release workflow's test
-# job run the suite this way. On Node 22, node --test's parent can misread the
-# results a child sends it, and then loop forever, when a read of the child's
-# output ends right after a frame's four-byte length and that length's last
-# byte is 0xff (nodejs/node#62693). nodejs/node#62704 fixed that, first in
-# 24.18.0 and 26.2.0, but no 22.x release has the fix, as of 22.23.4
-# (2026-10-21).
-#
-# TEST_EACH_FILE_JOBS, a whole number above 0, sets how many files run at
-# once; 1 runs them one after another. Each file's output is printed under a
-# line naming it, in the files' sorted order, whichever ends first: the
-# earliest file still running prints its output as it comes, and each later
-# one's waits until its turn. So no two files' output mixes, and a file that
-# never ends shows what it has written, as it would run one at a time.
+# its own; run it after npm run build, from the repository's
+# root, as CI and the release workflow do. That is what node --test runs in
+# each child, but here nothing between the file and the log reads its output.
+# CI's build-and-test job and the release workflow's test job run the suite
+# this way. On Node 22, node --test's parent can misread the results a child
+# sends it, and then loop forever, when a read of the child's output ends right
+# after a frame's four-byte length and that length's last byte is 0xff
+# (nodejs/node#62693). nodejs/node#62704 fixed that, first in 24.18.0 and
+# 26.2.0, but no 22.x release has the fix, as of 22.23.4 (2026-10-21).
 #
 # Every compiled test file runs, so these jobs can run more files than npm
 # test's globs reach, never fewer. A failing find or an empty list fails the
@@ -29,14 +21,10 @@ set -euo pipefail
 # Each file here prints that report, whoever runs the script.
 unset NODE_TEST_CONTEXT
 
-jobs=${TEST_EACH_FILE_JOBS:-}
-if [ -z "$jobs" ]; then
-  jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null) || jobs=1
-  case "$jobs" in ''|*[!0-9]*|0*) jobs=1 ;; esac
-fi
+jobs=${TEST_EACH_FILE_JOBS:-$(node -p 'require("node:os").availableParallelism()')}
 case "$jobs" in
   ''|*[!0-9]*|0*)
-    echo "::error::TEST_EACH_FILE_JOBS must be a whole number above 0, not '$jobs'"
+    echo "::error::TEST_EACH_FILE_JOBS must be a whole number above 0, with no leading zero, not '$jobs'"
     exit 1
     ;;
 esac

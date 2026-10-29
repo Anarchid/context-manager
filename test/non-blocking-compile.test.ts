@@ -25,6 +25,9 @@ import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
+const within = (ms: number, why: string): Promise<never> =>
+  new Promise((_, reject) => { setTimeout(() => reject(new Error(why)), ms).unref(); });
+
 const TEST_STORE_PATH = './test-non-blocking-compile';
 
 function cleanup(): void {
@@ -147,7 +150,10 @@ describe('AutobiographicalStrategy — non-blocking compile + uncompressed-chunk
     const ticking = manager.tick();
     try {
       await Promise.race([called, ticking.then(() => { throw new Error('premise: the tick asked for no compression'); })]);
-      await manager.compile({ maxTokens: 100_000, reserveForResponse: 0 });
+      await Promise.race([
+        manager.compile({ maxTokens: 100_000, reserveForResponse: 0 }),
+        within(10_000, 'compile() waited for the compression in flight'),
+      ]);
       assert.equal(answered, false, 'compile() returned while the compression was still unanswered');
     } finally {
       release();

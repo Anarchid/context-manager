@@ -316,7 +316,7 @@ describe('AutobiographicalStrategy: effective-config report', () => {
     );
   });
 
-  it('reports the default each option documents where the caller leaves it out', async () => {
+  it('reports the documented default of each option it names where the caller leaves it out', async () => {
     const plain = (await reportFromInitializing(new AutobiographicalStrategy({ logEffectiveConfig: true }))).reports[0]!.effective;
     assert.deepStrictEqual(
       {

@@ -672,11 +672,9 @@ describe("a sharded body's price is read once per shard", () => {
     messages[3]!.content.push({ type: 'text', text: words } as ContentBlock);
     const grown = strategy.docContext({ messages: [messages[0]!] }, ctx)!.totalTokens;
     assert.ok(grown > after, `the total takes the appended block in (${after} -> ${grown})`);
-    // A recalibrated store's total follows the calibration.
     calibration = 2;
     const recalibrated = strategy.docContext({ messages: [messages[0]!] }, ctx)!.totalTokens;
     assert.ok(recalibrated > grown, `the total follows the calibration (${grown} -> ${recalibrated})`);
-    // Another store's total is its own, as each strategy context's view is.
     const others = messages.map((m) => ({ ...m, content: [...m.content] }));
     others[4]!.content = [{ type: 'text', text: 'short' }] as ContentBlock[];
     const other = strategy.docContext({ messages: [others[0]!] }, { messageStore: { ...store(), getAll: () => others } })!.totalTokens;

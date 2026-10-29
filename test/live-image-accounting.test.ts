@@ -875,6 +875,7 @@ describe("the adaptive strip applies the estimate's verdicts", () => {
       ['Claude', [{ type: 'text', text: 'done' }]],
     ]);
     assert.equal(r.live.length, 6, 'premise: the repair sent the two results apart, each after a call');
+    assert.ok(!r.live.some((data) => data.includes('LARG')), `the large image, which its own verdict strips, went out live: ${JSON.stringify(r.live)}`);
     assert.ok(r.sent <= r.total, `sent ${r.sent}, past the render stats' ${r.total}`);
   });
 
