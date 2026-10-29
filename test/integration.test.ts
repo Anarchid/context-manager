@@ -701,8 +701,8 @@ describe('ContextManager', () => {
 
       const first = agentAlpha.getAllMessages()[0]!;
       new ContextLog(store, { namespace: 'alpha' }).append('User', first.content, first.id, 'copy');
-      assert.strictEqual(new ContextLog(store, { namespace: 'alpha' }).length(), 1);
-      assert.strictEqual(new ContextLog(store, { namespace: 'beta' }).length(), 0);
+      assert.strictEqual(agentAlpha.stats().contextEntryCount, 1);
+      assert.strictEqual(agentBeta.stats().contextEntryCount, 0);
 
       agentAlpha.close();
       agentBeta.close();

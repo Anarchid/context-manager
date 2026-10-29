@@ -168,8 +168,7 @@ describe('Chunk persistence: close-then-compress', () => {
     await manager.close();
   });
 
-  it('persists chunk records when chunks close, so a reopen summarises nothing again', async () => {
-    const path = freshPath();
+  it('persists chunk records when chunks close, so a restart under a drifted targetChunkTokens summarises each closed chunk as it closed', async () => {
     const config = {
       compressionModel: TEST_COMPRESSION_MODEL,
       targetChunkTokens: 100,
@@ -178,20 +177,27 @@ describe('Chunk persistence: close-then-compress', () => {
       hierarchical: true,
       l1HoldbackChunks: 0,
     };
-    {
-      const { membrane } = mockMembrane();
-      const manager = await ContextManager.open({ path, strategy: new AutobiographicalStrategy(config), membrane });
-      for (let i = 0; i < 40; i++) manager.addMessage(i % 2 ? 'agent' : 'user', [t(filler(i))]);
+    /** The numbers of the messages each compression request holds, request by request. */
+    const held = (calls: Array<{ messages: ApiMessage[] }>) => calls.map((c) =>
+      (c.messages.flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '').join(' ').match(/message \d+/g) ?? []).join(','));
+    const reopenedAt = async (targetChunkTokens: number) => {
+      const path = freshPath();
+      const first = mockMembrane();
+      {
+        const manager = await ContextManager.open({ path, strategy: new AutobiographicalStrategy(config), membrane: first.membrane });
+        for (let i = 0; i < 40; i++) manager.addMessage(i % 2 ? 'agent' : 'user', [t(filler(i))]);
+        assert.strictEqual(first.calls.length, 0, 'premise: nothing was summarised before the restart');
+        manager.close();
+      }
+      const fresh = mockMembrane();
+      const manager = await ContextManager.open({ path, strategy: new AutobiographicalStrategy({ ...config, targetChunkTokens }), membrane: fresh.membrane });
       await drain(manager);
-      assert.ok(l1s(manager).length > 0, 'premise: the first open summarised its chunks');
-      await manager.close();
-    }
-
-    const fresh = mockMembrane();
-    const manager = await ContextManager.open({ path, strategy: new AutobiographicalStrategy(config), membrane: fresh.membrane });
-    await drain(manager);
-    assert.strictEqual(fresh.calls.length, 0, `a reopen summarised again (${fresh.calls.length} calls)`);
-    await manager.close();
+      manager.close();
+      return held(fresh.calls);
+    };
+    const asClosed = await reopenedAt(100);
+    assert.ok(asClosed.length > 1, `premise: chunks closed before the restart (${asClosed.length} requests after it)`);
+    assert.deepStrictEqual(await reopenedAt(170), asClosed);
   });
 
   it('restart + config drift does not re-compress covered ground', async () => {
