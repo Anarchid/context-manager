@@ -517,6 +517,9 @@ const COMPRESSION_MARKER =
 
 const RECALL_TOOLS_SHOWN = 5;
 
+/** Latest summaries at a level whose mean prices the next one there (expectedPairCost). */
+const EXPECTED_PAIR_SAMPLE = 12;
+
 /**
  * The interstitial text between two summaries in the legacy combined recall
  * answer (`positionedRecallPairs: false`). Hoisted out of
@@ -6308,6 +6311,64 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * Whether the head of the merge queue takes its turn before the L1 of
+   * `chunk` because it would take more off the floor (#415): the plan's
+   * cheapest form of the store, which an adaptive compile refuses once it
+   * passes the hard budget. The lane runs one call at a time, and L1 work
+   * otherwise always goes first, so an agent that closes chunks as fast as
+   * calls complete keeps a chunk queued at every tick and its merges never
+   * run: the pyramid stops deepening while unmerged L1s fill the middle
+   * (#412). An L1 takes its chunk's raw tokens down to one recall pair; a
+   * merge takes its sources' pairs down to one, which with the default
+   * summary target is several times as much. A merge that has failed, waits
+   * on a hold or on the host's tools, or would land as planned under a drain
+   * (landsAsPlanned) keeps its usual place.
+   */
+  private mergeTakesTurnByRelief(chunk: Chunk | undefined, store: MessageStoreView): boolean {
+    if (!chunk || !this.config.adaptiveResolution || !this.config.hierarchical || this.landsAsPlanned()) return false;
+    const head = this.mergeQueue[0];
+    if (!head) return false;
+    const key = mergeFailureKey(head);
+    if (this.mergeFailureOrder.has(key) || this.toolsDeferredMerge === key) return false;
+    if (this.mergeBlockedByHold(head.sourceIds, store)) return false;
+    const mergeRelief = this.mergeRelief(head);
+    return mergeRelief !== null && mergeRelief > this.chunkRelief(chunk);
+  }
+
+  /** Tokens an L1 of `chunk` would take off the floor: its raw tokens, less
+   *  the recall pair an L1 renders as. */
+  protected chunkRelief(chunk: Chunk): number {
+    return chunk.tokens - this.expectedPairCost(1);
+  }
+
+  /** Tokens a merge would take off the floor: its sources' recall pairs, less
+   *  the one its parent renders as. Null when a source isn't held. */
+  protected mergeRelief(merge: { level: number; sourceIds: readonly string[] }): number | null {
+    let sources = 0;
+    for (const id of merge.sourceIds) {
+      const source = this.summaryById(id);
+      if (!source) return null;
+      sources += this.recallPairCost(source);
+    }
+    return sources - this.expectedPairCost(merge.level);
+  }
+
+  /** What a new summary at `level` is expected to cost as a recall pair: the
+   *  mean of the latest summaries at that level, or the summary target before
+   *  any exists. */
+  private expectedPairCost(level: number): number {
+    let count = 0;
+    let total = 0;
+    for (let i = this.summaries.length - 1; i >= 0 && count < EXPECTED_PAIR_SAMPLE; i--) {
+      const s = this.summaries[i]!;
+      if (s.level !== level) continue;
+      total += this.recallPairCost(s);
+      count++;
+    }
+    return count > 0 ? total / count : (this.config.summaryTargetTokens ?? 2000);
+  }
+
+  /**
    * An answer to one of the lane's calls ends its route's pause and backoff:
    * the pause of the membrane instance and model the answered call went
    * through, on whatever branch. Another route's answer says nothing about this one, so
@@ -7666,6 +7727,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // A chunk that failed gives its turn to a merge that hasn't failed since.
       const failedAt = this.compressionFailureOrder.get(key);
       if (failedAt !== undefined && this.mergeTakesTurnBefore(failedAt, ctx.messageStore)) break;
+      // A merge that takes more off the floor than this chunk's L1 goes first.
+      if (this.mergeTakesTurnByRelief(this.chunks[this.compressionQueue[queueIndex]!], ctx.messageStore)) break;
       const [chunkIndex] = this.compressionQueue.splice(queueIndex, 1);
       const queueGeneration = this.compressionQueueGeneration;
       this._drainProgress++; // consumed a queue item (real work or stale-cleanup)
