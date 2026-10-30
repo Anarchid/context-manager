@@ -70,7 +70,7 @@ import { FlatProfileStrategy } from '../adaptive/strategies/flat-profile.js';
 import { KvStableStrategy } from '../adaptive/strategies/kv-stable.js';
 import { reportOverlap } from '../adaptive/kv-control.js';
 import { KvUnifiedStrategy, ceilingMark, type KvUnifiedReuse } from '../adaptive/strategies/kv-unified.js';
-import { heldLevelPin, type CanonicalSummaryForest } from '../adaptive/kv-unified.js';
+import { heldLevelPin, CanonicalSummaryForest } from '../adaptive/kv-unified.js';
 import { SummaryTree } from '../adaptive/summary-tree.js';
 import { renderLayout, type RenderLayout } from '../adaptive/render-offsets.js';
 import { describeFoldDiff, formatFoldDiff, type FoldDiff, type RequestDivergence } from '../adaptive/fold-diff.js';
@@ -6369,6 +6369,59 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   }
 
   /**
+   * The floor (#415): the cheapest plan the summaries held allow for these
+   * inputs, head and tail included, in the plan's units. An adaptive compile
+   * refuses once it passes the hard budget, whatever the folding strategy
+   * picks, so the distance between the two is how near the store is to its
+   * first refusal. Null where the forest can't be built for these inputs;
+   * the figure is a report and never fails a compile.
+   */
+  private floorTokens(inputs: PickerInputs): number | null {
+    try {
+      const kv = this.config.foldingStrategy === 'kv-unified' ? this.config.kvUnified : undefined;
+      const reused = kv ? this.kvUnifiedReuse.forest : undefined;
+      const forest = reused?.builtFrom(inputs)
+        ? reused
+        : new CanonicalSummaryForest(inputs, {
+            treeifyNonContiguousSummaries: kv?.treeifyNonContiguousSummaries,
+            preserveGapBearingSummaries: kv?.preserveGapBearingSummaries,
+          });
+      const floor = forest.minimumTokens();
+      return floor.feasible ? floor.floorTokens : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** What the queued work is expected to take off the floor once it lands:
+   *  each queued chunk's L1 and each queued merge, as the lane prices them
+   *  (chunkRelief, mergeRelief), counting only work that relieves. Work tick
+   *  won't turn into a summary counts as zero: a chunk the compression
+   *  quarantine holds, which every rebuild queues again and tick skips, and a
+   *  merge holding a source an operator hold or a merge-quarantine record
+   *  keeps out (mergeHeldSourceIds), which tick drops. Where the quarantine
+   *  can't be read, no chunk counts, so the figure errs low: a host that waits
+   *  on it waits for nothing less often. Merges the queue doesn't hold yet
+   *  aren't counted. */
+  protected queuedReliefTokens(): number {
+    const quarantined = this.quarantinedChunkSources();
+    const held = this.mergeHeldSourceIds();
+    let total = 0;
+    if (quarantined) {
+      for (const index of this.compressionQueue) {
+        const chunk = this.chunks[index];
+        if (!chunk || chunk.compressed || quarantined.has(sha256Json(chunk.messages.map((m) => m.id)))) continue;
+        total += Math.max(0, this.chunkRelief(chunk));
+      }
+    }
+    for (const merge of this.mergeQueue) {
+      if (merge.sourceIds.some((id) => held.has(id))) continue;
+      total += Math.max(0, this.mergeRelief(merge) ?? 0);
+    }
+    return Math.round(total);
+  }
+
+  /**
    * An answer to one of the lane's calls ends its route's pause and backoff:
    * the pause of the membrane instance and model the answered call went
    * through, on whatever branch. Another route's answer says nothing about this one, so
@@ -9123,6 +9176,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     this._emittedSummaryIds = new Set();
     this._plannedTokens = null;
     this._plannedMeta = null;
+    this._plannedFloor = null;
     this._lastFoldDiff = null;
     this._rs = {
       head: { messages: 0, tokens: 0 },
@@ -9154,6 +9208,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** The picker's projected total for this compile (planner side). */
   private _plannedTokens: number | null = null;
   private _plannedMeta: { budgetMet: boolean; exhausted: boolean; moves: number; solver: string } | null = null;
+  /** This select's floor and the budget its plan check refuses above (#415). */
+  private _plannedFloor: { floorTokens: number; hardBudget: number } | null = null;
   /** `performance.now()` at the top of the current `select()`; rsEnd() stamps
    *  the base `select()`'s elapsed time on the plan-vs-actual line from it. */
   private _selectStartedAt = 0;
@@ -9262,6 +9318,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       // Dry runs and previews log the line too, and skip work a live compile
       // does, so a journal reader must be able to drop them.
       const dryRun = this._dryRunSelect;
+      const floor = this._plannedFloor;
+      const queuedRelief = floor ? this.queuedReliefTokens() : undefined;
       r.planVsActual = {
         planned,
         actual,
@@ -9276,6 +9334,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ...(ceiling ? { ceiling } : {}),
         ...(dryRun ? { dryRun: true as const } : {}),
         ...(this._lastFoldDiff ? { foldDiff: this._lastFoldDiff } : {}),
+        ...(floor ? { floorTokens: floor.floorTokens, hardBudget: floor.hardBudget, queuedReliefTokens: queuedRelief } : {}),
       };
       // Loud only when the emitter OVERRUNS the plan — that is the direction
       // that costs the tail. Under-spend is harmless slack.
@@ -9286,6 +9345,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
         ` moves=${m?.moves} solver=${m?.solver} messages=${messages} compileMs=${compileMs}` +
         (solveMs !== undefined ? ` solveMs=${solveMs}` : '') +
         (ceiling ? ` ceiling=${ceiling}` : '') +
+        (floor ? ` floor=${floor.floorTokens} hardBudget=${floor.hardBudget} queuedRelief=${queuedRelief}` : '') +
         (dryRun ? ' dryRun=true' : '');
       if (loud) this.diag.warn(`${line} — emitter overran the plan; the overrun is paid by the recent window`);
       else this.diag.error(line);
@@ -13519,6 +13579,7 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       diagnostics: {
         ...opts.diagnostics,
         ...this.summaryInventoryDiagnostics(),
+        ...(this._plannedFloor ? { floorTokens: this._plannedFloor.floorTokens, queuedReliefTokens: this.queuedReliefTokens() } : {}),
         configuredBudget: budget.maxTokens,
         reserveForResponse: budget.reserveForResponse,
         inputBudget: budget.maxTokens - budget.reserveForResponse,
@@ -14034,6 +14095,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
     // compare it against what was actually committed (its other figures,
     // `_plannedMeta`, once the changes are staged below).
     this._plannedTokens = result.finalTokens;
+    const floorTokens = this.floorTokens(pickerInputs);
+    this._plannedFloor = floorTokens === null ? null : { floorTokens, hardBudget: rejectionBudget };
 
     // Every trust-region override is loud (design §13.4) — silence was half
     // of the 2026-07-12 incident.

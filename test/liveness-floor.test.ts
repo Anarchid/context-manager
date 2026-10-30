@@ -16,6 +16,9 @@
  *   refused at its deepest available level (#412).
  * - Through bursts the lane can't keep up with, followed by idle stretches
  *   that let it catch up, the compile stays live.
+ * - Each adaptive compile reports its floor beside the hard budget, and the
+ *   floor drops as relief lands; a refusal names its floor and the relief
+ *   the queue holds.
  */
 
 import { describe, it, after } from 'node:test';
@@ -62,7 +65,7 @@ interface Reader {
   strategy: AutobiographicalStrategy;
   calls: { l1: number; merge: number };
   /** Add one turn of `reads` tool reads. */
-  read(reads: number): void;
+  read(reads: number, passage?: string): void;
   /** Grant the lane `n` ticks (one compression call each, at most). */
   grant(n: number): Promise<void>;
   /** Tick until nothing is queued, bounded. */
@@ -71,11 +74,14 @@ interface Reader {
 
 const settle = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };
 
-async function openReader(config: Record<string, unknown> = {}, summaryWords = 4): Promise<Reader> {
+async function openReader(config: Record<string, unknown> = {}, summaryWords = 4, refuse?: RegExp): Promise<Reader> {
   cleanup();
   const calls = { l1: 0, merge: 0 };
   const membrane = {
     complete: async (request: { messages?: unknown[] }) => {
+      if (refuse?.test(JSON.stringify(request.messages ?? []))) {
+        return { stopReason: 'refusal', content: [], usage: { input_tokens: 100, output_tokens: 0 } };
+      }
       const last = JSON.stringify(request.messages?.[request.messages.length - 1] ?? '');
       if (/consolidat/i.test(last)) calls.merge++;
       else calls.l1++;
@@ -105,11 +111,11 @@ async function openReader(config: Record<string, unknown> = {}, summaryWords = 4
     manager,
     strategy,
     calls,
-    read(reads: number) {
+    read(reads: number, passage = '') {
       for (let k = 0; k < reads; k++, n++) {
         const id = `read-${n}`;
         manager.addMessage('agent', [t('reading on'), { type: 'tool_use', id, name: 'read', input: { offset: n } } as ContentBlock]);
-        manager.addMessage('user', [{ type: 'tool_result', toolUseId: id, content: `passage ${n}: ${words(12)}` } as ContentBlock]);
+        manager.addMessage('user', [{ type: 'tool_result', toolUseId: id, content: `passage ${n}: ${passage}${words(12)}` } as ContentBlock]);
       }
     },
     async grant(ticks: number) {
@@ -176,6 +182,69 @@ describe('Adaptive compile liveness against the floor (#415)', () => {
     assert.ok(totalChunks >= BURST_TURNS * 0.9, `premise: the reader closed about a chunk a turn, against one call a turn (${totalChunks} chunks)`);
     assert.ok(reader.calls.merge > 0, 'premise: merges ran');
     assert.deepStrictEqual(refusals.slice(0, 3), [], `${refusals.length} of ${BURST_TURNS} compiles refused`);
+    reader.manager.close();
+  });
+
+  it('reports the floor beside the hard budget, under the plan, dropping as relief lands', async () => {
+    const reader = await openReader();
+    const budget = { maxTokens: 20_000, reserveForResponse: 0 };
+    reader.read(24);
+    await reader.manager.compile(budget);
+    const before = reader.manager.getRenderStats()?.planVsActual;
+    assert.ok(before?.floorTokens !== undefined, 'the plan reports its floor');
+    assert.strictEqual(before.hardBudget, Math.floor(20_000 * 1.02), 'beside the budget it refuses above');
+    assert.ok(before.floorTokens <= before.planned, `the floor (${before.floorTokens}) is at most the plan (${before.planned})`);
+    assert.ok((before.queuedReliefTokens ?? 0) > 0, `queued work is counted as relief (${before.queuedReliefTokens})`);
+    await reader.drain();
+    await reader.manager.compile(budget);
+    const after = reader.manager.getRenderStats()?.planVsActual;
+    assert.ok(after?.floorTokens !== undefined);
+    assert.ok(
+      after.floorTokens < before.floorTokens,
+      `the floor drops once the queued work lands (${before.floorTokens} → ${after.floorTokens})`,
+    );
+    assert.strictEqual(after.queuedReliefTokens, 0, 'with nothing queued, no relief is counted');
+    reader.manager.close();
+  });
+
+  it('counts a chunk the compression quarantine holds as no relief, though it stays queued', async () => {
+    const reader = await openReader(
+      // Source-only requests, so the chunks after the refused one don't carry
+      // it raw and get refused too (#346).
+      { recentWindowTokens: 0, compressionRefusalCurveFallbacks: 0, mergeThreshold: 99, compressionSourceOnly: true },
+      4,
+      /UNSUMMARIZABLE/,
+    );
+    reader.read(6);
+    await reader.drain();
+    reader.read(2, 'UNSUMMARIZABLE ');
+    reader.read(3); // closes the refused chunk
+    const quarantined = () =>
+      (reader.strategy as unknown as { quarantinedChunkSources(): Set<string> | undefined }).quarantinedChunkSources()?.size ?? 0;
+    for (let k = 0; k < 40 && quarantined() === 0; k++) await reader.grant(1);
+    await reader.manager.compile({ maxTokens: 20_000, reserveForResponse: 0 });
+    const stats = reader.manager.getRenderStats()?.planVsActual;
+    assert.ok(quarantined() > 0, 'premise: the refused chunk is quarantined');
+    assert.ok(reader.strategy.getProgressSnapshot().l1QueueLength > 0, 'premise: the rebuild queued it again');
+    assert.strictEqual(stats?.queuedReliefTokens, 0, 'a chunk tick will skip relieves nothing');
+    reader.manager.close();
+  });
+
+  it('names the floor and the queued relief in a refusal', async () => {
+    const reader = await openReader();
+    reader.read(24);
+    let refusal: OverBudgetError | undefined;
+    try {
+      await reader.manager.compile({ maxTokens: 600, reserveForResponse: 0 });
+    } catch (error) {
+      if (error instanceof OverBudgetError) refusal = error;
+      else throw error;
+    }
+    assert.ok(refusal, 'premise: the compile refused');
+    const { floorTokens, queuedReliefTokens } = refusal.diagnostics;
+    assert.ok(floorTokens !== undefined && floorTokens > refusal.budget, `its floor (${floorTokens}) is over the budget (${refusal.budget})`);
+    assert.ok((queuedReliefTokens ?? 0) > 0, `the queue's relief is named (${queuedReliefTokens})`);
+    assert.match(refusal.message, new RegExp(`floor=${floorTokens}, queued relief=${queuedReliefTokens}`));
     reader.manager.close();
   });
 });
