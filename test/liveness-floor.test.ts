@@ -249,6 +249,102 @@ describe('Adaptive compile liveness against the floor (#415)', () => {
   });
 });
 
+// The relief rule's exclusions: where the merge at the head keeps its usual
+// place behind the queued L1s. A store of six unmerged L1s, a merge of them
+// queued by hand (mergeThreshold 99 queues none), and closed chunks queued
+// after them; each case reads which kind of call the next tick makes.
+class OrderProbe extends AutobiographicalStrategy {
+  drainMode = false;
+  queueMergeOf(sourceIds: string[]): void {
+    this.enqueueMerge({ level: 2, sourceIds });
+  }
+  protected override landsAsPlanned(): boolean {
+    return this.drainMode;
+  }
+}
+
+async function openOrder(opts: { adaptive?: boolean; refuseMerges?: boolean; drainMode?: boolean } = {}) {
+  cleanup();
+  const calls: Array<'l1' | 'merge'> = [];
+  const membrane = {
+    complete: async (request: { messages?: unknown[] }) => {
+      const last = JSON.stringify(request.messages?.[request.messages.length - 1] ?? '');
+      const merge = /consolidat/i.test(last);
+      calls.push(merge ? 'merge' : 'l1');
+      if (merge && opts.refuseMerges) return { stopReason: 'refusal', content: [], usage: { input_tokens: 100, output_tokens: 0 } };
+      return { stopReason: 'end_turn', content: [t(`a recollection of what happened, ${words(4)}`)], usage: { input_tokens: 100, output_tokens: 40 } };
+    },
+  };
+  const adaptive = opts.adaptive ?? true;
+  const strategy = new OrderProbe({
+    compressionModel: 'test-compression-model',
+    adaptiveResolution: adaptive,
+    ...(adaptive ? { foldingStrategy: 'kv-unified', kvUnified: { ...KV_UNIFIED, policy: { ...KV_UNIFIED.policy } } } : {}),
+    targetChunkTokens: 100,
+    summaryTargetTokens: 40,
+    headWindowTokens: 0,
+    recentWindowTokens: 0,
+    mergeThreshold: 99,
+    autoTickOnNewMessage: false,
+  } as ConstructorParameters<typeof AutobiographicalStrategy>[0]);
+  strategy.drainMode = opts.drainMode ?? false;
+  const manager = await ContextManager.open({ path: STORE, strategy, membrane: membrane as never });
+  manager.setToolDefinitions(TOOLS);
+  let n = 0;
+  const read = (reads: number) => {
+    for (let k = 0; k < reads; k++, n++) {
+      const id = `read-${n}`;
+      manager.addMessage('agent', [t('reading on'), { type: 'tool_use', id, name: 'read', input: { offset: n } } as ContentBlock]);
+      manager.addMessage('user', [{ type: 'tool_result', toolUseId: id, content: `passage ${n}: ${words(12)}` } as ContentBlock]);
+    }
+  };
+  const tickOnce = async () => { await manager.tick(); await settle(); };
+  // About two reads close a chunk.
+  read(16);
+  for (let k = 0; k < 40 && !manager.isReady(); k++) await tickOnce();
+  const l1s = manager.getSummariesInRange({ level: 1 });
+  assert.ok(l1s.length >= 6, `premise: six L1s to merge (${l1s.length})`);
+  strategy.queueMergeOf(l1s.slice(0, 6).map((summary) => summary.id));
+  read(5);
+  assert.ok(strategy.getProgressSnapshot().l1QueueLength > 0, 'premise: chunks wait for L1');
+  assert.strictEqual(strategy.getProgressSnapshot().mergeQueueLength, 1, 'premise: the merge is queued');
+  calls.length = 0;
+  return { manager, strategy, calls, tickOnce };
+}
+
+describe('The relief rule leaves the usual order where it should (#415)', () => {
+  after(cleanup);
+
+  it('puts the queued merge first in the plain case (control)', async () => {
+    const probe = await openOrder();
+    await probe.tickOnce();
+    assert.deepStrictEqual(probe.calls, ['merge']);
+    probe.manager.close();
+  });
+
+  it('runs the next L1 before a merge the model has refused once', async () => {
+    const probe = await openOrder({ refuseMerges: true });
+    await probe.tickOnce();
+    await probe.tickOnce();
+    assert.deepStrictEqual(probe.calls, ['merge', 'l1'], 'the refused merge is retried only behind the queued L1s');
+    probe.manager.close();
+  });
+
+  it('runs the next L1 first under the drain script (landsAsPlanned)', async () => {
+    const probe = await openOrder({ drainMode: true });
+    await probe.tickOnce();
+    assert.deepStrictEqual(probe.calls, ['l1']);
+    probe.manager.close();
+  });
+
+  it('runs the next L1 first without adaptive resolution', async () => {
+    const probe = await openOrder({ adaptive: false });
+    await probe.tickOnce();
+    assert.deepStrictEqual(probe.calls, ['l1']);
+    probe.manager.close();
+  });
+});
+
 // The burst scenario's geometry: two reads a turn (about a chunk) against one
 // call, the lane drained every BURST_LENGTH turns, at a budget the floor fits
 // under only while merges keep landing during the bursts. On main at

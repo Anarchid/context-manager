@@ -11,7 +11,7 @@
   against the chunk's raw tokens less the pair its L1 renders as, each new
   summary priced at the mean of the latest at its level. With the default
   `summaryTargetTokens` of 2,000 and 3,000-token chunks, that is nearly
-  always the merge. A merge that has failed, waits on a hold or on the
-  host's tools keeps its place behind the L1s, as does every merge under
-  `scripts/drain-autobiographical.ts`. The calls made are the same; only
+  always the merge. A merge that has failed or been refused before, or
+  waits on a hold or on the host's tools, keeps its place behind the L1s,
+  as does every merge under `scripts/drain-autobiographical.ts`. The calls made are the same; only
   their order changes, and only while both kinds of work are queued.

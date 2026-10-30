@@ -6320,14 +6320,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
    * run: the pyramid stops deepening while unmerged L1s fill the middle
    * (#412). An L1 takes its chunk's raw tokens down to one recall pair; a
    * merge takes its sources' pairs down to one, which with the default
-   * summary target is several times as much. A merge that has failed, waits
-   * on a hold or on the host's tools, or would land as planned under a drain
-   * (landsAsPlanned) keeps its usual place.
+   * summary target is several times as much. A merge that has failed (a
+   * transient failure, or an answer recordMergeRejection counted as an
+   * attempt), waits on a hold or on the host's tools, or would land as
+   * planned under a drain (landsAsPlanned) keeps its usual place.
    */
   private mergeTakesTurnByRelief(chunk: Chunk | undefined, store: MessageStoreView): boolean {
     if (!chunk || !this.config.adaptiveResolution || !this.config.hierarchical || this.landsAsPlanned()) return false;
     const head = this.mergeQueue[0];
     if (!head) return false;
+    if ((head.attempts ?? 0) > 0 || head.hadRefusal) return false;
     const key = mergeFailureKey(head);
     if (this.mergeFailureOrder.has(key) || this.toolsDeferredMerge === key) return false;
     if (this.mergeBlockedByHold(head.sourceIds, store)) return false;
