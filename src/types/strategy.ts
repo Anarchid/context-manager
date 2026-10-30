@@ -1156,9 +1156,12 @@ export interface RenderStats {
      *  the recall pair its L1 is expected to render as, and each queued
      *  merge's sources' pairs less its parent's. Work that wouldn't shrink
      *  the floor counts as zero, as does work tick won't turn into a summary:
-     *  a chunk the compression quarantine holds, and a merge holding a source
-     *  a hold or a merge-quarantine record keeps out. Merges not yet queued
-     *  aren't counted (`queuedRelief=`). Set with `floorTokens`. */
+     *  a chunk the compression quarantine holds or deferred for the host's
+     *  tools; every chunk from the first a compression
+     *  hold reaches; a merge holding a source a hold or a merge-quarantine
+     *  record keeps out, and every merge from the first a hold blocks. Merges
+     *  not yet queued aren't counted (`queuedRelief=`). Set with
+     *  `floorTokens`. */
     queuedReliefTokens?: number;
   };
 }

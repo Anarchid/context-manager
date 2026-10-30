@@ -6339,26 +6339,29 @@ export class AutobiographicalStrategy implements ResettableStrategy {
 
   /** Tokens an L1 of `chunk` would take off the floor: its raw tokens, less
    *  the recall pair an L1 renders as. */
-  protected chunkRelief(chunk: Chunk): number {
-    return chunk.tokens - this.expectedPairCost(1);
+  protected chunkRelief(chunk: Chunk, expected?: Map<number, number>): number {
+    return chunk.tokens - this.expectedPairCost(1, expected);
   }
 
   /** Tokens a merge would take off the floor: its sources' recall pairs, less
    *  the one its parent renders as. Null when a source isn't held. */
-  protected mergeRelief(merge: { level: number; sourceIds: readonly string[] }): number | null {
+  protected mergeRelief(merge: { level: number; sourceIds: readonly string[] }, expected?: Map<number, number>): number | null {
     let sources = 0;
     for (const id of merge.sourceIds) {
       const source = this.summaryById(id);
       if (!source) return null;
       sources += this.recallPairCost(source);
     }
-    return sources - this.expectedPairCost(merge.level);
+    return sources - this.expectedPairCost(merge.level, expected);
   }
 
   /** What a new summary at `level` is expected to cost as a recall pair: the
    *  mean of the latest summaries at that level, or the summary target before
-   *  any exists. */
-  private expectedPairCost(level: number): number {
+   *  any exists. A caller pricing many items passes `expected`, which keeps
+   *  each level's figure for the pass. */
+  private expectedPairCost(level: number, expected?: Map<number, number>): number {
+    const known = expected?.get(level);
+    if (known !== undefined) return known;
     let count = 0;
     let total = 0;
     for (let i = this.summaries.length - 1; i >= 0 && count < EXPECTED_PAIR_SAMPLE; i--) {
@@ -6367,7 +6370,9 @@ export class AutobiographicalStrategy implements ResettableStrategy {
       total += this.recallPairCost(s);
       count++;
     }
-    return count > 0 ? total / count : (this.config.summaryTargetTokens ?? 2000);
+    const cost = count > 0 ? total / count : (this.config.summaryTargetTokens ?? 2000);
+    expected?.set(level, cost);
+    return cost;
   }
 
   /**
@@ -6389,8 +6394,16 @@ export class AutobiographicalStrategy implements ResettableStrategy {
             preserveGapBearingSummaries: kv?.preserveGapBearingSummaries,
           });
       const floor = forest.minimumTokens();
+      this.floorFailure = undefined;
       return floor.feasible ? floor.floorTokens : null;
-    } catch {
+    } catch (error) {
+      // Said once a run of failures with the same cause, as the report goes
+      // missing from every compile while it lasts.
+      const cause = describeCompressionFailure(error);
+      if (cause !== this.floorFailure) {
+        this.floorFailure = cause;
+        this.diag.warn(`[autobiographical] floor not computed, so floor= is left off the plan line until it is: ${cause}`);
+      }
       return null;
     }
   }
@@ -6398,27 +6411,53 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   /** What the queued work is expected to take off the floor once it lands:
    *  each queued chunk's L1 and each queued merge, as the lane prices them
    *  (chunkRelief, mergeRelief), counting only work that relieves. Work tick
-   *  won't turn into a summary counts as zero: a chunk the compression
-   *  quarantine holds, which every rebuild queues again and tick skips, and a
-   *  merge holding a source an operator hold or a merge-quarantine record
-   *  keeps out (mergeHeldSourceIds), which tick drops. Where the quarantine
-   *  can't be read, no chunk counts, so the figure errs low: a host that waits
-   *  on it waits for nothing less often. Merges the queue doesn't hold yet
-   *  aren't counted. */
+   *  won't turn into a summary counts as zero, by the gates tick and
+   *  compressionWorkQueued read:
+   *  - a chunk the compression quarantine holds, which every rebuild queues
+   *    again and tick skips, and one deferred for the host's tool
+   *    definitions;
+   *  - from the first chunk a compression hold reaches, every chunk, since
+   *    tick stops there until the hold is released;
+   *  - a merge holding a source an operator hold or a merge-quarantine record
+   *    keeps out (mergeHeldSourceIds), which tick drops, and from the first
+   *    merge a hold blocks, every merge;
+   *  - every merge without a compression model, outside `hierarchical`, or
+   *    while the family waits for the host's tools.
+   *  Where the quarantine can't be read, no chunk counts, so the figure errs
+   *  low: a host that waits on it waits for nothing less often. Merges the
+   *  queue doesn't hold yet aren't counted. Unlike compressionWorkQueued it
+   *  doesn't ask which queued messages the selection can fold, which would
+   *  price every message again on each compile: the queue holds the
+   *  chunker's compressible messages, less any a raw pin placed since keeps
+   *  raw. */
   protected queuedReliefTokens(): number {
+    const store = this.hostContext?.messageStore;
+    const tools = this.hostContext?.tools;
     const quarantined = this.quarantinedChunkSources();
-    const held = this.mergeHeldSourceIds();
+    const heldSources = this.mergeHeldSourceIds();
+    const blocked = store ? this.holdBlockedIds(store) : null;
+    const deferredForTools: (chunk: Chunk) => boolean =
+      (tools?.length ?? 0) > 0 ? () => false
+        : isToolsLessRefusingSummarizer(this.config.compressionModel ?? '') ? () => true
+          : store ? this.requestCarriesToolBlocks(store) : () => false;
+    const expected = new Map<number, number>();
     let total = 0;
     if (quarantined) {
       for (const index of this.compressionQueue) {
         const chunk = this.chunks[index];
-        if (!chunk || chunk.compressed || quarantined.has(sha256Json(chunk.messages.map((m) => m.id)))) continue;
-        total += Math.max(0, this.chunkRelief(chunk));
+        if (!chunk || chunk.compressed) continue;
+        if (this.chunkHasHeldMessage(chunk, blocked)) break;
+        if (this.toolsDeferredChunks.has(this.chunkKey(chunk)) || deferredForTools(chunk)) continue;
+        if (quarantined.has(sha256Json(chunk.messages.map((m) => m.id)))) continue;
+        total += Math.max(0, this.chunkRelief(chunk, expected));
       }
     }
-    for (const merge of this.mergeQueue) {
-      if (merge.sourceIds.some((id) => held.has(id))) continue;
-      total += Math.max(0, this.mergeRelief(merge) ?? 0);
+    if (this.config.hierarchical && this.config.compressionModel && !this.familyWaitsForTools(tools)) {
+      for (const merge of this.mergeQueue) {
+        if (store && this.mergeBlockedByHold(merge.sourceIds, store, blocked)) break;
+        if (merge.sourceIds.some((id) => heldSources.has(id))) continue;
+        total += Math.max(0, this.mergeRelief(merge, expected) ?? 0);
+      }
     }
     return Math.round(total);
   }
@@ -9212,6 +9251,8 @@ export class AutobiographicalStrategy implements ResettableStrategy {
   private _plannedMeta: { budgetMet: boolean; exhausted: boolean; moves: number; solver: string } | null = null;
   /** This select's floor and the budget its plan check refuses above (#415). */
   private _plannedFloor: { floorTokens: number; hardBudget: number } | null = null;
+  /** The cause of the last floor computation that failed, while it keeps failing (floorTokens). */
+  private floorFailure: string | undefined;
   /** `performance.now()` at the top of the current `select()`; rsEnd() stamps
    *  the base `select()`'s elapsed time on the plan-vs-actual line from it. */
   private _selectStartedAt = 0;

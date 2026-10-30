@@ -343,6 +343,23 @@ describe('The relief rule leaves the usual order where it should (#415)', () => 
     assert.deepStrictEqual(probe.calls, ['l1']);
     probe.manager.close();
   });
+
+  it('counts a queued merge holding a held source as no relief', async () => {
+    const probe = await openOrder({ drainMode: true });
+    // Under the drain script the merge waits behind the L1s, so the chunks
+    // compress and the merge stays queued.
+    for (let k = 0; k < 40 && probe.strategy.getProgressSnapshot().l1QueueLength > 0; k++) await probe.tickOnce();
+    assert.strictEqual(probe.strategy.getProgressSnapshot().mergeQueueLength, 1, 'premise: the merge is still queued');
+    const budget = { maxTokens: 20_000, reserveForResponse: 0 };
+    await probe.manager.compile(budget);
+    const open = probe.manager.getRenderStats()?.planVsActual?.queuedReliefTokens ?? 0;
+    assert.ok(open > 0, `premise: the merge alone counts as relief (${open})`);
+    const sourceId = (probe.strategy as unknown as { mergeQueue: Array<{ sourceIds: string[] }> }).mergeQueue[0]!.sourceIds[0]!;
+    (probe.strategy as unknown as { config: { mergeHoldSummaryIds?: string[] } }).config.mergeHoldSummaryIds = [sourceId];
+    await probe.manager.compile(budget);
+    assert.strictEqual(probe.manager.getRenderStats()?.planVsActual?.queuedReliefTokens, 0, 'a merge tick will drop relieves nothing');
+    probe.manager.close();
+  });
 });
 
 // The burst scenario's geometry: two reads a turn (about a chunk) against one
