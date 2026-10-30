@@ -67,11 +67,13 @@ export interface OverBudgetDiagnostics {
    * head and tail included (#415). Under kv-unified, at or under the budget a
    * plan that fits exists, so the refusal isn't for want of summaries.
    * Outside kv-unified the floor counts no lock and is a lower bound: a floor
-   * over the budget means every compile refuses, and one at or under it
-   * doesn't promise a plan fits. Over the budget, no plan fits until the
-   * floor drops under the budget or the budget rises, as new summaries, a
-   * smaller tail, fewer messages, or a released pin or lock that kept a
-   * message from its cheapest form can bring about. Absent where it couldn't
+   * over `hardBudget` (`inputBudget` with `overBudgetGraceRatio` added, the
+   * plan size above which a compile refuses, as `RenderStats` reports it)
+   * means every compile refuses, and one at or under it doesn't promise a
+   * plan fits. Over `hardBudget`, no plan fits until the floor drops under it
+   * or the budget rises, as new summaries, a smaller tail, fewer messages, or
+   * a released pin or lock that kept a message from its cheapest form can
+   * bring about. Absent where it couldn't
    * be computed, and on a refusal that comes before the plan, as the head
    * and tail reservation's does.
    */
@@ -79,7 +81,7 @@ export interface OverBudgetDiagnostics {
   /**
    * Under adaptive resolution, what the queued compression work is expected
    * to take off `floorTokens` once it lands (RenderStats' `queuedReliefTokens`).
-   * It's an estimate, so a floor that stays over the budget less this much
+   * It's an estimate, so a floor that stays over `hardBudget` less this much
    * isn't expected to be cleared by draining the queue alone.
    */
   queuedReliefTokens?: number;
