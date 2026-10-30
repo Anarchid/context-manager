@@ -263,15 +263,21 @@ class OrderProbe extends AutobiographicalStrategy {
   }
 }
 
-async function openOrder(opts: { adaptive?: boolean; refuseMerges?: boolean; drainMode?: boolean } = {}) {
+async function openOrder(opts: { adaptive?: boolean; refuseMerges?: boolean; truncateMerges?: boolean; failFirstMerge?: boolean; drainMode?: boolean } = {}) {
   cleanup();
   const calls: Array<'l1' | 'merge'> = [];
+  let mergeFailed = false;
   const membrane = {
     complete: async (request: { messages?: unknown[] }) => {
       const last = JSON.stringify(request.messages?.[request.messages.length - 1] ?? '');
       const merge = /consolidat/i.test(last);
       calls.push(merge ? 'merge' : 'l1');
       if (merge && opts.refuseMerges) return { stopReason: 'refusal', content: [], usage: { input_tokens: 100, output_tokens: 0 } };
+      if (merge && opts.truncateMerges) return { stopReason: 'max_tokens', content: [t(`a recollection cut off ${words(2)}`)], usage: { input_tokens: 100, output_tokens: 40 } };
+      if (merge && opts.failFirstMerge && !mergeFailed) {
+        mergeFailed = true;
+        throw Object.assign(new Error('connection reset'), { type: 'network', retryable: true });
+      }
       return { stopReason: 'end_turn', content: [t(`a recollection of what happened, ${words(4)}`)], usage: { input_tokens: 100, output_tokens: 40 } };
     },
   };
@@ -325,8 +331,30 @@ describe('The relief rule leaves the usual order where it should (#415)', () => 
   it('runs the next L1 before a merge the model has refused once', async () => {
     const probe = await openOrder({ refuseMerges: true });
     await probe.tickOnce();
+    assert.strictEqual(probe.strategy.getProgressSnapshot().mergeQueueLength, 1, 'premise: the refused merge is still queued');
     await probe.tickOnce();
     assert.deepStrictEqual(probe.calls, ['merge', 'l1'], 'the refused merge is retried only behind the queued L1s');
+    probe.manager.close();
+  });
+
+  it('runs the next L1 before a merge whose answer was cut off', async () => {
+    const probe = await openOrder({ truncateMerges: true });
+    await probe.tickOnce();
+    assert.strictEqual(probe.strategy.getProgressSnapshot().mergeQueueLength, 1, 'premise: the cut-off merge is still queued');
+    await probe.tickOnce();
+    assert.deepStrictEqual(probe.calls, ['merge', 'l1'], 'the cut-off merge is retried only behind the queued L1s');
+    probe.manager.close();
+  });
+
+  it('runs the next L1 before a merge whose call failed, once the pause it caused has passed', async () => {
+    const probe = await openOrder({ failFirstMerge: true });
+    await assert.rejects(() => probe.tickOnce(), /connection reset/);
+    const lane = probe.strategy as unknown as { compressionPause: { backoffUntil: number } | null };
+    assert.ok(lane.compressionPause, 'premise: the failure paused the lane');
+    assert.strictEqual(probe.strategy.getProgressSnapshot().mergeQueueLength, 1, 'premise: the failed merge is still queued');
+    lane.compressionPause.backoffUntil = 0;
+    await probe.tickOnce();
+    assert.deepStrictEqual(probe.calls, ['merge', 'l1'], 'the failed merge is retried only behind the queued L1s');
     probe.manager.close();
   });
 
