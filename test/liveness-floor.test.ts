@@ -16,15 +16,19 @@
  *   refused at its deepest available level (#412).
  * - Through bursts the lane can't keep up with, followed by idle stretches
  *   that let it catch up, the compile stays live.
- * - Each adaptive compile reports its floor beside the hard budget, and the
- *   floor drops as relief lands; a refusal names its floor and the relief
- *   the queue holds.
+ * - Each adaptive compile whose floor can be computed reports it beside the
+ *   hard budget, and the floor drops as relief lands; a refusal after the
+ *   plan names its floor and the relief the queue holds, when the floor was
+ *   computed. Outside kv-unified the floor counts no lock, so a lock a pin
+ *   overrides doesn't take it away; under kv-unified it counts every lock. A
+ *   floor that can't be computed is said once per cause.
  */
 
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
 import { rmSync, existsSync } from 'node:fs';
 import { ContextManager, AutobiographicalStrategy, OverBudgetError } from '../src/index.js';
+import { CanonicalSummaryForest } from '../src/adaptive/kv-unified.js';
 import type { ContentBlock } from '@animalabs/membrane';
 
 const STORE = './test-liveness-floor';
@@ -73,6 +77,13 @@ interface Reader {
 }
 
 const settle = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };
+
+function collectFloorWarnings(): { warnings: string[]; restore: () => void } {
+  const warnings: string[] = [];
+  const warn = console.warn;
+  console.warn = (message?: unknown) => { if (/floor not computed/.test(String(message))) warnings.push(String(message)); };
+  return { warnings, restore: () => { console.warn = warn; } };
+}
 
 async function openReader(config: Record<string, unknown> = {}, summaryWords = 4, refuse?: RegExp): Promise<Reader> {
   cleanup();
@@ -246,6 +257,142 @@ describe('Adaptive compile liveness against the floor (#415)', () => {
     assert.ok((queuedReliefTokens ?? 0) > 0, `the queue's relief is named (${queuedReliefTokens})`);
     assert.match(refusal.message, new RegExp(`floor=${floorTokens}, queued relief=${queuedReliefTokens}`));
     reader.manager.close();
+  });
+
+  for (const foldingStrategy of ['kv-stable', 'flat-profile', 'oldest-first']) {
+    it(`keeps the floor where a pin overrides a lock, under ${foldingStrategy}`, async () => {
+      const reader = await openReader({ foldingStrategy, kvUnified: undefined });
+      reader.read(40);
+      await reader.drain();
+      await reader.manager.compile({ maxTokens: 3_000, reserveForResponse: 0 });
+      const resolutions = (reader.strategy as unknown as { resolutions: Map<string, number> }).resolutions;
+      const folded = [...resolutions].find(([, level]) => level >= 1)?.[0];
+      assert.ok(folded, 'premise: a message is folded');
+      const budget = { maxTokens: 20_000, reserveForResponse: 0 };
+      const floor = collectFloorWarnings();
+      try {
+        reader.strategy.lockChunk(folded);
+        await reader.manager.compile(budget);
+        const beforePin = reader.manager.getRenderStats()?.planVsActual?.floorTokens;
+        reader.manager.pinRange(folded, folded);
+        await reader.manager.compile(budget);
+        const stats = reader.manager.getRenderStats()?.planVsActual;
+        assert.ok(stats?.floorTokens !== undefined, 'the floor is reported beside a raw pin over a locked message');
+        assert.ok(stats.floorTokens <= stats.planned, `at or under the plan (${stats.floorTokens} > ${stats.planned})`);
+        assert.ok(beforePin !== undefined && stats.floorTokens > beforePin, `the pin counts (${stats.floorTokens}, ${beforePin})`);
+        assert.strictEqual(floor.warnings.length, 0, floor.warnings.join('\n'));
+      } finally {
+        floor.restore();
+      }
+      reader.manager.close();
+    });
+  }
+
+  it('counts no lock outside kv-unified, so a lock a level pin overrides through its summary leaves the floor under the plan', async () => {
+    const reader = await openReader({ foldingStrategy: 'kv-stable', kvUnified: undefined });
+    reader.read(40);
+    await reader.drain();
+    const locked = reader.manager.getAllMessages()[20]!.id;
+    reader.strategy.lockChunk(locked);
+    await reader.manager.compile({ maxTokens: 3_000, reserveForResponse: 0 });
+    const summaries = (reader.strategy as unknown as { summaries: { level: number; sourceIds: string[] }[] }).summaries;
+    const sibling = summaries.find((summary) => summary.level === 1 && summary.sourceIds.includes(locked))?.sourceIds.find((id) => id !== locked);
+    assert.ok(sibling, 'premise: the locked message shares an L1');
+    const budget = { maxTokens: 20_000, reserveForResponse: 0 };
+    reader.manager.pinRange(sibling, sibling, { level: 1 });
+    await reader.manager.compile(budget);
+    const withLock = reader.manager.getRenderStats()?.planVsActual;
+    reader.strategy.unlockChunk(locked);
+    await reader.manager.compile(budget);
+    const withoutLock = reader.manager.getRenderStats()?.planVsActual;
+    assert.ok(withLock?.floorTokens !== undefined && withLock.floorTokens <= withLock.planned, `at or under the plan (${withLock?.floorTokens}, ${withLock?.planned})`);
+    assert.strictEqual(withLock.floorTokens, withoutLock?.floorTokens, 'the lock leaves the floor as it is');
+    reader.manager.close();
+  });
+
+  it('counts a lock under kv-unified, whose constraints the floor takes', async () => {
+    const reader = await openReader();
+    reader.read(40);
+    await reader.drain();
+    const budget = { maxTokens: 20_000, reserveForResponse: 0 };
+    const floorNow = async () => {
+      await reader.manager.compile(budget);
+      return reader.manager.getRenderStats()?.planVsActual?.floorTokens;
+    };
+    const free = await floorNow();
+    reader.strategy.lockChunk(reader.manager.getAllMessages()[20]!.id);
+    const held = await floorNow();
+    assert.ok(free !== undefined && held !== undefined && held > free, `a message held raw raises the floor (${held}, ${free})`);
+    reader.manager.close();
+  });
+
+  it('keeps the floor where a level pin overrides a lock under kv-stable, as kv-unified refuses the compile for it', async () => {
+    const budget = { maxTokens: 20_000, reserveForResponse: 0 };
+    const unified = await openReader();
+    unified.read(40);
+    await unified.drain();
+    const first = unified.manager.getAllMessages()[0]!.id;
+    unified.strategy.lockChunk(first);
+    unified.manager.pinRange(first, first, { level: 2 });
+    await assert.rejects(unified.manager.compile(budget), /infeasible/, 'premise: under kv-unified the lock and the pin conflict');
+    unified.manager.close();
+
+    const reader = await openReader({ foldingStrategy: 'kv-stable', kvUnified: undefined });
+    reader.read(40);
+    await reader.drain();
+    const id = reader.manager.getAllMessages()[0]!.id;
+    const floor = collectFloorWarnings();
+    try {
+      reader.strategy.lockChunk(id);
+      reader.manager.pinRange(id, id, { level: 2 });
+      await reader.manager.compile(budget);
+      const stats = reader.manager.getRenderStats()?.planVsActual;
+      assert.ok(stats?.floorTokens !== undefined, 'the floor is reported');
+      assert.ok(stats.floorTokens <= stats.planned, `at or under the plan (${stats.floorTokens} > ${stats.planned})`);
+      assert.strictEqual(floor.warnings.length, 0, floor.warnings.join('\n'));
+    } finally {
+      floor.restore();
+    }
+    reader.manager.close();
+  });
+
+  it('says once that a floor whose computation fails is missing, again when it recurs or the store is opened again, and the compile goes on', async () => {
+    const reader = await openReader({ foldingStrategy: 'kv-stable', kvUnified: undefined });
+    reader.read(24);
+    await reader.drain();
+    const budget = { maxTokens: 20_000, reserveForResponse: 0 };
+    const forest = CanonicalSummaryForest.prototype as unknown as { minimumTokens: () => unknown };
+    const minimumTokens = forest.minimumTokens;
+    const breakIt = () => { forest.minimumTokens = () => { throw new Error('the forest broke'); }; };
+    const floor = collectFloorWarnings();
+    try {
+      breakIt();
+      await reader.manager.compile(budget);
+      await reader.manager.compile(budget);
+      const stats = reader.manager.getRenderStats()?.planVsActual;
+      assert.ok(stats, 'premise: the compile went on');
+      assert.strictEqual(stats.floorTokens, undefined, 'no floor is reported');
+      assert.strictEqual(stats.hardBudget, undefined, 'nor the budget beside it');
+      assert.strictEqual(floor.warnings.length, 1, `said once over two compiles (${floor.warnings.length})`);
+      assert.match(floor.warnings[0]!, /floor not computed.*the forest broke/);
+      forest.minimumTokens = () => { throw new Error('the forest broke otherwise'); };
+      await reader.manager.compile(budget);
+      assert.strictEqual(floor.warnings.length, 2, `another cause is said too (${floor.warnings.length})`);
+      forest.minimumTokens = minimumTokens;
+      await reader.manager.compile(budget);
+      assert.ok(reader.manager.getRenderStats()?.planVsActual?.floorTokens !== undefined, 'premise: the floor is back');
+      forest.minimumTokens = () => { throw new Error('the forest broke otherwise'); };
+      await reader.manager.compile(budget);
+      assert.strictEqual(floor.warnings.length, 3, `said again when it recurs (${floor.warnings.length})`);
+      reader.manager.close();
+      const reopened = await ContextManager.open({ path: STORE, strategy: reader.strategy, membrane: { complete: async () => { throw new Error('no call expected'); } } as never });
+      await reopened.compile(budget);
+      assert.strictEqual(floor.warnings.length, 4, `said again for the store opened anew (${floor.warnings.length})`);
+      reopened.close();
+    } finally {
+      forest.minimumTokens = minimumTokens;
+      floor.restore();
+    }
   });
 });
 
