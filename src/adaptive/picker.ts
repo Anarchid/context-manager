@@ -64,15 +64,16 @@ export interface OverBudgetDiagnostics {
   rawPins?: { tokens: number; pins: readonly OverBudgetRawPin[] };
   /**
    * Under adaptive resolution, the cheapest plan the summaries held allow,
-   * head and tail included (#415), counting no lock outside kv-unified,
-   * where it's a lower bound. At or under the budget, a plan that fits
-   * exists, outside kv-unified unless a lock holds a message above its
-   * cheapest form, so the refusal isn't for want of summaries; over it, no
-   * plan fits until the floor drops under the budget or the budget rises, as
-   * new summaries, a smaller tail, fewer messages, or a released pin or lock
-   * that kept a message from its cheapest form can bring about. Absent where
-   * it couldn't be computed, and on a refusal that comes before the plan, as
-   * the head and tail reservation's does.
+   * head and tail included (#415). Under kv-unified, at or under the budget a
+   * plan that fits exists, so the refusal isn't for want of summaries.
+   * Outside kv-unified the floor counts no lock and is a lower bound: a floor
+   * over the budget means every compile refuses, and one at or under it
+   * doesn't promise a plan fits. Over the budget, no plan fits until the
+   * floor drops under the budget or the budget rises, as new summaries, a
+   * smaller tail, fewer messages, or a released pin or lock that kept a
+   * message from its cheapest form can bring about. Absent where it couldn't
+   * be computed, and on a refusal that comes before the plan, as the head
+   * and tail reservation's does.
    */
   floorTokens?: number;
   /**

@@ -13,19 +13,20 @@
   merge-quarantine record keeps out, and every merge from the first a hold
   blocks. Under `kv-unified` the floor takes that solver's own constraints,
   locks included, and is exact. The other folding strategies give pins
-  precedence over locks in ways those constraints don't follow, so there the floor
-  counts no lock and is a lower bound: over the budget, every compile still
-  refuses; at or under it, a plan fits only where no lock holds a message
-  above its cheapest form. A floor that can't be computed leaves the fields
-  out and is said once per cause, and once more by each load that meets it,
-  as `[autobiographical] floor not computed`.
+  precedence over locks in ways those constraints don't follow, so there the
+  floor counts no lock. Outside `kv-unified` the floor is a lower bound: a
+  floor over the budget means every compile refuses, and one at or under it
+  doesn't promise a plan fits. A floor that can't be computed leaves the
+  fields out and is said once per cause, and once more by each load that
+  meets it, as `[autobiographical] floor not computed`.
 - `OverBudgetDiagnostics` gains `floorTokens` and `queuedReliefTokens` on
   the adaptive refusals that come once the plan is made, when its floor was
   computed, and the refusal's message then names them as `floor=` and
   `queued relief=`. The refusal for a head and tail that alone exceed the
-  budget comes before the plan, so it carries neither. A floor at or under
-  the budget means the refusal isn't for want of summaries, since a plan
-  that fits exists (outside `kv-unified`, unless a lock holds a message
-  above its cheapest form); a floor still over the budget once the queued
-  relief is taken off means draining the queue alone isn't expected to clear
-  it, the relief being an estimate.
+  budget comes before the plan, so it carries neither. Under `kv-unified`,
+  a floor at or under the budget means the refusal isn't for want of
+  summaries, since a plan that fits exists. Outside `kv-unified` the floor is
+  a lower bound: a floor over the budget means every compile refuses, and one
+  at or under it doesn't promise a plan fits. A floor still over the budget
+  once the queued relief is taken off means draining the queue alone isn't
+  expected to clear it, the relief being an estimate.
