@@ -4,11 +4,9 @@
   version. Before, a host on 0.9.0 got a second membrane installed for
   context-manager: TypeScript refused the host's `Membrane` where
   context-manager takes one ("Type 'import("…/membrane").Membrane' is not
-  assignable to type 'import("…/membrane").Membrane'", TS2322), and in
-  JavaScript context-manager handed its own membrane 0.8 `NativeFormatter`
-  to the host's 0.9 `Membrane`. A host on 0.8 changes nothing. A host with
-  no membrane dependency of its own now gets 0.9.0 on a fresh install, and
-  membrane 0.9.0's own changes with it.
+  assignable to type 'import("…/membrane").Membrane'", TS2322). A host on
+  0.8 changes nothing. For a host with no membrane dependency of its own,
+  the range now admits 0.9.0, npm's `latest`, as well as 0.8.
   - **Unchanged:** context-manager's own code, which uses nothing membrane
     0.9.0 adds. For the requests compared, through the Anthropic,
     OpenRouter and an OpenAI-compatible adapter, with a system prompt, an
